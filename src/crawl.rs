@@ -501,23 +501,25 @@ async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Op
             );
         }
 
-        // 2xx. Content-type gate for pages (sitemaps are XML — no gate).
-        if job.kind == 0 {
-            let ct = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !ct.is_empty() && !ct.contains("text/html") && !ct.contains("application/xhtml+xml")
-            {
-                return (
-                    Outcome::PermanentFail {
-                        reason: format!("content-type:{ct}"),
-                    },
-                    None,
-                );
-            }
+        // 2xx. Content-type gate for pages (sitemaps are XML — no gate);
+        // the header also feeds charset decoding at extraction time.
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if job.kind == 0
+            && !content_type.is_empty()
+            && !content_type.contains("text/html")
+            && !content_type.contains("application/xhtml+xml")
+        {
+            return (
+                Outcome::PermanentFail {
+                    reason: format!("content-type:{content_type}"),
+                },
+                None,
+            );
         }
 
         let final_url = cur.clone();
@@ -561,7 +563,16 @@ async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Op
         // Page: extraction + WARC member build are CPU-bound — off the runtime.
         let url_for_record = final_url.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            build_stored(url_for_record, status, head, body, sha, truncated, now)
+            build_stored(
+                url_for_record,
+                status,
+                head,
+                body,
+                content_type,
+                sha,
+                truncated,
+                now,
+            )
         })
         .await
         .unwrap_or_else(|e| Outcome::PermanentFail {
@@ -605,11 +616,13 @@ fn http_head_snapshot(status: u16, headers: &reqwest::header::HeaderMap) -> Vec<
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stored(
     final_url: String,
     status: u16,
     mut head: Vec<u8>,
     body: Vec<u8>,
+    content_type: String,
     sha: [u8; 32],
     truncated: bool,
     now: i64,
@@ -619,8 +632,9 @@ fn build_stored(
             reason: "bad-final-url".into(),
         };
     };
-    let html = String::from_utf8_lossy(&body);
+    let html = crate::extract::decode_html(&body, Some(&content_type));
     let meta = crate::extract::links_and_meta(&base, &html);
+    let extract = crate::extract::full(&final_url, &html);
 
     head.extend_from_slice(format!("\r\ncontent-length: {}", body.len()).as_bytes());
     let seed = format!("{final_url}\u{0}{now}");
@@ -642,6 +656,7 @@ fn build_stored(
         sha256: sha,
         noindex: meta.noindex,
         links: meta.links,
+        extract,
     })
 }
 

@@ -1,8 +1,11 @@
+mod api;
 mod config;
 mod crawl;
 mod db;
 mod extract;
+mod index;
 mod net;
+mod search;
 mod sitemap;
 mod urlnorm;
 mod warc;
@@ -57,9 +60,12 @@ fn main() -> ExitCode {
         Some("init") => cmd_init(),
         Some("id") => cmd_id(),
         Some("crawl") => cmd_crawl(rest),
+        Some("run") => cmd_run(),
+        Some("search") => cmd_search(rest),
+        Some("reindex") => cmd_reindex(rest),
         Some("seed") => cmd_seed(rest),
         Some("status") => cmd_status(rest),
-        Some(c @ ("run" | "search" | "bootstrap" | "ingest" | "rank" | "reindex")) => {
+        Some(c @ ("bootstrap" | "ingest" | "rank")) => {
             Err(format!("`mycel {c}` is not implemented yet (pending milestone)").into())
         }
         Some("version" | "--version" | "-V") => {
@@ -207,7 +213,7 @@ fn cmd_seed(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `mycel crawl [--limit N]`: run the crawler until the frontier drains, the
+/// `mycel crawl [--limit N]`: crawl + index until the frontier drains, the
 /// limit is reached, or Ctrl-C.
 fn cmd_crawl(rest: &[String]) -> Result<()> {
     let mut limit = None;
@@ -225,8 +231,51 @@ fn cmd_crawl(rest: &[String]) -> Result<()> {
             s => return Err(format!("unknown flag {s}").into()),
         }
     }
+    daemon(DaemonOpts {
+        with_api: false,
+        exit_when_idle: true,
+        limit,
+        crawl: true,
+    })
+}
+
+/// `mycel run`: the full daemon — crawler + indexer + API — until Ctrl-C.
+fn cmd_run() -> Result<()> {
+    daemon(DaemonOpts {
+        with_api: true,
+        exit_when_idle: false,
+        limit: None,
+        crawl: true,
+    })
+}
+
+/// `mycel reindex [--missing]`: index docs left pending (--missing), or (M3)
+/// rebuild the whole index from WARC.
+fn cmd_reindex(rest: &[String]) -> Result<()> {
+    let missing = rest.iter().any(|a| a == "--missing");
+    if !missing {
+        return Err("full reindex lands in M3 — use `mycel reindex --missing` for now".into());
+    }
+    daemon(DaemonOpts {
+        with_api: false,
+        exit_when_idle: true,
+        limit: None,
+        crawl: false,
+    })
+}
+
+struct DaemonOpts {
+    with_api: bool,
+    exit_when_idle: bool,
+    limit: Option<u64>,
+    /// false = indexer-only (reindex --missing): no crawler, no contact needed.
+    crawl: bool,
+}
+
+/// Shared engine assembly: db-writer + indexer, optional crawler and API.
+fn daemon(opts: DaemonOpts) -> Result<()> {
     let (cfg, data) = load_env()?;
-    if cfg.crawl.contact_url.is_empty() {
+    if opts.crawl && cfg.crawl.contact_url.is_empty() {
         return Err(
             "crawl.contact_url must be set in mycel.toml before crawling — it identifies \
              your crawler in the user agent"
@@ -249,38 +298,143 @@ fn cmd_crawl(rest: &[String]) -> Result<()> {
         recrawl_secs: cfg.crawl.recrawl_days as i64 * 86_400,
         max_urls_per_host: cfg.crawl.max_urls_per_host as i64,
         max_depth: 32,
+        languages: cfg.index.languages.clone(),
+    };
+    let indexer_cfg = index::IndexerCfg {
+        index_dir: data.join("index"),
+        db_path: data.join("mycel.sqlite"),
+        warc_dir: data.join("warc"),
+        commit_docs: cfg.index.commit_docs,
+        commit_secs: cfg.index.commit_secs,
+        heap_mb: cfg.index.heap_mb,
+        languages: cfg.index.languages.clone(),
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let (db, writer) = db::spawn_writer(conn, warc_init, db_cfg)?;
         let cancel = tokio_util::sync::CancellationToken::new();
         {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("interrupt — draining in-flight fetches");
+                tracing::info!("interrupt — shutting down");
                 cancel.cancel();
             });
         }
-        let n = crawl::run(
-            db.clone(),
-            cfg.crawl.clone(),
-            cancel,
-            crawl::CrawlerOpts {
-                exit_when_idle: true,
-                limit,
-            },
-        )
-        .await?;
+
+        // Wire order: indexer channel exists before the writer starts.
+        let (index_tx, indexer) = {
+            // The indexer needs a Db handle; create the writer first with the
+            // indexer's sender, using a pre-made channel pair.
+            let (tx, rx) = std::sync::mpsc::channel::<index::IndexMsg>();
+            let (db, writer) = db::spawn_writer(conn, warc_init, db_cfg, Some(tx.clone()))?;
+            let indexer = index::spawn_indexer_with(indexer_cfg, db.clone(), rx)?;
+            ((tx, db, writer), indexer)
+        };
+        let (index_tx, db, writer) = index_tx;
+
+        let api_task = if opts.with_api {
+            let searcher = std::sync::Arc::new(search::Searcher::open(
+                &data.join("index"),
+                cfg.rank.weight,
+            )?);
+            let state = std::sync::Arc::new(api::Api {
+                searcher,
+                db: db.clone(),
+                stats_conn: tokio::sync::Mutex::new(db::open(&data.join("mycel.sqlite"))?),
+                page_size: cfg.api.page_size,
+            });
+            let bind = cfg.api.bind.clone();
+            let cancel = cancel.clone();
+            Some(tokio::spawn(async move {
+                api::serve(&bind, state, cancel).await
+            }))
+        } else {
+            None
+        };
+
+        if opts.crawl {
+            let n = crawl::run(
+                db.clone(),
+                cfg.crawl.clone(),
+                cancel.clone(),
+                crawl::CrawlerOpts {
+                    exit_when_idle: opts.exit_when_idle,
+                    limit: opts.limit,
+                },
+            )
+            .await?;
+            tracing::info!("crawl finished: {n} fetches");
+        } else {
+            // reindex --missing: the indexer's boot sweep does the work; give
+            // it a moment to start, then fall through to shutdown which drains.
+        }
+
+        // Shutdown order: indexer first (its marks need the writer alive).
+        let _ = index_tx.send(index::IndexMsg::Shutdown);
+        let _ = tokio::task::spawn_blocking(move || indexer.join()).await;
         db.flush().await;
         db.shutdown().await;
         let _ = tokio::task::spawn_blocking(move || writer.join()).await;
-        tracing::info!("crawl finished: {n} fetches");
+        cancel.cancel();
+        if let Some(t) = api_task {
+            let _ = t.await;
+        }
         Ok::<(), Error>(())
     })
+}
+
+/// `mycel search <q> [--json]`: one-shot local query.
+fn cmd_search(rest: &[String]) -> Result<()> {
+    let json = rest.iter().any(|a| a == "--json");
+    let q: Vec<&str> = rest
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .collect();
+    let q = q.join(" ");
+    if q.trim().is_empty() {
+        return Err("usage: mycel search <query> [--json]".into());
+    }
+    let (cfg, data) = load_env()?;
+    let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
+    let (total, hits) = searcher.search(&q, 0, cfg.api.page_size)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "query": q, "total": total, "hits": hits
+            }))?
+        );
+    } else if hits.is_empty() {
+        println!("no results ({} docs indexed)", searcher.num_docs());
+    } else {
+        println!("{total} results");
+        for h in hits {
+            let snippet = h
+                .snippet
+                .replace("<b>", "\x1b[1m")
+                .replace("</b>", "\x1b[0m");
+            println!(
+                "\n\x1b[4m{}\x1b[0m\n  {}\n  {}",
+                h.title,
+                h.url,
+                unescape_html(&snippet)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Undo the snippet generator's HTML escaping for terminal display.
+fn unescape_html(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// `mycel status [--json]`: queue depths, host states, docs, shards, counters.

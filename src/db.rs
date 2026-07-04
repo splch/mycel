@@ -11,6 +11,7 @@
 //! rows advances shards.bytes. On boot the open shard is truncated back to
 //! shards.bytes, so a torn tail is unobservable and orphans are impossible.
 
+use crate::index::{IndexDoc, IndexMsg};
 use crate::{Result, warc};
 use rusqlite::{Connection, Transaction, params};
 use std::collections::HashMap;
@@ -202,6 +203,8 @@ pub struct StoredPage {
     pub noindex: bool,
     /// (normalized url, host) — deduped, capped by the extractor.
     pub links: Vec<(String, String)>,
+    /// Readability output; None means too little text ('empty').
+    pub extract: Option<crate::extract::Extracted>,
 }
 
 pub enum Outcome {
@@ -252,7 +255,15 @@ enum Cmd {
     },
     Robots(Box<RobotsMsg>),
     Complete(Box<Completion>),
-    #[allow(dead_code)] // sent from M2 (indexer thread)
+    MarkDocs {
+        marks: Vec<(i64, i64, Option<&'static str>)>,
+    },
+    UpdateDocExtract {
+        doc_id: i64,
+        title: String,
+        lang: &'static str,
+        simhash: i64,
+    },
     Counter {
         name: &'static str,
         delta: i64,
@@ -313,7 +324,27 @@ impl Db {
         let _ = self.tx.send(Cmd::Complete(Box::new(c))).await;
     }
 
-    #[allow(dead_code)] // used from M2 (indexer thread)
+    /// Indexer thread (sync context): record indexed/skipped outcomes.
+    pub fn mark_docs_blocking(&self, marks: Vec<(i64, i64, Option<&'static str>)>) {
+        let _ = self.tx.blocking_send(Cmd::MarkDocs { marks });
+    }
+
+    /// Indexer thread: persist cold-path extraction results on a docs row.
+    pub fn update_doc_extract_blocking(
+        &self,
+        doc_id: i64,
+        title: String,
+        lang: &'static str,
+        simhash: i64,
+    ) {
+        let _ = self.tx.blocking_send(Cmd::UpdateDocExtract {
+            doc_id,
+            title,
+            lang,
+            simhash,
+        });
+    }
+
     pub async fn counter(&self, name: &'static str, delta: i64) {
         let _ = self.tx.send(Cmd::Counter { name, delta }).await;
     }
@@ -349,6 +380,8 @@ pub struct DbCfg {
     pub recrawl_secs: i64,
     pub max_urls_per_host: i64,
     pub max_depth: i64,
+    /// Languages to index (ISO 639-1); others stored, not indexed.
+    pub languages: Vec<String>,
 }
 
 struct WarcState {
@@ -362,6 +395,7 @@ struct Writer {
     conn: Connection,
     warc: WarcState,
     cfg: DbCfg,
+    index_tx: Option<std::sync::mpsc::Sender<IndexMsg>>,
     counters: HashMap<&'static str, i64>,
     last_flush: i64,
     last_sweep: i64,
@@ -373,6 +407,7 @@ pub fn spawn_writer(
     mut conn: Connection,
     warc_init: WarcInit,
     cfg: DbCfg,
+    index_tx: Option<std::sync::mpsc::Sender<IndexMsg>>,
 ) -> Result<(Db, std::thread::JoinHandle<()>)> {
     recover(&conn)?;
     let warc = attach_shard(&mut conn, warc_init)?;
@@ -383,6 +418,7 @@ pub fn spawn_writer(
         conn,
         warc,
         cfg,
+        index_tx,
         counters,
         last_flush: t,
         last_sweep: t,
@@ -569,10 +605,48 @@ impl Writer {
                         }
                     }
                     Cmd::Complete(c) => {
-                        if let Err(e) =
-                            handle_complete(&tx, &mut self.warc, &self.cfg, &mut self.counters, &c)
-                        {
+                        if let Err(e) = handle_complete(
+                            &tx,
+                            &mut self.warc,
+                            &self.cfg,
+                            &mut self.counters,
+                            self.index_tx.as_ref(),
+                            &c,
+                        ) {
                             tracing::error!("completion failed for {}: {e}", c.url);
+                        }
+                    }
+                    Cmd::MarkDocs { marks } => {
+                        for (doc_id, indexed, reason) in marks {
+                            if let Err(e) = tx
+                                .prepare_cached(
+                                    "UPDATE docs SET indexed = ?1, skip_reason = ?2 WHERE id = ?3",
+                                )
+                                .and_then(|mut s| s.execute(params![indexed, reason, doc_id]))
+                            {
+                                tracing::error!("mark doc {doc_id} failed: {e}");
+                            }
+                            let name = if indexed == 1 {
+                                "docs_indexed"
+                            } else {
+                                "docs_skipped"
+                            };
+                            *self.counters.entry(name).or_insert(0) += 1;
+                        }
+                    }
+                    Cmd::UpdateDocExtract {
+                        doc_id,
+                        title,
+                        lang,
+                        simhash,
+                    } => {
+                        if let Err(e) = tx
+                            .prepare_cached(
+                                "UPDATE docs SET title = ?1, lang = ?2, simhash = ?3 WHERE id = ?4",
+                            )
+                            .and_then(|mut s| s.execute(params![title, lang, simhash, doc_id]))
+                        {
+                            tracing::error!("update doc {doc_id} failed: {e}");
                         }
                     }
                     Cmd::Counter { name, delta } => {
@@ -745,6 +819,7 @@ fn handle_complete(
     ws: &mut WarcState,
     cfg: &DbCfg,
     counters: &mut HashMap<&'static str, i64>,
+    index_tx: Option<&std::sync::mpsc::Sender<IndexMsg>>,
     c: &Completion,
 ) -> Result<()> {
     let now = c.now_ms / 1000;
@@ -754,20 +829,35 @@ fn handle_complete(
         Outcome::Stored(p) => {
             let (offset, len) = ws.shard.append_member(&p.member)?;
             ws.dirty = true;
+            // Index-eligibility gates that need no tantivy state; dedup gates
+            // (sha/simhash) live in the indexer.
             let (indexed, skip): (i64, Option<&str>) = if p.noindex {
                 (2, Some("noindex"))
             } else {
-                (0, None)
+                match &p.extract {
+                    None => (2, Some("empty")),
+                    Some(ex) if !cfg.languages.iter().any(|l| l == ex.lang) => (2, Some("lang")),
+                    Some(_) => (0, None),
+                }
+            };
+            let (title, lang, simhash) = match &p.extract {
+                Some(ex) => (
+                    Some(ex.title.as_str()),
+                    Some(ex.lang),
+                    Some(ex.simhash as i64),
+                ),
+                None => (None, None, None),
             };
             tx.prepare_cached(
                 "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
-                                   fetched_at, indexed, skip_reason)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                                   fetched_at, indexed, skip_reason, title, lang, simhash)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                  ON CONFLICT(url) DO UPDATE SET
                    host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
                    len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
                    fetched_at=excluded.fetched_at, indexed=excluded.indexed,
-                   skip_reason=excluded.skip_reason, simhash=NULL, lang=NULL, title=NULL",
+                   skip_reason=excluded.skip_reason, simhash=excluded.simhash,
+                   lang=excluded.lang, title=excluded.title",
             )?
             .execute(params![
                 p.final_url,
@@ -779,8 +869,33 @@ fn handle_complete(
                 p.http_status as i64,
                 now,
                 indexed,
-                skip
+                skip,
+                title,
+                lang,
+                simhash
             ])?;
+            if indexed == 0
+                && let (Some(itx), Some(ex)) = (index_tx, &p.extract)
+            {
+                let doc_id: i64 = tx
+                    .prepare_cached("SELECT id FROM docs WHERE url = ?1")?
+                    .query_row([&p.final_url], |r| r.get(0))?;
+                let (host, centrality): (String, f64) = tx
+                    .prepare_cached("SELECT host, centrality FROM hosts WHERE id = ?1")?
+                    .query_row([c.host_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let _ = itx.send(IndexMsg::Add(Box::new(IndexDoc {
+                    doc_id,
+                    url: p.final_url.clone(),
+                    host,
+                    title: ex.title.clone(),
+                    body: ex.text.clone(),
+                    lang: ex.lang.to_string(),
+                    fetched_at: now,
+                    centrality,
+                    simhash: ex.simhash,
+                    sha256: p.sha256.to_vec(),
+                })));
+            }
             for (url, host) in &p.links {
                 enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1)?;
             }
@@ -821,7 +936,16 @@ fn handle_complete(
         }
         Outcome::PermanentFail { reason } => {
             fail_permanent(tx, c.frontier_id, reason)?;
-            // If this URL was previously stored, the page is gone: mark it out.
+            // If this URL had been indexed, the page is gone: remove it.
+            let was_indexed: Option<i64> = tx
+                .prepare_cached("SELECT indexed FROM docs WHERE url = ?1")?
+                .query_row([&c.url], |r| r.get(0))
+                .ok();
+            if was_indexed == Some(1)
+                && let Some(itx) = index_tx
+            {
+                let _ = itx.send(IndexMsg::Delete(c.url.clone()));
+            }
             tx.prepare_cached("UPDATE docs SET indexed = 2, skip_reason = 'error' WHERE url = ?1")?
                 .execute([&c.url])?;
             success = false;
@@ -1037,6 +1161,7 @@ mod tests {
             recrawl_secs: 14 * 86_400,
             max_urls_per_host: 50_000,
             max_depth: 32,
+            languages: vec!["en".into()],
         }
     }
 
@@ -1049,7 +1174,8 @@ mod tests {
         drop(conn);
 
         let conn = open(&db_path).unwrap();
-        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), test_cfg()).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
 
         let t = now();
         let jobs = db.claim(t, 10).await;
@@ -1085,6 +1211,12 @@ mod tests {
                 payload_len: payload.len() as u64,
                 sha256: sha,
                 noindex: false,
+                extract: Some(crate::extract::Extracted {
+                    title: "hello".into(),
+                    text: "hello world content body".into(),
+                    lang: "en",
+                    simhash: 42,
+                }),
                 links: vec![
                     ("http://example.com/about".into(), "example.com".into()),
                     ("http://other.org/".into(), "other.org".into()),
@@ -1176,7 +1308,8 @@ mod tests {
         seed(&conn, "example.com", "http://example.com/a");
         drop(conn);
         let conn = open(&db_path).unwrap();
-        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), test_cfg()).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
 
         let t = now();
         let job = db.claim(t, 1).await.pop().unwrap();
@@ -1228,7 +1361,8 @@ mod tests {
         seed(&conn, "example.com", "http://example.com/a");
         drop(conn);
         let conn = open(&db_path).unwrap();
-        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), test_cfg()).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
 
         let t = now();
         let job = db.claim(t, 1).await.pop().unwrap();
