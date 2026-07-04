@@ -1,0 +1,36 @@
+[package]
+name = "mycel"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, decentralized web crawler, indexer, and search engine"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "gzip"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tantivy = "0.26"
+iroh = "1"
+texting_robots = "0.2"
+url = "2.5"
+quick-xml = "0.41"
+gaoya = "0.2"
+scraper = "0.27"
+dom_smoothie = "0"
+whichlang = "0.1"
+flate2 = "1"
+sha2 = "0.10"
+blake3 = "1"
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+csv = "1"
+hex = "0.4"
+fastrand = "2"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
