@@ -1,4 +1,5 @@
 mod api;
+mod bootstrap;
 mod config;
 mod crawl;
 mod db;
@@ -67,9 +68,8 @@ fn main() -> ExitCode {
         Some("seed") => cmd_seed(rest),
         Some("status") => cmd_status(rest),
         Some("rank") => cmd_rank(rest),
-        Some(c @ ("bootstrap" | "ingest")) => {
-            Err(format!("`mycel {c}` is not implemented yet (pending milestone)").into())
-        }
+        Some("bootstrap") => cmd_bootstrap(rest),
+        Some("ingest") => cmd_ingest(rest),
         Some("version" | "--version" | "-V") => {
             println!("mycel {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -235,9 +235,58 @@ fn cmd_crawl(rest: &[String]) -> Result<()> {
     }
     daemon(DaemonOpts {
         with_api: false,
-        exit_when_idle: true,
-        limit,
-        crawl: true,
+        work: DaemonWork::Crawl {
+            exit_when_idle: true,
+            limit,
+        },
+    })
+}
+
+/// `mycel bootstrap --hosts F [--records F]`: seed centrality + activate the
+/// curated hosts, then ranged-fetch the Common Crawl records into the store.
+fn cmd_bootstrap(rest: &[String]) -> Result<()> {
+    let (mut hosts, mut records) = (None, None);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--hosts" => hosts = Some(PathBuf::from(it.next().ok_or("--hosts needs a path")?)),
+            "--records" => {
+                records = Some(PathBuf::from(it.next().ok_or("--records needs a path")?));
+            }
+            s => return Err(format!("unknown flag {s}").into()),
+        }
+    }
+    if hosts.is_none() && records.is_none() {
+        return Err("usage: mycel bootstrap --hosts hosts.csv [--records records.csv]".into());
+    }
+    let (_cfg, data) = load_env()?;
+    if let Some(h) = &hosts {
+        let mut conn = db::open(&data.join("mycel.sqlite"))?;
+        let n = bootstrap::seed_hosts(&mut conn, h)?;
+        println!("seeded {n} hosts (activated, centrality from hcrank10)");
+    }
+    if let Some(r) = records {
+        daemon(DaemonOpts {
+            with_api: false,
+            work: DaemonWork::Bootstrap { records: r },
+        })?;
+    }
+    Ok(())
+}
+
+/// `mycel ingest <file|dir>…`: register + index local .warc / .warc.gz files.
+fn cmd_ingest(rest: &[String]) -> Result<()> {
+    let paths: Vec<PathBuf> = rest
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .collect();
+    if paths.is_empty() {
+        return Err("usage: mycel ingest <file.warc.gz|dir>…".into());
+    }
+    daemon(DaemonOpts {
+        with_api: false,
+        work: DaemonWork::Ingest { paths },
     })
 }
 
@@ -245,9 +294,10 @@ fn cmd_crawl(rest: &[String]) -> Result<()> {
 fn cmd_run() -> Result<()> {
     daemon(DaemonOpts {
         with_api: true,
-        exit_when_idle: false,
-        limit: None,
-        crawl: true,
+        work: DaemonWork::Crawl {
+            exit_when_idle: false,
+            limit: None,
+        },
     })
 }
 
@@ -258,9 +308,7 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
     if missing {
         return daemon(DaemonOpts {
             with_api: false,
-            exit_when_idle: true,
-            limit: None,
-            crawl: false,
+            work: DaemonWork::IndexPending,
         });
     }
     let (cfg, data) = load_env()?;
@@ -318,16 +366,28 @@ fn cmd_rank(rest: &[String]) -> Result<()> {
 
 struct DaemonOpts {
     with_api: bool,
-    exit_when_idle: bool,
-    limit: Option<u64>,
-    /// false = indexer-only (reindex --missing): no crawler, no contact needed.
-    crawl: bool,
+    work: DaemonWork,
+}
+
+enum DaemonWork {
+    Crawl {
+        exit_when_idle: bool,
+        limit: Option<u64>,
+    },
+    /// reindex --missing: the indexer's boot sweep does the work.
+    IndexPending,
+    Bootstrap {
+        records: PathBuf,
+    },
+    Ingest {
+        paths: Vec<PathBuf>,
+    },
 }
 
 /// Shared engine assembly: db-writer + indexer, optional crawler and API.
 fn daemon(opts: DaemonOpts) -> Result<()> {
     let (cfg, data) = load_env()?;
-    if opts.crawl && cfg.crawl.contact_url.is_empty() {
+    if matches!(opts.work, DaemonWork::Crawl { .. }) && cfg.crawl.contact_url.is_empty() {
         return Err(
             "crawl.contact_url must be set in mycel.toml before crawling — it identifies \
              your crawler in the user agent"
@@ -407,21 +467,45 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
             None
         };
 
-        if opts.crawl {
-            let n = crawl::run(
-                db.clone(),
-                cfg.crawl.clone(),
-                cancel.clone(),
-                crawl::CrawlerOpts {
-                    exit_when_idle: opts.exit_when_idle,
-                    limit: opts.limit,
-                },
-            )
-            .await?;
-            tracing::info!("crawl finished: {n} fetches");
-        } else {
-            // reindex --missing: the indexer's boot sweep does the work; give
-            // it a moment to start, then fall through to shutdown which drains.
+        match &opts.work {
+            DaemonWork::Crawl {
+                exit_when_idle,
+                limit,
+            } => {
+                let n = crawl::run(
+                    db.clone(),
+                    cfg.crawl.clone(),
+                    cancel.clone(),
+                    crawl::CrawlerOpts {
+                        exit_when_idle: *exit_when_idle,
+                        limit: *limit,
+                    },
+                )
+                .await?;
+                tracing::info!("crawl finished: {n} fetches");
+            }
+            DaemonWork::IndexPending => {
+                // The indexer's boot sweep (synchronous, before its recv loop)
+                // drains pending docs; shutdown below waits for it.
+            }
+            DaemonWork::Bootstrap { records } => {
+                let recs = bootstrap::load_records_csv(records)?;
+                let key = bootstrap::resume_key(records)?;
+                let meta_conn = db::open(&data.join("mycel.sqlite"))?;
+                let bcfg = bootstrap::BootstrapCfg {
+                    concurrency: cfg.bootstrap.concurrency,
+                    rate_limit_per_sec: cfg.bootstrap.rate_limit_per_sec,
+                    contact: cfg.crawl.contact_url.clone(),
+                    failed_log: data.join("bootstrap-failed.csv"),
+                };
+                let (done, failed) =
+                    bootstrap::fetch_records(&db, &meta_conn, &bcfg, &recs, &key).await?;
+                tracing::info!("bootstrap: {done} records ingested, {failed} failed");
+            }
+            DaemonWork::Ingest { paths } => {
+                let (seen, ingested) = bootstrap::ingest_paths(&db, paths).await?;
+                tracing::info!("ingest: {ingested}/{seen} records ingested");
+            }
         }
 
         // Shutdown order: indexer first (its marks need the writer alive).

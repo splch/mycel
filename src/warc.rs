@@ -566,4 +566,39 @@ mod tests {
         assert_eq!(info.warc_type(), Some("warcinfo"));
         assert!(String::from_utf8_lossy(&info.body).contains("software: mycel/"));
     }
+    /// Real Common Crawl members (CC-MAIN-2025-38), fetched once by ranged GET
+    /// against index.commoncrawl.org pointers — see README "Fixture".
+    #[test]
+    fn reads_real_common_crawl_members() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cc-sample.warc.gz");
+        let items: Vec<_> = MemberIter::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(items.len(), 3);
+        // Boundaries are contiguous and cover the whole file.
+        let mut expect = 0u64;
+        for (offset, len, _) in &items {
+            assert_eq!(*offset, expect);
+            expect += len;
+        }
+        assert_eq!(expect, std::fs::metadata(&path).unwrap().len());
+        for (offset, len, rec) in &items {
+            assert_eq!(rec.warc_type(), Some("response"));
+            let (status, head, payload) = rec.http_parts().expect("http parts");
+            assert_eq!(status, 200);
+            assert!(!payload.is_empty());
+            assert!(head.len() > 20);
+            // Random access reproduces the sequential parse.
+            let again = read_member_at(&path, *offset, *len).unwrap();
+            assert_eq!(again.target_uri(), rec.target_uri());
+        }
+        let uris: Vec<&str> = items
+            .iter()
+            .filter_map(|(_, _, r)| r.target_uri())
+            .collect();
+        assert!(uris.iter().any(|u| u.contains("example.com")));
+        assert!(uris.iter().any(|u| u.contains("marginalia.nu")));
+    }
 }

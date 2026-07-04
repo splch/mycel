@@ -242,6 +242,21 @@ pub struct Completion {
     pub now_ms: i64,
 }
 
+/// A record entering the store outside the crawl loop (Common Crawl
+/// bootstrap or local WARC ingest). The member bytes are appended verbatim.
+pub struct IngestRecord {
+    pub url: String,
+    pub host: String,
+    pub member: Vec<u8>,
+    pub payload_len: u64,
+    pub sha256: [u8; 32],
+    pub http_status: u16,
+    pub fetched_at: i64,
+    pub noindex: bool,
+    pub extract: Option<crate::extract::Extracted>,
+    pub links: Vec<(String, String)>,
+}
+
 enum Cmd {
     Claim {
         now: i64,
@@ -255,6 +270,7 @@ enum Cmd {
     },
     Robots(Box<RobotsMsg>),
     Complete(Box<Completion>),
+    Ingest(Box<IngestRecord>),
     MarkDocs {
         marks: Vec<(i64, i64, Option<&'static str>)>,
     },
@@ -322,6 +338,10 @@ impl Db {
 
     pub async fn complete(&self, c: Completion) {
         let _ = self.tx.send(Cmd::Complete(Box::new(c))).await;
+    }
+
+    pub async fn ingest(&self, r: IngestRecord) {
+        let _ = self.tx.send(Cmd::Ingest(Box::new(r))).await;
     }
 
     /// Indexer thread (sync context): record indexed/skipped outcomes.
@@ -616,6 +636,18 @@ impl Writer {
                             tracing::error!("completion failed for {}: {e}", c.url);
                         }
                     }
+                    Cmd::Ingest(r) => {
+                        if let Err(e) = handle_ingest(
+                            &tx,
+                            &mut self.warc,
+                            &self.cfg,
+                            &mut self.counters,
+                            self.index_tx.as_ref(),
+                            &r,
+                        ) {
+                            tracing::error!("ingest failed for {}: {e}", r.url);
+                        }
+                    }
                     Cmd::MarkDocs { marks } => {
                         for (doc_id, indexed, reason) in marks {
                             if let Err(e) = tx
@@ -811,6 +843,119 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     for (url, host) in &m.sitemaps {
         enqueue(tx, cfg, now, None, url, host, 1, 0)?;
     }
+    Ok(())
+}
+
+/// Bootstrap/ingest path: append the member verbatim, register the doc (newest
+/// WARC-Date wins), harvest links into the webgraph/frontier, forward to the
+/// indexer. Skips identical re-ingests entirely (no duplicate WARC copy).
+fn handle_ingest(
+    tx: &Transaction,
+    ws: &mut WarcState,
+    cfg: &DbCfg,
+    counters: &mut HashMap<&'static str, i64>,
+    index_tx: Option<&std::sync::mpsc::Sender<IndexMsg>>,
+    r: &IngestRecord,
+) -> Result<()> {
+    let already: bool = tx
+        .prepare_cached(
+            "SELECT 1 FROM docs WHERE url = ?1 AND sha256 = ?2 AND fetched_at >= ?3 LIMIT 1",
+        )?
+        .query_row(params![r.url, &r.sha256[..], r.fetched_at], |_| Ok(true))
+        .unwrap_or(false);
+    if already {
+        *counters.entry("docs_skipped").or_insert(0) += 1;
+        return Ok(());
+    }
+    let newer: Option<i64> = tx
+        .prepare_cached("SELECT 1 FROM docs WHERE url = ?1 AND fetched_at > ?2 LIMIT 1")?
+        .query_row(params![r.url, r.fetched_at], |row| row.get(0))
+        .ok();
+    if newer.is_some() {
+        *counters.entry("docs_skipped").or_insert(0) += 1;
+        return Ok(());
+    }
+
+    tx.prepare_cached("INSERT OR IGNORE INTO hosts (host, state, added_at) VALUES (?1, 0, ?2)")?
+        .execute(params![r.host, r.fetched_at])?;
+    let host_id: i64 = tx
+        .prepare_cached("SELECT id FROM hosts WHERE host = ?1")?
+        .query_row([&r.host], |row| row.get(0))?;
+
+    let (offset, len) = ws.shard.append_member(&r.member)?;
+    ws.dirty = true;
+
+    let (indexed, skip): (i64, Option<&str>) = if r.noindex {
+        (2, Some("noindex"))
+    } else {
+        match &r.extract {
+            None => (2, Some("empty")),
+            Some(ex) if !cfg.languages.iter().any(|l| l == ex.lang) => (2, Some("lang")),
+            Some(_) => (0, None),
+        }
+    };
+    let (title, lang, simhash) = match &r.extract {
+        Some(ex) => (
+            Some(ex.title.as_str()),
+            Some(ex.lang),
+            Some(ex.simhash as i64),
+        ),
+        None => (None, None, None),
+    };
+    tx.prepare_cached(
+        "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                           fetched_at, indexed, skip_reason, title, lang, simhash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(url) DO UPDATE SET
+           host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
+           len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
+           fetched_at=excluded.fetched_at, indexed=excluded.indexed,
+           skip_reason=excluded.skip_reason, simhash=excluded.simhash,
+           lang=excluded.lang, title=excluded.title
+         WHERE excluded.fetched_at >= docs.fetched_at",
+    )?
+    .execute(params![
+        r.url,
+        host_id,
+        ws.shard_db_id,
+        offset as i64,
+        len as i64,
+        &r.sha256[..],
+        r.http_status as i64,
+        r.fetched_at,
+        indexed,
+        skip,
+        title,
+        lang,
+        simhash
+    ])?;
+    for (url, host) in &r.links {
+        enqueue(tx, cfg, r.fetched_at, Some(host_id), url, host, 0, 1)?;
+    }
+    if indexed == 0
+        && let (Some(itx), Some(ex)) = (index_tx, &r.extract)
+    {
+        let doc_id: i64 = tx
+            .prepare_cached("SELECT id FROM docs WHERE url = ?1")?
+            .query_row([&r.url], |row| row.get(0))?;
+        let centrality: f64 = tx
+            .prepare_cached("SELECT centrality FROM hosts WHERE id = ?1")?
+            .query_row([host_id], |row| row.get(0))?;
+        let _ = itx.send(IndexMsg::Add(Box::new(IndexDoc {
+            doc_id,
+            url: r.url.clone(),
+            host: r.host.clone(),
+            title: ex.title.clone(),
+            body: ex.text.clone(),
+            lang: ex.lang.to_string(),
+            fetched_at: r.fetched_at,
+            centrality,
+            simhash: ex.simhash,
+            sha256: r.sha256.to_vec(),
+        })));
+    }
+    *counters.entry("docs_stored").or_insert(0) += 1;
+    *counters.entry("bytes_fetched").or_insert(0) += r.payload_len as i64;
     Ok(())
 }
 
