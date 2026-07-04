@@ -138,8 +138,41 @@ webgraph, `mycel rank` replaces the seeded ranks with your own.
 
 ## Federation
 
-Landing in M5 (see SPEC.md §11): explicit peer lists, query fan-out over iroh
-QUIC with unspoofable result attribution, and pull-based WARC shard sync.
+Nodes federate over [iroh](https://iroh.computer) QUIC — dial by public key,
+~90% direct connections through NAT, relays as fallback. Trust is social: each
+node lists the peers it accepts, and that allowlist is the only gate.
+
+```console
+alice$ mycel id                    # exchange ids out of band
+bob$   mycel id
+```
+
+```toml
+# alice's mycel.toml
+[federation]
+enabled = true
+
+[[federation.peers]]
+id = "<bob's 64-hex endpoint id>"
+name = "bob"        # result badge
+sync = true         # pull bob's crawl corpus
+```
+
+- **Query fan-out**: `/api/search?q=…&federated=1` (or `mycel search --federated`
+  against the running daemon) queries all peers in parallel behind a hard
+  timeout; results interleave round-robin — never a cross-node score sort —
+  deduped by URL, each remote hit badged with the peer that answered.
+  Attribution is stamped by the requester from the dialed key: unspoofable.
+- **Shard sync**: peers exchange crawl corpora as immutable, blake3-verified
+  WARC shards (pull-based, quota-capped, resumable). Only self-crawled shards
+  are exported — no transitive flooding. Synced documents join the local index
+  through the same dedup gates as everything else.
+- **`mycel peers check`** proves dial + auth + protocol for every peer in one
+  round trip.
+
+A peerless node binds no sockets and publishes nothing; `preset = "empty"`
+runs federation with zero external infrastructure (explicit peer `addr`s,
+LAN/tests/airgap).
 
 ## Recovery (the index is never precious)
 

@@ -174,6 +174,11 @@ pub struct FederationCfg {
     pub enabled: bool,
     pub fanout: bool,
     pub fanout_timeout_ms: u64,
+    /// "n0" (relays + DNS address lookup, the default) or "empty" (pure
+    /// sockets — tests/airgapped; peers then need explicit `addr`).
+    pub preset: String,
+    /// Optional UDP bind address (tests/firewalls); "" = ephemeral.
+    pub bind: String,
     pub peers: Vec<PeerCfg>,
 }
 
@@ -183,6 +188,8 @@ impl Default for FederationCfg {
             enabled: false,
             fanout: true,
             fanout_timeout_ms: 1500,
+            preset: "n0".into(),
+            bind: String::new(),
             peers: Vec::new(),
         }
     }
@@ -190,13 +197,16 @@ impl Default for FederationCfg {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // name/sync are read from M5 (federation)
 pub struct PeerCfg {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_true")]
     pub sync: bool,
+    /// Optional direct socket address ("ip:port") — used when address lookup
+    /// is off (tests) or to skip discovery.
+    #[serde(default)]
+    pub addr: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -270,11 +280,23 @@ impl Config {
         if self.crawl.concurrency == 0 {
             return Err("crawl.concurrency must be > 0".into());
         }
+        if !matches!(self.federation.preset.as_str(), "n0" | "empty") {
+            return Err(format!(
+                "federation.preset must be \"n0\" or \"empty\" (got {:?})",
+                self.federation.preset
+            )
+            .into());
+        }
         for p in &self.federation.peers {
             if p.id.len() != 64 || !p.id.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(
                     format!("federation peer id must be 64 hex chars (got {:?})", p.id).into(),
                 );
+            }
+            if let Some(a) = &p.addr
+                && a.parse::<std::net::SocketAddr>().is_err()
+            {
+                return Err(format!("peer addr must be ip:port (got {a:?})").into());
             }
         }
         Ok(())

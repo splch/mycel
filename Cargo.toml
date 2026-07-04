@@ -7,7 +7,7 @@ description = "A fast, decentralized web crawler, indexer, and search engine"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tokio-util = "0.7"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "gzip"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "gzip", "json"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tantivy = "0.26"
 iroh = "1"
@@ -29,6 +29,7 @@ csv = "1"
 hex = "0.4"
 fastrand = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 

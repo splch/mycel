@@ -1,6 +1,8 @@
 //! Query-side: site: filter, conjunctive QueryParser over title+body, BM25
 //! score × (1 + w·centrality) via the fast field, snippets.
 
+pub mod fanout;
+
 use crate::Result;
 use crate::index::{Fields, fields};
 use serde::Serialize;

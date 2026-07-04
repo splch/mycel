@@ -15,12 +15,21 @@ pub struct Api {
     pub db: db::Db,
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
     pub page_size: usize,
+    pub fed: Option<FedState>,
+}
+
+/// Federation context for the API: fan-out + peer checks.
+pub struct FedState {
+    pub fanout: Arc<search::fanout::Fanout>,
+    pub default_on: bool,
+    pub peers: Vec<crate::config::PeerCfg>,
 }
 
 pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Result<()> {
     let app = axum::Router::new()
         .route("/", get(ui))
         .route("/api/search", get(api_search))
+        .route("/api/peers/check", get(peers_check))
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .with_state(api);
@@ -36,16 +45,38 @@ pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Resu
 struct SearchParams {
     q: Option<String>,
     page: Option<usize>,
+    federated: Option<u8>,
 }
 
 async fn run_search(
     api: &Arc<Api>,
     q: String,
     page: usize,
+    federated: Option<u8>,
 ) -> std::result::Result<(usize, Vec<search::Hit>), String> {
     let searcher = api.searcher.clone();
     let page_size = api.page_size;
     api.db.counter("queries", 1).await;
+    let want_fed = match federated {
+        Some(v) => v != 0,
+        None => api.fed.as_ref().is_some_and(|f| f.default_on),
+    };
+    // Federated merging is page-0 only (the peer protocol carries no offset);
+    // deeper pages stay local.
+    if want_fed
+        && page == 0
+        && let Some(fed) = &api.fed
+    {
+        let local_q = q.clone();
+        let local = tokio::task::spawn_blocking(move || searcher.search(&local_q, 0, page_size));
+        let peer_lists = fed.fanout.search_peers(&q, page_size).await;
+        let (total, local_hits) = local
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let merged = search::fanout::merge(local_hits, peer_lists, page_size);
+        return Ok((total.max(merged.len()), merged));
+    }
     tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size))
         .await
         .map_err(|e| e.to_string())?
@@ -64,7 +95,7 @@ async fn api_search(
         }))
         .into_response();
     }
-    match run_search(&api, q.clone(), page).await {
+    match run_search(&api, q.clone(), page, p.federated).await {
         Ok((total, hits)) => axum::Json(serde_json::json!({
             "query": q, "page": page, "total": total, "hits": hits
         }))
@@ -81,12 +112,16 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
     let page = p.page.unwrap_or(0);
     let mut results = String::new();
     if !q.trim().is_empty() {
-        match run_search(&api, q.clone(), page).await {
+        match run_search(&api, q.clone(), page, p.federated).await {
             Ok((total, hits)) => {
                 results.push_str(&format!("<p class=meta>{total} results</p>"));
                 for h in &hits {
+                    let badge = match &h.source {
+                        Some(s) => format!(" <span class=badge>{}</span>", search::html_escape(s)),
+                        None => String::new(),
+                    };
                     results.push_str(&format!(
-                        "<div class=hit><a href=\"{url}\">{title}</a>\
+                        "<div class=hit><a href=\"{url}\">{title}</a>{badge}\
                          <div class=url>{url_show}</div><div class=snip>{snippet}</div></div>",
                         url = search::html_escape(&h.url),
                         title =
@@ -128,9 +163,27 @@ padding:0 1rem;color:#1a1a1a}h1{display:inline;font-size:1.3rem;margin-right:.8r
 input{width:60%;padding:.45rem .6rem;font-size:1rem;border:1px solid #bbb;border-radius:4px}\
 button{padding:.45rem .9rem;font-size:1rem}.hit{margin:1.1rem 0}.hit a{font-size:1.05rem}\
 .url{color:#0a7d33;font-size:.85rem;overflow-wrap:anywhere}.snip{color:#444;font-size:.92rem}\
-.snip b{background:#fff2a8;font-weight:600}.meta{color:#777;font-size:.85rem}\
+.snip b{background:#fff2a8;font-weight:600}.meta{color:#777;font-size:.85rem}.badge{background:#e3ecff;color:#274690;border-radius:3px;padding:0 .35rem;font-size:.75rem}\
 @media(prefers-color-scheme:dark){body{background:#111;color:#ddd}.snip{color:#aaa}\
 .snip b{background:#5c4d00;color:#fff}input{background:#222;color:#ddd;border-color:#444}}";
+
+async fn peers_check(State(api): State<Arc<Api>>) -> impl IntoResponse {
+    let Some(fed) = &api.fed else {
+        return (StatusCode::BAD_REQUEST, "federation is not enabled").into_response();
+    };
+    let results = crate::net::endpoint::check_peers(&fed.fanout.endpoint, &fed.peers).await;
+    let body: Vec<_> = results
+        .into_iter()
+        .map(|(peer, r)| {
+            serde_json::json!({
+                "peer": peer,
+                "ok": r.is_ok(),
+                "detail": r.err().unwrap_or_default(),
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "peers": body })).into_response()
+}
 
 async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
     let db_ok = tokio::time::timeout(std::time::Duration::from_secs(1), api.db.flush())

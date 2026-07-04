@@ -39,11 +39,15 @@ Commands:
   status [--json]            counters, queue depths, shards, disk
   seed <host|url>... [--from-file F]
                              promote hosts to active + enqueue roots
+  peers check                dial every configured peer and verify auth + protocol
 
 Config: ./mycel.toml (or $MYCEL_CONFIG). An empty file is valid; defaults apply.
 ";
 
 fn main() -> ExitCode {
+    // Both reqwest and iroh link rustls; with two crypto providers in the
+    // binary, rustls demands an explicit process-level default.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Logs go to stderr (unbuffered, visible under pipes); stdout carries data.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -70,6 +74,7 @@ fn main() -> ExitCode {
         Some("rank") => cmd_rank(rest),
         Some("bootstrap") => cmd_bootstrap(rest),
         Some("ingest") => cmd_ingest(rest),
+        Some("peers") => cmd_peers(rest),
         Some("version" | "--version" | "-V") => {
             println!("mycel {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -402,7 +407,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
     let warc_init = db::WarcInit {
         dir: data.join("warc"),
         node8,
-        origin,
+        origin: origin.clone(),
         contact: cfg.crawl.contact_url.clone(),
         shard_cap_bytes: cfg.warc.shard_mb * 1024 * 1024,
     };
@@ -447,16 +452,74 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
         };
         let (index_tx, db, writer) = index_tx;
 
-        let api_task = if opts.with_api {
-            let searcher = std::sync::Arc::new(search::Searcher::open(
+        // Federation serves + syncs only in crawl/run mode (one-shot commands
+        // must not linger on the network).
+        let fed_on = cfg.federation.enabled && matches!(opts.work, DaemonWork::Crawl { .. });
+        let searcher = if opts.with_api || fed_on {
+            Some(std::sync::Arc::new(search::Searcher::open(
                 &data.join("index"),
                 cfg.rank.weight,
-            )?);
+            )?))
+        } else {
+            None
+        };
+
+        let fed = if fed_on {
+            let endpoint =
+                std::sync::Arc::new(net::endpoint::build(&cfg.federation, sk.clone()).await?);
+            tracing::info!(
+                "federation up: node {} serving {} peer(s)",
+                origin.chars().take(10).collect::<String>(),
+                cfg.federation.peers.len()
+            );
+            let net_conn = std::sync::Arc::new(tokio::sync::Mutex::new(db::open(
+                &data.join("mycel.sqlite"),
+            )?));
+            let net_state = std::sync::Arc::new(net::endpoint::NetState {
+                self_id: origin.clone(),
+                allowlist: cfg.federation.peers.iter().map(|p| p.id.clone()).collect(),
+                searcher: searcher.clone().expect("searcher built for federation"),
+                conn: net_conn.clone(),
+                warc_dir: data.join("warc"),
+            });
+            tokio::spawn(net::endpoint::run_server(
+                endpoint.clone(),
+                net_state,
+                cancel.clone(),
+            ));
+            if cfg.sync.enabled {
+                let deps = net::endpoint::NetDeps {
+                    db: db.clone(),
+                    endpoint: endpoint.clone(),
+                    peers: cfg.federation.peers.clone(),
+                    warc_dir: data.join("warc"),
+                    conn: net_conn,
+                    self_id: origin.clone(),
+                    interval_secs: cfg.sync.interval_secs,
+                    max_total_bytes: cfg.sync.max_total_bytes,
+                };
+                tokio::spawn(net::sync::pull_task(deps, cancel.clone()));
+            }
+            Some(api::FedState {
+                fanout: std::sync::Arc::new(search::fanout::Fanout::new(
+                    endpoint,
+                    cfg.federation.peers.clone(),
+                    cfg.federation.fanout_timeout_ms,
+                )),
+                default_on: cfg.federation.fanout,
+                peers: cfg.federation.peers.clone(),
+            })
+        } else {
+            None
+        };
+
+        let api_task = if opts.with_api {
             let state = std::sync::Arc::new(api::Api {
-                searcher,
+                searcher: searcher.clone().expect("searcher built for api"),
                 db: db.clone(),
                 stats_conn: tokio::sync::Mutex::new(db::open(&data.join("mycel.sqlite"))?),
                 page_size: cfg.api.page_size,
+                fed,
             });
             let bind = cfg.api.bind.clone();
             let cancel = cancel.clone();
@@ -525,6 +588,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
 /// `mycel search <q> [--json]`: one-shot local query.
 fn cmd_search(rest: &[String]) -> Result<()> {
     let json = rest.iter().any(|a| a == "--json");
+    let federated = rest.iter().any(|a| a == "--federated");
     let q: Vec<&str> = rest
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -532,9 +596,42 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         .collect();
     let q = q.join(" ");
     if q.trim().is_empty() {
-        return Err("usage: mycel search <query> [--json]".into());
+        return Err("usage: mycel search <query> [--json] [--federated]".into());
     }
     let (cfg, data) = load_env()?;
+    if federated {
+        // Fan-out needs the node's live endpoint — go through the daemon.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(async move {
+            let url = format!(
+                "http://{}/api/search?federated=1&q={}",
+                cfg.api.bind,
+                urlencode(&q)
+            );
+            let resp = reqwest::get(&url)
+                .await
+                .map_err(|_| "federated search needs the daemon — start `mycel run` first")?;
+            let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                for h in v["hits"].as_array().cloned().unwrap_or_default() {
+                    let badge = h["source"]
+                        .as_str()
+                        .map(|s| format!(" [{s}]"))
+                        .unwrap_or_default();
+                    println!(
+                        "\n\x1b[4m{}\x1b[0m{badge}\n  {}",
+                        h["title"].as_str().unwrap_or(""),
+                        h["url"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
+        });
+    }
     let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
     let (total, hits) = searcher.search(&q, 0, cfg.api.page_size)?;
     if json {
@@ -562,6 +659,84 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `mycel peers check`: probe every configured peer. Uses the running
+/// daemon's endpoint when available (same node key can't bind twice); falls
+/// back to a standalone endpoint when the daemon is down.
+fn cmd_peers(rest: &[String]) -> Result<()> {
+    if rest.first().map(String::as_str) != Some("check") {
+        return Err("usage: mycel peers check".into());
+    }
+    let (cfg, data) = load_env()?;
+    if cfg.federation.peers.is_empty() {
+        return Err("no [[federation.peers]] configured".into());
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        // Prefer the daemon (it owns the node identity on the network).
+        let url = format!("http://{}/api/peers/check", cfg.api.bind);
+        if let Ok(resp) = reqwest::get(&url).await
+            && resp.status().is_success()
+        {
+            let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let mut ok = true;
+            for p in v["peers"].as_array().cloned().unwrap_or_default() {
+                let good = p["ok"].as_bool().unwrap_or(false);
+                ok &= good;
+                println!(
+                    "{}  {}{}",
+                    if good { "ok  " } else { "FAIL" },
+                    p["peer"].as_str().unwrap_or("?"),
+                    if good {
+                        String::new()
+                    } else {
+                        format!("  ({})", p["detail"].as_str().unwrap_or(""))
+                    }
+                );
+            }
+            return if ok {
+                Ok(())
+            } else {
+                Err("some peers unreachable".into())
+            };
+        }
+        // Daemon down: bind our own endpoint with the node key.
+        let sk = net::endpoint::load_or_create_identity(&data.join("identity.key"))?;
+        let endpoint = net::endpoint::build(&cfg.federation, sk).await?;
+        let results = net::endpoint::check_peers(&endpoint, &cfg.federation.peers).await;
+        endpoint.close().await;
+        let mut ok = true;
+        for (peer, r) in results {
+            match r {
+                Ok(()) => println!("ok    {peer}"),
+                Err(e) => {
+                    ok = false;
+                    println!("FAIL  {peer}  ({e})");
+                }
+            }
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err("some peers unreachable".into())
+        }
+    })
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Undo the snippet generator's HTML escaping for terminal display.

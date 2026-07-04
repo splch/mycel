@@ -139,7 +139,7 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
         fetched_at: rec.date_secs().unwrap_or_else(db::now),
         url,
         host,
-        member,
+        location: crate::db::IngestLocation::Append { member },
         sha256: sha,
         http_status: status,
         noindex: meta.noindex,

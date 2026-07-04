@@ -242,12 +242,24 @@ pub struct Completion {
     pub now_ms: i64,
 }
 
+/// Where an ingested record's bytes live.
+pub enum IngestLocation {
+    /// Append the member into our own open shard (bootstrap, local ingest).
+    Append { member: Vec<u8> },
+    /// Already on disk inside a registered (remote) shard — reference it.
+    Stored {
+        shard_id: i64,
+        offset: i64,
+        len: i64,
+    },
+}
+
 /// A record entering the store outside the crawl loop (Common Crawl
-/// bootstrap or local WARC ingest). The member bytes are appended verbatim.
+/// bootstrap, local WARC ingest, or peer shard sync).
 pub struct IngestRecord {
     pub url: String,
     pub host: String,
-    pub member: Vec<u8>,
+    pub location: IngestLocation,
     pub payload_len: u64,
     pub sha256: [u8; 32],
     pub http_status: u16,
@@ -271,6 +283,17 @@ enum Cmd {
     Robots(Box<RobotsMsg>),
     Complete(Box<Completion>),
     Ingest(Box<IngestRecord>),
+    RegisterRemoteShard {
+        name: String,
+        origin_node: String,
+        bytes: i64,
+        records: i64,
+        blake3: String,
+        reply: oneshot::Sender<Result<i64>>,
+    },
+    MarkShardIngested {
+        shard_id: i64,
+    },
     MarkDocs {
         marks: Vec<(i64, i64, Option<&'static str>)>,
     },
@@ -342,6 +365,34 @@ impl Db {
 
     pub async fn ingest(&self, r: IngestRecord) {
         let _ = self.tx.send(Cmd::Ingest(Box::new(r))).await;
+    }
+
+    /// Register a fetched peer shard (sealed, remote origin, not yet ingested).
+    pub async fn register_remote_shard(
+        &self,
+        name: String,
+        origin_node: String,
+        bytes: i64,
+        records: i64,
+        blake3: String,
+    ) -> Result<i64> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::RegisterRemoteShard {
+                name,
+                origin_node,
+                bytes,
+                records,
+                blake3,
+                reply,
+            })
+            .await
+            .map_err(|_| "db writer gone")?;
+        rx.await.map_err(|_| "db writer gone")?
+    }
+
+    pub async fn mark_shard_ingested(&self, shard_id: i64) {
+        let _ = self.tx.send(Cmd::MarkShardIngested { shard_id }).await;
     }
 
     /// Indexer thread (sync context): record indexed/skipped outcomes.
@@ -648,6 +699,41 @@ impl Writer {
                             tracing::error!("ingest failed for {}: {e}", r.url);
                         }
                     }
+                    Cmd::RegisterRemoteShard {
+                        name,
+                        origin_node,
+                        bytes,
+                        records,
+                        blake3,
+                        reply,
+                    } => {
+                        let res = tx
+                            .prepare_cached(
+                                "INSERT INTO shards (name, state, source, origin_node, bytes,
+                                                     records, blake3, created_at)
+                                 VALUES (?1, 1, 'sync', ?2, ?3, ?4, ?5, ?6)
+                                 ON CONFLICT(name) DO UPDATE SET blake3 = excluded.blake3",
+                            )
+                            .and_then(|mut s| {
+                                s.execute(params![name, origin_node, bytes, records, blake3, now()])
+                            })
+                            .map(|_| ())
+                            .and_then(|()| {
+                                tx.prepare_cached("SELECT id FROM shards WHERE name = ?1")?
+                                    .query_row([&name], |r| r.get::<_, i64>(0))
+                            });
+                        replies.push(Box::new(move || {
+                            let _ = reply.send(res.map_err(Into::into));
+                        }));
+                    }
+                    Cmd::MarkShardIngested { shard_id } => {
+                        if let Err(e) = tx
+                            .prepare_cached("UPDATE shards SET ingested_at = ?1 WHERE id = ?2")
+                            .and_then(|mut s| s.execute(params![now(), shard_id]))
+                        {
+                            tracing::error!("mark shard {shard_id} ingested failed: {e}");
+                        }
+                    }
                     Cmd::MarkDocs { marks } => {
                         for (doc_id, indexed, reason) in marks {
                             if let Err(e) = tx
@@ -729,8 +815,11 @@ impl Writer {
             for r in replies {
                 r();
             }
-            // Seal + rotate outside the batch transaction (blake3 reads the file).
+            // Seal + rotate outside the batch transaction (blake3 reads the
+            // file). Never seal a shard holding only its warcinfo record —
+            // with a zero cap that would churn empty shards forever.
             if self.warc.shard.end >= self.warc.init.shard_cap_bytes
+                && self.warc.shard.records > 1
                 && let Err(e) = self.seal_and_rotate()
             {
                 tracing::error!("shard seal failed: {e}");
@@ -882,8 +971,18 @@ fn handle_ingest(
         .prepare_cached("SELECT id FROM hosts WHERE host = ?1")?
         .query_row([&r.host], |row| row.get(0))?;
 
-    let (offset, len) = ws.shard.append_member(&r.member)?;
-    ws.dirty = true;
+    let (shard_id, offset, len) = match &r.location {
+        IngestLocation::Append { member } => {
+            let (offset, len) = ws.shard.append_member(member)?;
+            ws.dirty = true;
+            (ws.shard_db_id, offset as i64, len as i64)
+        }
+        IngestLocation::Stored {
+            shard_id,
+            offset,
+            len,
+        } => (*shard_id, *offset, *len),
+    };
 
     let (indexed, skip): (i64, Option<&str>) = if r.noindex {
         (2, Some("noindex"))
@@ -917,9 +1016,9 @@ fn handle_ingest(
     .execute(params![
         r.url,
         host_id,
-        ws.shard_db_id,
-        offset as i64,
-        len as i64,
+        shard_id,
+        offset,
+        len,
         &r.sha256[..],
         r.http_status as i64,
         r.fetched_at,
