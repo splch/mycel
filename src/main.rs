@@ -5,6 +5,7 @@ mod db;
 mod extract;
 mod index;
 mod net;
+mod rank;
 mod search;
 mod sitemap;
 mod urlnorm;
@@ -65,7 +66,8 @@ fn main() -> ExitCode {
         Some("reindex") => cmd_reindex(rest),
         Some("seed") => cmd_seed(rest),
         Some("status") => cmd_status(rest),
-        Some(c @ ("bootstrap" | "ingest" | "rank")) => {
+        Some("rank") => cmd_rank(rest),
+        Some(c @ ("bootstrap" | "ingest")) => {
             Err(format!("`mycel {c}` is not implemented yet (pending milestone)").into())
         }
         Some("version" | "--version" | "-V") => {
@@ -253,15 +255,65 @@ fn cmd_run() -> Result<()> {
 /// rebuild the whole index from WARC.
 fn cmd_reindex(rest: &[String]) -> Result<()> {
     let missing = rest.iter().any(|a| a == "--missing");
-    if !missing {
-        return Err("full reindex lands in M3 — use `mycel reindex --missing` for now".into());
+    if missing {
+        return daemon(DaemonOpts {
+            with_api: false,
+            exit_when_idle: true,
+            limit: None,
+            crawl: false,
+        });
     }
-    daemon(DaemonOpts {
-        with_api: false,
-        exit_when_idle: true,
-        limit: None,
-        crawl: false,
-    })
+    let (cfg, data) = load_env()?;
+    // Refuse while a daemon holds the live index's writer lock.
+    {
+        let live = index::open_or_create(&data.join("index"))?;
+        let probe: std::result::Result<tantivy::IndexWriter, _> = live.writer(64 * 1024 * 1024);
+        if probe.is_err() {
+            return Err("the index is in use — stop `mycel run`/`crawl` before reindexing".into());
+        }
+    }
+    let dest = data.join("index.new");
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    let icfg = index::IndexerCfg {
+        index_dir: data.join("index"),
+        db_path: data.join("mycel.sqlite"),
+        warc_dir: data.join("warc"),
+        commit_docs: cfg.index.commit_docs,
+        commit_secs: cfg.index.commit_secs,
+        heap_mb: cfg.index.heap_mb,
+        languages: cfg.index.languages.clone(),
+    };
+    let mut conn = db::open(&data.join("mycel.sqlite"))?;
+    let (indexed, skipped) = index::rebuild(&icfg, &mut conn, &dest)?;
+    let old = data.join("index.old");
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
+    }
+    std::fs::rename(data.join("index"), &old)?;
+    std::fs::rename(&dest, data.join("index"))?;
+    std::fs::remove_dir_all(&old)?;
+    println!("reindexed from WARC: {indexed} indexed, {skipped} skipped");
+    Ok(())
+}
+
+/// `mycel rank [--force]`: harmonic centrality over the host webgraph.
+fn cmd_rank(rest: &[String]) -> Result<()> {
+    let force = rest.iter().any(|a| a == "--force");
+    let (cfg, data) = load_env()?;
+    let mut conn = db::open(&data.join("mycel.sqlite"))?;
+    let out = rank::run(&mut conn, cfg.rank.exact_bfs_max_hosts, force)?;
+    println!(
+        "ranked {} hosts ({}); new values apply to docs on recrawl or `mycel reindex`",
+        out.hosts_ranked,
+        if out.exact {
+            "exact BFS"
+        } else {
+            "HyperBall approx"
+        }
+    );
+    Ok(())
 }
 
 struct DaemonOpts {

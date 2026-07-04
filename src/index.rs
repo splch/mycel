@@ -372,6 +372,110 @@ impl Indexer {
     }
 }
 
+/// Full rebuild from WARC into a fresh index directory. Offline only: the
+/// caller holds no writer on the live index and owns the directory swap.
+/// Re-derives every gate with fresh dedup state and writes docs.indexed
+/// directly on `conn`. Docs previously marked 'error' (dead pages) stay dead.
+pub fn rebuild(
+    cfg: &IndexerCfg,
+    conn: &mut rusqlite::Connection,
+    dest: &Path,
+) -> Result<(u64, u64)> {
+    std::fs::create_dir_all(dest)?;
+    let index = open_or_create(dest)?;
+    let f = fields(&index.schema());
+    let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
+    let mut lsh: SimHashIndex<u64, i64> = SimHashIndex::new(6, NEAR_DUP_RADIUS);
+    let mut seen_sha: HashSet<Vec<u8>> = HashSet::new();
+    let mut marks: Vec<(i64, i64, Option<&'static str>)> = Vec::new();
+    let (mut n_indexed, mut n_skipped) = (0u64, 0u64);
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, String, String, f64, i64, String, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
+             FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
+             WHERE NOT (d.indexed = 2 AND d.skip_reason = 'error')
+             ORDER BY d.shard_id, d.offset",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?;
+        mapped.collect::<std::result::Result<_, _>>()?
+    };
+
+    for (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) in rows {
+        let mut mark = |m: (i64, i64, Option<&'static str>)| marks.push(m);
+        let verdict: std::result::Result<(), &'static str> = (|| {
+            let rec =
+                warc::read_member_at(&cfg.warc_dir.join(&shard_name), offset as u64, len as u64)
+                    .map_err(|_| "error")?;
+            let (_status, head, payload) = rec.http_parts().ok_or("error")?;
+            let content_type = header_value(head, "content-type");
+            let html = extract::decode_html(payload, content_type.as_deref());
+            let base = url::Url::parse(&url).map_err(|_| "error")?;
+            if extract::links_and_meta(&base, &html).noindex {
+                return Err("noindex");
+            }
+            let ex = extract::full(&url, &html).ok_or("empty")?;
+            if !cfg.languages.iter().any(|l| l == ex.lang) {
+                return Err("lang");
+            }
+            use sha2::Digest;
+            let sha = sha2::Sha256::digest(payload).to_vec();
+            if !seen_sha.insert(sha) {
+                return Err("dup-exact");
+            }
+            if let Some((&nid, _)) = lsh.query_one(&ex.simhash)
+                && nid != doc_id
+            {
+                return Err("dup-near");
+            }
+            lsh.insert(doc_id, ex.simhash);
+            writer
+                .add_document(doc!(
+                    f.url => url.clone(), f.host => host.clone(), f.title => ex.title.clone(),
+                    f.body => ex.text.clone(), f.lang => ex.lang,
+                    f.fetched_at => fetched_at.max(0) as u64, f.centrality => centrality,
+                ))
+                .map_err(|_| "error")?;
+            Ok(())
+        })();
+        match verdict {
+            Ok(()) => {
+                n_indexed += 1;
+                mark((doc_id, 1, None));
+            }
+            Err(reason) => {
+                n_skipped += 1;
+                mark((doc_id, 2, Some(reason)));
+            }
+        }
+    }
+    let mut writer = writer;
+    writer.commit()?;
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt =
+            tx.prepare("UPDATE docs SET indexed = ?1, skip_reason = ?2 WHERE id = ?3")?;
+        for (doc_id, indexed, reason) in &marks {
+            stmt.execute(params![indexed, reason, doc_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok((n_indexed, n_skipped))
+}
+
 /// Pull one header value out of a raw HTTP head block (case-insensitive).
 fn header_value(head: &[u8], name: &str) -> Option<String> {
     for line in head.split(|&b| b == b'\n') {
