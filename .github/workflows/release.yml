@@ -60,7 +60,7 @@ jobs:
           NAME="mycel-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$NAME"
           cp "target/${{ matrix.target }}/release/mycel" "$NAME/"
-          cp README.md "$NAME/"
+          cp README.md LICENSE "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           if command -v sha256sum >/dev/null; then
             sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"

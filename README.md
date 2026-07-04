@@ -191,3 +191,9 @@ LAN/tests/airgap).
 (example.com, marginalia.nu, commoncrawl.org/blog) fetched by ranged GET using
 pointers from `https://index.commoncrawl.org/CC-MAIN-2025-38-index?url=…` and
 concatenated — standalone gzip members make a valid multi-member WARC.
+
+## License
+
+[AGPL-3.0-only](LICENSE). Run it, self-host it, fork it — but if you offer a
+modified mycel to users over a network, publish your modifications. The same
+reciprocity shard sync asks of your corpus, applied to the code.

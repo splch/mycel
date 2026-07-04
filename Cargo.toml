@@ -3,6 +3,8 @@ name = "mycel"
 version = "0.1.0"
 edition = "2024"
 description = "A fast, decentralized web crawler, indexer, and search engine"
+license = "AGPL-3.0-only"
+repository = "https://github.com/splch/mycel"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
