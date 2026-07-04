@@ -16,6 +16,10 @@ specification.
 
 ## Quickstart
 
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Apple Silicon) are on
+the [releases page](https://github.com/splch/mycel/releases); or build from
+source:
+
 ```console
 $ cargo build --release
 $ mycel init                       # config, data dir, node identity

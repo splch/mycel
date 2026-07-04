@@ -59,3 +59,4 @@ Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): a WARC m
 - Errors are `crate::Result` (boxed string-friendly); no error-handling crate.
 - SQLite schema changes go through `PRAGMA user_version` migrations in `db.rs` (`SCHEMA_VERSION`).
 - Milestone-style commits: gates green + acceptance exercised against the real binary before committing.
+- Releases: push a `v*` tag matching `Cargo.toml`'s version; `.github/workflows/release.yml` gates on fmt/clippy/test, then builds Linux x86_64/aarch64 + macOS arm64 tarballs onto the GitHub release.
