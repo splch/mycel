@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-mycel is a decentralized web search engine in one Rust binary: each node is a complete crawler + WARC store + tantivy index + ranker + HTTP API, and federation (query fan-out, shard sync over iroh QUIC) is additive. Two documents are **binding design authority**: `RESEARCH.md` (adversarially verified evidence for every architecture decision) and `SPEC.md` (the v1 specification, including the anti-feature list in §9 — no JS rendering, no vector search, no DHT, no trustless peering, no custom storage formats). Don't relitigate those decisions without new evidence; extend the spec's "deviations" sections when you must diverge.
+mycel is a decentralized web search engine in one Rust binary: each node is a complete crawler + WARC store + tantivy index + ranker + HTTP API, and federation (query fan-out, shard sync over iroh QUIC) is additive. Two documents are **binding design authority**: `docs/RESEARCH.md` (adversarially verified evidence for every architecture decision) and `docs/SPEC.md` (the v1 specification, including the anti-feature list in §9 — no JS rendering, no vector search, no DHT, no trustless peering, no custom storage formats). Don't relitigate those decisions without new evidence; extend the spec's "deviations" sections when you must diverge.
 
 ## Commands
 
@@ -55,7 +55,7 @@ Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): the db-w
 
 ## Conventions
 
-- Dependencies are a closed, deliberately boring set (SPEC.md §2 lists them and the deliberate absences — no clap/anyhow/chrono/warc-crate/etc.); hand-roll small frozen things instead of adding deps.
+- Dependencies are a closed, deliberately boring set (docs/SPEC.md §2 lists them and the deliberate absences — no clap/anyhow/chrono/warc-crate/etc.); hand-roll small frozen things instead of adding deps.
 - Errors are `crate::Result` (boxed string-friendly); no error-handling crate.
 - SQLite schema changes go through `PRAGMA user_version` migrations in `db.rs` (`SCHEMA_VERSION`).
 - Milestone-style commits: gates green + acceptance exercised against the real binary before committing.
