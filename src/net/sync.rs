@@ -83,7 +83,7 @@ async fn sync_peer(deps: &NetDeps, peer: &config::PeerCfg) -> Result<()> {
         Reply::Err(e) => return Err(format!("catalog refused: {}", e.message).into()),
     };
 
-    // Anti-spoof: a peer may only advertise its own shards.
+    // Anti-spoof: a peer may advertise only its own shards.
     let mut wanted: Vec<proto::ShardMeta> = catalog
         .into_iter()
         .filter(|m| {

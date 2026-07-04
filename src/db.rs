@@ -540,8 +540,8 @@ fn load_counters(conn: &Connection) -> Result<HashMap<&'static str, i64>> {
     Ok(map)
 }
 
-/// Reopen the shard that was open at last shutdown (truncating past the
-/// watermark), or create the first/next one.
+/// Reopen the shard that was open at last shutdown (truncating anything past
+/// the watermark), or create the first/next one.
 fn attach_shard(conn: &mut Connection, init: WarcInit) -> Result<WarcState> {
     let existing: Option<(i64, String, i64, i64)> = conn
         .query_row(

@@ -135,8 +135,8 @@ $ mycel bootstrap --hosts hosts.csv --records records.csv
 
 Fetches are ranged GETs against `data.commoncrawl.org`, throttled (4-way, 10
 rps, sticky slowdown on 429/503), resumable (Ctrl-C and rerun — progress is
-tracked per-file), and every record lands in mycel's own WARC store, indexed,
-its links feeding the webgraph and frontier. Failures are appended to
+tracked per file), and every record lands in mycel's own WARC store, indexed,
+its links feeding the webgraph and frontier. Failures go to
 `bootstrap-failed.csv` in the data dir. After a real crawl accumulates a
 webgraph, `mycel rank` replaces the seeded ranks with your own.
 
@@ -166,11 +166,11 @@ sync = true         # pull bob's crawl corpus
   against the running daemon) queries all peers in parallel behind a hard
   timeout; results interleave round-robin — never a cross-node score sort —
   deduped by URL, each remote hit badged with the peer that answered.
-  Attribution is stamped by the requester from the dialed key: unspoofable.
+  The requester stamps attribution from the dialed key: unspoofable.
 - **Shard sync**: peers exchange crawl corpora as immutable, blake3-verified
-  WARC shards (pull-based, quota-capped, resumable). Only self-crawled shards
-  are exported — no transitive flooding. Synced documents join the local index
-  through the same dedup gates as everything else.
+  WARC shards (pull-based, quota-capped, resumable). Nodes export only
+  self-crawled shards — no transitive flooding. Synced documents join the
+  local index through the same dedup gates as everything else.
 - **`mycel peers check`** proves dial + auth + protocol for every peer in one
   round trip.
 
@@ -196,4 +196,4 @@ concatenated — standalone gzip members make a valid multi-member WARC.
 
 [AGPL-3.0-only](LICENSE). Run it, self-host it, fork it — but if you offer a
 modified mycel to users over a network, publish your modifications. The same
-reciprocity shard sync asks of your corpus, applied to the code.
+reciprocity that shard sync asks of your corpus, applied to the code.

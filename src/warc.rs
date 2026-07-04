@@ -2,7 +2,6 @@
 //! Common Crawl publishes, so one reader path serves our own shards, peer
 //! shards, and CC bootstrap fetches. WARC and gzip are frozen formats — this
 //! module should never need maintenance.
-#![allow(dead_code)] // readers land in the bin at M2 (reindex) and M4 (ingest); remove then
 
 use crate::Result;
 use flate2::Compression;

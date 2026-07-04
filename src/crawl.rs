@@ -249,7 +249,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
 }
 
 async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, String)>) {
-    // Derive from the job URL so the authority (including any port) is kept —
+    // Derive from the job URL so the authority (including any port) survives —
     // the hosts-table key deliberately drops ports.
     let url = match Url::parse(&job.url) {
         Ok(mut u) => {
@@ -583,8 +583,8 @@ async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Op
 }
 
 /// Reconstruct the HTTP header block for the WARC record: status line + headers
-/// minus hop-by-hop/encoding headers (the body is stored decoded), plus the
-/// decoded Content-Length appended by the caller via body length.
+/// minus hop-by-hop/encoding headers (the body is stored decoded); the caller
+/// appends a Content-Length for the decoded body.
 fn http_head_snapshot(status: u16, headers: &reqwest::header::HeaderMap) -> Vec<u8> {
     let reason = reqwest::StatusCode::from_u16(status)
         .ok()

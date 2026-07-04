@@ -1,7 +1,7 @@
 //! Integration test (b): two real nodes on loopback (preset = "empty", no
 //! relays, no address lookup — explicit peer addrs). A ingests the CC fixture;
 //! B federated-queries A (source badge proves attribution) and pulls A's
-//! sealed shards into its own local index. A third, unlisted node is rejected.
+//! sealed shards into its own local index. A rejects a third, unlisted node.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -171,7 +171,7 @@ fn two_node_federation() {
         .unwrap_or(false)
     });
 
-    // Local-only query on B stays empty until sync ingests A's shards, then
+    // Local-only query on B stays empty until sync ingests A's shards; then
     // B serves the same docs from its own index (no badge).
     poll("shard sync delivers A's corpus to B", 45, || {
         get(&format!(
@@ -192,7 +192,7 @@ fn two_node_federation() {
             .unwrap_or(false)
     });
 
-    // Unlisted node C dials A and must be rejected (allowlist close code 1).
+    // Unlisted node C dials A, and A must reject it (allowlist close code 1).
     write_config(
         &dir_c,
         free_tcp_port(),

@@ -1,5 +1,5 @@
-//! HTTP API + minimal server-rendered UI. Data on stdout-equivalent JSON
-//! routes; one HTML page; no template engine.
+//! HTTP API + minimal server-rendered UI. JSON routes carry the data; one
+//! HTML page; no template engine.
 
 use crate::{Result, db, search};
 use axum::extract::{Query, State};

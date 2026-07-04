@@ -1,7 +1,7 @@
 use quick_xml::events::Event;
 
 /// Hard caps: a single sitemap file may list at most 50k URLs (the sitemaps.org
-/// limit) and we refuse to walk deeper than 3 levels of sitemapindex nesting
+/// limit), and we refuse to walk deeper than 3 levels of sitemapindex nesting
 /// (enforced by the caller via frontier depth).
 const MAX_LOCS: usize = 50_000;
 
@@ -13,8 +13,8 @@ pub struct Parsed {
 }
 
 /// Streaming parse of a (decompressed) sitemap document. Namespace-agnostic:
-/// element names are matched by local suffix. Anything unparseable simply
-/// yields what was collected so far — a partial sitemap is still useful.
+/// element names match by local suffix. Anything unparseable yields what was
+/// collected so far — a partial sitemap is still useful.
 pub fn parse(xml: &[u8]) -> Parsed {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);

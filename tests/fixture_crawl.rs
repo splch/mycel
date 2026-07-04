@@ -7,8 +7,8 @@ use std::process::Command;
 
 const PHRASE: &str = "unmistakable-fixture-phrase";
 
-/// Distinct filler per page — near-identical filler across pages would be
-/// (correctly) caught by the near-dup simhash gate and never indexed.
+/// Distinct filler per page — near-identical filler across pages would
+/// (correctly) trip the near-dup simhash gate and never index.
 fn filler(seed: u64) -> String {
     const WORDS: [&str; 24] = [
         "crawler", "index", "search", "network", "mycelium", "harvest", "signal", "garden",
