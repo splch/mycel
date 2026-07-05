@@ -175,7 +175,7 @@ pub struct FederationCfg {
     pub fanout: bool,
     pub fanout_timeout_ms: u64,
     /// "n0" (relays + DNS address lookup, the default) or "empty" (pure
-    /// sockets — tests/airgapped; peers then need explicit `addr`).
+    /// sockets, for tests/airgapped; peers then need explicit `addr`).
     pub preset: String,
     /// Optional UDP bind address (tests/firewalls); "" = ephemeral.
     pub bind: String,
@@ -203,7 +203,7 @@ pub struct PeerCfg {
     pub name: Option<String>,
     #[serde(default = "default_true")]
     pub sync: bool,
-    /// Optional direct socket address ("ip:port") — used when address lookup
+    /// Optional direct socket address ("ip:port"), used when address lookup
     /// is off (tests) or to skip discovery.
     #[serde(default)]
     pub addr: Option<String>,

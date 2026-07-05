@@ -1,5 +1,5 @@
 //! Integration test (a): crawl a fixture site end-to-end through the real
-//! binary — seed → crawl (+index) → search hits the right URL.
+//! binary: seed → crawl (+index) → search hits the right URL.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -7,7 +7,7 @@ use std::process::Command;
 
 const PHRASE: &str = "unmistakable-fixture-phrase";
 
-/// Distinct filler per page — near-identical filler across pages would
+/// Distinct filler per page; near-identical filler across pages would
 /// (correctly) trip the near-dup simhash gate and never index.
 fn filler(seed: u64) -> String {
     const WORDS: [&str; 24] = [

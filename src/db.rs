@@ -3,7 +3,7 @@
 //! One OS thread owns the sole write connection and the open WARC shard, and
 //! drains a bounded command channel. Correctness-critical reads (claims) flow
 //! through the same channel, so every state transition is strictly ordered.
-//! Commands are drain-batched into one transaction — few large sequential WAL
+//! Commands are drain-batched into one transaction: few large sequential WAL
 //! writes instead of thousands of tiny commits.
 //!
 //! Durability ordering (the watermark protocol): WARC members are appended and
@@ -123,7 +123,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(format!(
-            "database schema is v{version}, newer than this binary understands (v{SCHEMA_VERSION}) — upgrade mycel"
+            "database schema is v{version}, newer than this binary understands (v{SCHEMA_VERSION}); upgrade mycel"
         )
         .into());
     }
@@ -177,7 +177,7 @@ pub struct Job {
 pub enum RobotsResult {
     /// 2xx: cache the (truncated) body.
     Fetched { status: u16, body: String },
-    /// 4xx: unrestricted — cache an empty allow-all body.
+    /// 4xx: unrestricted; cache an empty allow-all body.
     AllowAll { status: u16 },
     /// 5xx / network error: complete disallow; host stalls, retried hourly.
     Unavailable { status: Option<u16> },
@@ -201,7 +201,7 @@ pub struct StoredPage {
     pub payload_len: u64,
     pub sha256: [u8; 32],
     pub noindex: bool,
-    /// (normalized url, host) — deduped, capped by the extractor.
+    /// (normalized url, host), deduped and capped by the extractor.
     pub links: Vec<(String, String)>,
     /// Readability output; None means too little text ('empty').
     pub extract: Option<crate::extract::Extracted>,
@@ -218,7 +218,7 @@ pub enum Outcome {
     CrossRedirect {
         target: Option<(String, String)>,
     },
-    /// robots.txt disallow — no HTTP request was made, host turn not consumed.
+    /// robots.txt disallow: no HTTP request was made, host turn not consumed.
     Denied,
     PermanentFail {
         reason: String,
@@ -246,7 +246,7 @@ pub struct Completion {
 pub enum IngestLocation {
     /// Append the member into our own open shard (bootstrap, local ingest).
     Append { member: Vec<u8> },
-    /// Already on disk inside a registered (remote) shard — reference it.
+    /// Already on disk inside a registered (remote) shard; reference it.
     Stored {
         shard_id: i64,
         offset: i64,
@@ -337,7 +337,7 @@ impl Db {
     }
 
     /// How many frontier rows are in flight or will become due within
-    /// `horizon` seconds — the "is the crawl actually done?" signal.
+    /// `horizon` seconds: the "is the crawl actually done?" signal.
     pub async fn pending_soon(&self, now: i64, horizon: i64) -> i64 {
         let (reply, rx) = oneshot::channel();
         if self
@@ -816,7 +816,7 @@ impl Writer {
                 r();
             }
             // Seal + rotate outside the batch transaction (blake3 reads the
-            // file). Never seal a shard holding only its warcinfo record —
+            // file). Never seal a shard holding only its warcinfo record;
             // with a zero cap that would churn empty shards forever.
             if self.warc.shard.end >= self.warc.init.shard_cap_bytes
                 && self.warc.shard.records > 1

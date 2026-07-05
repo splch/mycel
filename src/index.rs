@@ -123,7 +123,7 @@ struct Indexer {
     writer: tantivy::IndexWriter,
     fields: Fields,
     lsh: SimHashIndex<u64, i64>,
-    /// doc_ids added/marked-skipped since the last completed mark round —
+    /// doc_ids added/marked-skipped since the last completed mark round;
     /// keeps the periodic sweep from double-processing in-flight rows.
     in_flight: HashSet<i64>,
     pending_marks: Vec<(i64, i64, Option<&'static str>)>,
@@ -270,7 +270,7 @@ impl Indexer {
         }
     }
 
-    /// Reconciliation: cold-path (re-)extraction of docs left `indexed = 0` —
+    /// Reconciliation: cold-path (re-)extraction of docs left `indexed = 0`:
     /// crash recovery, `ingest` registrations, and `reindex --missing`.
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();

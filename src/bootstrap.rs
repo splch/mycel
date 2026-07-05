@@ -1,6 +1,6 @@
 //! Common Crawl bootstrap + local WARC ingest.
 //!
-//! Subset selection stays outside the binary (DuckDB/Athena/CDX — see README);
+//! Subset selection stays outside the binary (DuckDB/Athena/CDX; see README);
 //! mycel consumes two CSVs: hosts.csv (host,hcrank10) and records.csv
 //! (url,warc_filename,warc_record_offset,warc_record_length). Fetched members
 //! are appended verbatim into our own WARC store (origin = self), indexed,
@@ -17,7 +17,7 @@ use std::time::Duration;
 const FETCH_RETRIES: u32 = 5;
 const CC_BASE: &str = "https://data.commoncrawl.org";
 
-/// Step 1: seed hosts.csv — activate hosts and seed centrality (hcrank10/10).
+/// Step 1: seed hosts.csv, activating hosts and seeding centrality (hcrank10/10).
 /// Offline, direct connection; returns the number of hosts seeded.
 pub fn seed_hosts(conn: &mut rusqlite::Connection, path: &Path) -> Result<u64> {
     let mut rdr = csv::ReaderBuilder::new()

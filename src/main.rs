@@ -20,7 +20,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 const USAGE: &str = "\
-mycel — a fast, decentralized web crawler, indexer, and search engine
+mycel: a fast, decentralized web crawler, indexer, and search engine
 
 Usage: mycel <command> [options]
 
@@ -104,7 +104,7 @@ fn load_env() -> Result<(config::Config, PathBuf)> {
     let cfg = config::Config::load()?;
     let data = cfg.resolve_data_dir()?;
     if !data.join("mycel.sqlite").exists() {
-        return Err("data dir not initialized — run `mycel init` first".into());
+        return Err("data dir not initialized; run `mycel init` first".into());
     }
     Ok((cfg, data))
 }
@@ -142,7 +142,7 @@ fn cmd_id() -> Result<()> {
     let data = cfg.resolve_data_dir()?;
     let key_path = data.join("identity.key");
     if !key_path.exists() {
-        return Err("no identity yet — run `mycel init` first".into());
+        return Err("no identity yet; run `mycel init` first".into());
     }
     let sk = net::endpoint::load_or_create_identity(&key_path)?;
     println!("{}", net::endpoint::endpoint_id(&sk));
@@ -169,7 +169,7 @@ fn cmd_seed(rest: &[String]) -> Result<()> {
         }
     }
     if entries.is_empty() {
-        return Err("nothing to seed — pass hosts/URLs or --from-file".into());
+        return Err("nothing to seed; pass hosts/URLs or --from-file".into());
     }
 
     let (_cfg, data) = load_env()?;
@@ -295,7 +295,7 @@ fn cmd_ingest(rest: &[String]) -> Result<()> {
     })
 }
 
-/// `mycel run`: the full daemon — crawler + indexer + API — until Ctrl-C.
+/// `mycel run`: the full daemon (crawler + indexer + API) until Ctrl-C.
 fn cmd_run() -> Result<()> {
     daemon(DaemonOpts {
         with_api: true,
@@ -322,7 +322,7 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         let live = index::open_or_create(&data.join("index"))?;
         let probe: std::result::Result<tantivy::IndexWriter, _> = live.writer(64 * 1024 * 1024);
         if probe.is_err() {
-            return Err("the index is in use — stop `mycel run`/`crawl` before reindexing".into());
+            return Err("the index is in use; stop `mycel run`/`crawl` before reindexing".into());
         }
     }
     let dest = data.join("index.new");
@@ -394,7 +394,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
     let (cfg, data) = load_env()?;
     if matches!(opts.work, DaemonWork::Crawl { .. }) && cfg.crawl.contact_url.is_empty() {
         return Err(
-            "crawl.contact_url must be set in mycel.toml before crawling — it identifies \
+            "crawl.contact_url must be set in mycel.toml before crawling; it identifies \
              your crawler in the user agent"
                 .into(),
         );
@@ -436,7 +436,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("interrupt — shutting down");
+                tracing::info!("interrupt, shutting down");
                 cancel.cancel();
             });
         }
@@ -600,7 +600,7 @@ fn cmd_search(rest: &[String]) -> Result<()> {
     }
     let (cfg, data) = load_env()?;
     if federated {
-        // Fan-out needs the node's live endpoint — go through the daemon.
+        // Fan-out needs the node's live endpoint; go through the daemon.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -612,7 +612,7 @@ fn cmd_search(rest: &[String]) -> Result<()> {
             );
             let resp = reqwest::get(&url)
                 .await
-                .map_err(|_| "federated search needs the daemon — start `mycel run` first")?;
+                .map_err(|_| "federated search needs the daemon; start `mycel run` first")?;
             let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&v)?);

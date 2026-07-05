@@ -1,6 +1,6 @@
 //! Offline harmonic centrality over the host-level webgraph.
 //!
-//! H(v) = Σ_{u≠v} 1/d(u,v) with distances along *incoming* paths — computed by
+//! H(v) = Σ_{u≠v} 1/d(u,v) with distances along *incoming* paths, computed by
 //! walking the transposed graph from v. Exact all-sources BFS below the
 //! configured threshold; HyperBall (Boldi & Vigna) with our own small
 //! HyperLogLog above it. Scores are percentile-normalized into [0,1] and
@@ -24,11 +24,11 @@ pub fn run(conn: &mut Connection, exact_max: usize, force: bool) -> Result<RankO
     let (ids, radj) = load_transposed(conn)?;
     let n = ids.len();
     if n == 0 {
-        return Err("webgraph is empty — crawl first".into());
+        return Err("webgraph is empty; crawl first".into());
     }
     if n < MIN_GRAPH_HOSTS && !force {
         return Err(format!(
-            "webgraph has only {n} hosts (<{MIN_GRAPH_HOSTS}); seeded ranks are likely better — \
+            "webgraph has only {n} hosts (<{MIN_GRAPH_HOSTS}); seeded ranks are likely better; \
              pass --force to rank anyway"
         )
         .into());
@@ -91,7 +91,7 @@ fn load_transposed(conn: &Connection) -> Result<(Vec<i64>, Vec<Vec<u32>>)> {
     Ok((ids, radj))
 }
 
-/// Exact all-sources BFS over the transpose. O(V·E) — fine at v1 host counts.
+/// Exact all-sources BFS over the transpose. O(V·E), fine at v1 host counts.
 fn exact_harmonic(radj: &[Vec<u32>]) -> Vec<f64> {
     let n = radj.len();
     let mut scores = vec![0.0f64; n];
@@ -124,7 +124,7 @@ fn exact_harmonic(radj: &[Vec<u32>]) -> Vec<f64> {
 // --------------------------------------------------------------- HyperBall --
 
 const HLL_P: usize = 6;
-const HLL_M: usize = 1 << HLL_P; // 64 registers, ~13% rel. error — a boost, not a metric
+const HLL_M: usize = 1 << HLL_P; // 64 registers, ~13% rel. error; a boost, not a metric
 const HLL_ALPHA: f64 = 0.709;
 
 #[derive(Clone)]
@@ -138,7 +138,7 @@ impl Hll {
     }
 
     fn add(&mut self, item: u64) {
-        // Mix with SplitMix64 — node indices are sequential, raw bits won't do.
+        // Mix with SplitMix64: node indices are sequential, raw bits won't do.
         let mut x = item.wrapping_add(0x9E3779B97F4A7C15);
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);

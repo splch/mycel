@@ -335,7 +335,7 @@ async fn sync_stream(
 }
 
 /// Probe every configured peer: an empty query must come back as a
-/// BadRequest reply — proving dial, auth, and protocol in one round trip.
+/// BadRequest reply, proving dial, auth, and protocol in one round trip.
 pub async fn check_peers(
     endpoint: &iroh::Endpoint,
     peers: &[config::PeerCfg],

@@ -14,7 +14,7 @@ pub struct Parsed {
 
 /// Streaming parse of a (decompressed) sitemap document. Namespace-agnostic:
 /// element names match by local suffix. Anything unparseable yields what was
-/// collected so far — a partial sitemap is still useful.
+/// collected so far; a partial sitemap is still useful.
 pub fn parse(xml: &[u8]) -> Parsed {
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);

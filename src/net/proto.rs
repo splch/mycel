@@ -1,6 +1,6 @@
 //! Wire protocol: the ALPN string IS the version; frames are u32-LE length +
 //! JSON. JSON over a binary codec: zero new dependencies, additive evolution
-//! via serde defaults, debuggable by eye — and bulk bytes (shard payloads)
+//! via serde defaults, debuggable by eye; bulk bytes (shard payloads)
 //! bypass the codec entirely as raw stream bytes.
 
 use crate::Result;

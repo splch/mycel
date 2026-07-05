@@ -102,7 +102,7 @@ pub async fn run(
         if jobs.is_empty() {
             let all_idle = sem.available_permits() == concurrency;
             idle_rounds = if all_idle { idle_rounds + 1 } else { 0 };
-            // Nothing claimable right now — but rows may be politeness-gated
+            // Nothing claimable right now, but rows may be politeness-gated
             // or backing off. Exit only when nothing is due within an hour.
             if opts.exit_when_idle
                 && all_idle
@@ -221,7 +221,7 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
 }
 
 /// Politeness: the largest of the config floor, robots crawl-delay (capped at
-/// 30 s — a larger ask is treated as "very slowly", not "never"), and the
+/// 30 s; a larger ask is treated as "very slowly", not "never"), and the
 /// host's sticky 429-doubled delay.
 fn effective_delay_ms(cfg: &CrawlCfg, robots_delay_s: Option<f32>, host_delay_ms: i64) -> i64 {
     let robots_ms = robots_delay_s
@@ -249,7 +249,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<i64> {
 }
 
 async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, String)>) {
-    // Derive from the job URL so the authority (including any port) survives —
+    // Derive from the job URL so the authority (including any port) survives;
     // the hosts-table key deliberately drops ports.
     let url = match Url::parse(&job.url) {
         Ok(mut u) => {
@@ -307,7 +307,7 @@ async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, Str
     }
 }
 
-/// GET following up to 5 redirects blindly — used only for robots.txt, where
+/// GET following up to 5 redirects blindly, used only for robots.txt, where
 /// RFC 9309 says to follow them (cross-host included).
 async fn get_following_redirects(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
     let mut cur = url.to_string();
@@ -501,7 +501,7 @@ async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Op
             );
         }
 
-        // 2xx. Content-type gate for pages (sitemaps are XML — no gate);
+        // 2xx. Content-type gate for pages (sitemaps are XML, no gate);
         // the header also feeds charset decoding at extraction time.
         let content_type = resp
             .headers()
@@ -560,7 +560,7 @@ async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Op
             return (parse_sitemap_outcome(&job.host, body), None);
         }
 
-        // Page: extraction + WARC member build are CPU-bound — off the runtime.
+        // Page: extraction + WARC member build are CPU-bound, so they run off the runtime.
         let url_for_record = final_url.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             build_stored(

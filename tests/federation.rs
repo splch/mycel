@@ -1,5 +1,5 @@
 //! Integration test (b): two real nodes on loopback (preset = "empty", no
-//! relays, no address lookup — explicit peer addrs). A ingests the CC fixture;
+//! relays, no address lookup; explicit peer addrs). A ingests the CC fixture;
 //! B federated-queries A (source badge proves attribution) and pulls A's
 //! sealed shards into its own local index. A rejects a third, unlisted node.
 

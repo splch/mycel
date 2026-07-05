@@ -32,7 +32,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
 
-  # Native builds only — no cross-compilation (aws-lc-sys makes that painful).
+  # Native builds only, no cross-compilation (aws-lc-sys makes that painful).
   # Targets are the devices mycel actually serves; Windows and musl are
   # deliberately absent until someone tests/needs them.
   build:

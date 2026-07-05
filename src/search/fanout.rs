@@ -1,5 +1,5 @@
 //! Query fan-out: local search always; peers in parallel behind a hard
-//! timeout. Merge = round-robin interleave (never a global score sort —
+//! timeout. Merge = round-robin interleave (never a global score sort;
 //! scores are not comparable across nodes), dedup by URL keep-first.
 
 use crate::net::endpoint::dial;
@@ -185,7 +185,7 @@ mod tests {
         let peer_b = vec![hit("b1", 50.0, Some("b"))];
         let m = merge(local, vec![peer_a, peer_b], 10);
         let urls: Vec<&str> = m.iter().map(|h| h.url.as_str()).collect();
-        // Interleave order, local first — NOT by score (a1 would win a sort).
+        // Interleave order, local first, NOT by score (a1 would win a sort).
         assert_eq!(urls, vec!["l1", "a1", "b1", "l2", "a2"]);
     }
 

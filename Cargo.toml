@@ -1,6 +1,6 @@
 [package]
 name = "mycel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast, decentralized web crawler, indexer, and search engine"
 license = "AGPL-3.0-only"

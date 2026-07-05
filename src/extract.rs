@@ -46,7 +46,7 @@ pub fn decode_html(bytes: &[u8], content_type: Option<&str>) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Naive ASCII scan for `charset=`/`charset ="` inside the head — enough for
+/// Naive ASCII scan for `charset=`/`charset ="` inside the head, enough for
 /// the common `<meta charset=utf-8>` / http-equiv forms.
 fn sniff_meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let lower: Vec<u8> = head.iter().map(|b| b.to_ascii_lowercase()).collect();
@@ -63,7 +63,7 @@ fn sniff_meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
 }
 
 /// Parse the page once for links and robots meta. `final_url` is the URL the
-/// content was actually served from (post-redirect) — the base for relatives.
+/// content was actually served from (post-redirect), the base for relatives.
 pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
     let doc = scraper::Html::parse_document(html);
 

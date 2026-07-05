@@ -1,6 +1,6 @@
 //! Hand-rolled WARC/1.0 subset: gzip-member-per-record files, exactly the shape
 //! Common Crawl publishes, so one reader path serves our own shards, peer
-//! shards, and CC bootstrap fetches. WARC and gzip are frozen formats — this
+//! shards, and CC bootstrap fetches. WARC and gzip are frozen formats; this
 //! module should never need maintenance.
 
 use crate::Result;
@@ -180,7 +180,7 @@ pub fn parse_record(buf: &[u8]) -> Result<Record> {
 
 // ---------------------------------------------------------------- reading --
 
-/// Read the single gzip member at (offset, len) — the docs-table access path,
+/// Read the single gzip member at (offset, len), the docs-table access path,
 /// identical in shape to a Common Crawl ranged fetch.
 pub fn read_member_at(path: &Path, offset: u64, len: u64) -> Result<Record> {
     let mut f = File::open(path)?;
@@ -334,7 +334,7 @@ impl ShardFile {
         Ok((offset, member.len() as u64))
     }
 
-    /// Whole-file blake3 (streamed) — the shard's identity once sealed.
+    /// Whole-file blake3 (streamed), the shard's identity once sealed.
     /// Hashes through a separate read handle so the append handle's cursor is
     /// never disturbed (a mid-hash failure must not corrupt later appends).
     pub fn blake3_hex(&mut self) -> Result<String> {
@@ -566,7 +566,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&info.body).contains("software: mycel/"));
     }
     /// Real Common Crawl members (CC-MAIN-2025-38), fetched once by ranged GET
-    /// against index.commoncrawl.org pointers — see README "Fixture".
+    /// against index.commoncrawl.org pointers; see README "Fixture".
     #[test]
     fn reads_real_common_crawl_members() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

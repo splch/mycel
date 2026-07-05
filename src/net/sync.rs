@@ -118,7 +118,7 @@ async fn sync_peer(deps: &NetDeps, peer: &config::PeerCfg) -> Result<()> {
     for meta in wanted.into_iter().filter(|m| !known.contains(&m.blake3)) {
         if used + meta.bytes > deps.max_total_bytes {
             tracing::warn!(
-                "sync quota reached ({used}/{} bytes) — raise [sync].max_total_bytes to keep pulling",
+                "sync quota reached ({used}/{} bytes); raise [sync].max_total_bytes to keep pulling",
                 deps.max_total_bytes
             );
             return Ok(());

@@ -5,12 +5,12 @@ A fast, decentralized web crawler, indexer, and search engine in one Rust binary
 Every mycel node is a **complete search engine**: a polite crawler, a WARC
 document store (the source of truth), a [tantivy](https://github.com/quickwit-oss/tantivy)
 index (disposable, always rebuildable), BM25 + harmonic-centrality ranking, and
-an HTTP API. A node is fully useful with zero peers; federation is additive —
+an HTTP API. A node is fully useful with zero peers; federation is additive:
 nodes dial each other by public key over [iroh](https://iroh.computer) QUIC,
 fan queries out to an explicit peer list, and exchange crawl corpora as
 immutable WARC shards. No DHT, no global state, no token anything.
 
-The architecture is the product of adversarially verified research — see
+The architecture is the product of adversarially verified research; see
 [RESEARCH.md](docs/RESEARCH.md) for the evidence and
 [SPEC.md](docs/SPEC.md) for the full
 specification.
@@ -31,7 +31,7 @@ $ mycel search "some phrase"
 $ mycel run                        # daemon: crawler + indexer + API on :8080
 ```
 
-An empty `mycel.toml` is valid — every setting has a default. The crawler
+An empty `mycel.toml` is valid: every setting has a default. The crawler
 refuses to run until `crawl.contact_url` identifies you.
 
 ## Commands
@@ -55,7 +55,7 @@ refuses to run until `crawl.contact_url` identifies you.
 You don't need to crawl the planet: Common Crawl already did. Subset selection
 happens **outside** mycel with standard tools; mycel consumes two CSVs.
 
-**1. `hosts.csv` — top-K hosts by harmonic centrality** (DuckDB CLI over plain
+**1. `hosts.csv`: top-K hosts by harmonic centrality** (DuckDB CLI over plain
 HTTPS, no AWS account). Common Crawl's host index publishes `hcrank10`, a 0–10
 harmonic-centrality rank mycel uses to seed result boosting:
 
@@ -79,10 +79,10 @@ COPY (
 ) TO 'hosts.csv' (HEADER, DELIMITER ',');"
 ```
 
-The host index is a "testing" dataset — if a column rename breaks this query,
+The host index is a "testing" dataset; if a column rename breaks this query,
 fix the query, not mycel.
 
-**2. `records.csv` — WARC record pointers**
+**2. `records.csv`: WARC record pointers**
 (`url,warc_filename,warc_record_offset,warc_record_length`). Three routes,
 by scale:
 
@@ -116,7 +116,7 @@ by scale:
   ) TO 'records.csv' (HEADER, DELIMITER ',');"
   ```
 
-- **CDX API** (tiny samples, zero setup — also how the test fixture was made):
+- **CDX API** (tiny samples, zero setup; also how the test fixture was made):
 
   ```bash
   curl -s "https://index.commoncrawl.org/CC-MAIN-2025-38-index?url=example.com&output=json" \
@@ -135,7 +135,7 @@ $ mycel bootstrap --hosts hosts.csv --records records.csv
 ```
 
 Fetches are ranged GETs against `data.commoncrawl.org`, throttled (4-way, 10
-rps, sticky slowdown on 429/503), resumable (Ctrl-C and rerun — progress is
+rps, sticky slowdown on 429/503), resumable (Ctrl-C and rerun; progress is
 tracked per file), and every record lands in mycel's own WARC store, indexed,
 its links feeding the webgraph and frontier. Failures go to
 `bootstrap-failed.csv` in the data dir. After a real crawl accumulates a
@@ -143,7 +143,7 @@ webgraph, `mycel rank` replaces the seeded ranks with your own.
 
 ## Federation
 
-Nodes federate over [iroh](https://iroh.computer) QUIC — dial by public key,
+Nodes federate over [iroh](https://iroh.computer) QUIC: dial by public key,
 ~90% direct connections through NAT, relays as fallback. Trust is social: each
 node lists the peers it accepts, and that allowlist is the only gate.
 
@@ -165,12 +165,12 @@ sync = true         # pull bob's crawl corpus
 
 - **Query fan-out**: `/api/search?q=…&federated=1` (or `mycel search --federated`
   against the running daemon) queries all peers in parallel behind a hard
-  timeout; results interleave round-robin — never a cross-node score sort —
+  timeout; results interleave round-robin (never a cross-node score sort),
   deduped by URL, each remote hit badged with the peer that answered.
   The requester stamps attribution from the dialed key: unspoofable.
 - **Shard sync**: peers exchange crawl corpora as immutable, blake3-verified
   WARC shards (pull-based, quota-capped, resumable). Nodes export only
-  self-crawled shards — no transitive flooding. Synced documents join the
+  self-crawled shards: no transitive flooding. Synced documents join the
   local index through the same dedup gates as everything else.
 - **`mycel peers check`** proves dial + auth + protocol for every peer in one
   round trip.
@@ -191,10 +191,10 @@ LAN/tests/airgap).
 `tests/fixtures/cc-sample.warc.gz` is three real CC-MAIN-2025-38 members
 (example.com, marginalia.nu, commoncrawl.org/blog) fetched by ranged GET using
 pointers from `https://index.commoncrawl.org/CC-MAIN-2025-38-index?url=…` and
-concatenated — standalone gzip members make a valid multi-member WARC.
+concatenated; standalone gzip members make a valid multi-member WARC.
 
 ## License
 
-[AGPL-3.0-only](LICENSE). Run it, self-host it, fork it — but if you offer a
+[AGPL-3.0-only](LICENSE). Run it, self-host it, fork it. But if you offer a
 modified mycel to users over a network, publish your modifications. The same
 reciprocity that shard sync asks of your corpus, applied to the code.
