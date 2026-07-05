@@ -13,7 +13,7 @@ immutable WARC shards. No DHT, no global state, no token anything.
 The architecture is the product of adversarially verified research; see
 [RESEARCH.md](docs/RESEARCH.md) for the evidence and
 [SPEC.md](docs/SPEC.md) for the full
-specification.
+specification. The complete user manual is [MANUAL.md](docs/MANUAL.md).
 
 ## Quickstart
 
