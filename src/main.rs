@@ -1,3 +1,4 @@
+mod admin;
 mod api;
 mod bootstrap;
 mod config;
@@ -173,48 +174,13 @@ fn cmd_seed(rest: &[String]) -> Result<()> {
     }
 
     let (_cfg, data) = load_env()?;
+    let pairs = entries
+        .iter()
+        .map(|e| urlnorm::parse_seed_entry(e))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut conn = db::open(&data.join("mycel.sqlite"))?;
-    let now = db::now();
     let tx = conn.transaction()?;
-    let (mut hosts_n, mut urls_n) = (0u64, 0u64);
-    for entry in &entries {
-        let (host, url) = if entry.contains("://") {
-            let url =
-                urlnorm::normalize(entry).ok_or_else(|| format!("not a crawlable URL: {entry}"))?;
-            let host = urlnorm::host_of(&url).ok_or_else(|| format!("no host in: {entry}"))?;
-            (host, url)
-        } else {
-            let host = entry.trim().trim_end_matches('/').to_ascii_lowercase();
-            if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
-                return Err(format!("not a host name: {entry}").into());
-            }
-            let url = urlnorm::normalize(&format!("https://{host}/"))
-                .ok_or_else(|| format!("not a host name: {entry}"))?;
-            (host, url)
-        };
-        tx.execute(
-            "INSERT INTO hosts (host, state, added_at) VALUES (?1, 1, ?2)
-             ON CONFLICT(host) DO UPDATE SET state = 1",
-            rusqlite::params![host, now],
-        )?;
-        hosts_n += 1;
-        let host_id: i64 = tx.query_row("SELECT id FROM hosts WHERE host = ?1", [&host], |r| {
-            r.get(0)
-        })?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO frontier (host_id, url, kind, state, next_attempt_at, attempts,
-                                             depth, discovered_at)
-             VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)",
-            rusqlite::params![host_id, url, now],
-        )?;
-        if inserted > 0 {
-            urls_n += 1;
-            tx.execute(
-                "UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1",
-                [host_id],
-            )?;
-        }
-    }
+    let (hosts_n, urls_n) = db::seed_into(&tx, db::now(), &pairs)?;
     tx.commit()?;
     println!("activated {hosts_n} hosts, enqueued {urls_n} urls");
     Ok(())
@@ -520,6 +486,13 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
                 stats_conn: tokio::sync::Mutex::new(db::open(&data.join("mycel.sqlite"))?),
                 page_size: cfg.api.page_size,
                 fed,
+                admin: std::sync::Arc::new(admin::AdminState::new(
+                    cfg.clone(),
+                    config::config_path(),
+                    data.clone(),
+                    origin.clone(),
+                    index_tx.clone(),
+                )),
             });
             let bind = cfg.api.bind.clone();
             let cancel = cancel.clone();
@@ -554,15 +527,13 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
             DaemonWork::Bootstrap { records } => {
                 let recs = bootstrap::load_records_csv(records)?;
                 let key = bootstrap::resume_key(records)?;
-                let meta_conn = db::open(&data.join("mycel.sqlite"))?;
                 let bcfg = bootstrap::BootstrapCfg {
                     concurrency: cfg.bootstrap.concurrency,
                     rate_limit_per_sec: cfg.bootstrap.rate_limit_per_sec,
                     contact: cfg.crawl.contact_url.clone(),
                     failed_log: data.join("bootstrap-failed.csv"),
                 };
-                let (done, failed) =
-                    bootstrap::fetch_records(&db, &meta_conn, &bcfg, &recs, &key).await?;
+                let (done, failed) = bootstrap::fetch_records(&db, &bcfg, &recs, &key).await?;
                 tracing::info!("bootstrap: {done} records ingested, {failed} failed");
             }
             DaemonWork::Ingest { paths } => {
@@ -726,7 +697,7 @@ fn cmd_peers(rest: &[String]) -> Result<()> {
     })
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {

@@ -23,6 +23,7 @@ const SWEEP_BATCH: usize = 200;
 pub enum IndexMsg {
     Add(Box<IndexDoc>),
     Delete(String),
+    Sweep,
     Shutdown,
 }
 
@@ -175,6 +176,7 @@ impl Indexer {
                         .delete_term(Term::from_field_text(self.fields.url, &url));
                     self.dirty_ops += 1;
                 }
+                Ok(IndexMsg::Sweep) => self.sweep(),
                 Ok(IndexMsg::Shutdown) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

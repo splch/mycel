@@ -268,7 +268,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.crawl.scope != "host" {
             return Err(
                 format!("crawl.scope must be \"host\" (got {:?})", self.crawl.scope).into(),

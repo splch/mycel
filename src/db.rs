@@ -275,6 +275,10 @@ enum Cmd {
         batch: usize,
         reply: oneshot::Sender<Vec<Job>>,
     },
+    Seed {
+        entries: Vec<(String, String)>,
+        reply: oneshot::Sender<Result<(u64, u64)>>,
+    },
     PendingSoon {
         now: i64,
         horizon: i64,
@@ -302,6 +306,14 @@ enum Cmd {
         title: String,
         lang: &'static str,
         simhash: i64,
+    },
+    MetaPut {
+        key: String,
+        value: String,
+    },
+    MetaGet {
+        key: String,
+        reply: oneshot::Sender<Option<String>>,
     },
     Counter {
         name: &'static str,
@@ -334,6 +346,17 @@ impl Db {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    /// Activate hosts + enqueue start URLs through the writer (the daemon-side
+    /// `mycel seed`). Entries are (host key, normalized URL) pairs.
+    pub async fn seed(&self, entries: Vec<(String, String)>) -> Result<(u64, u64)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Seed { entries, reply })
+            .await
+            .map_err(|_| "db writer gone")?;
+        rx.await.map_err(|_| "db writer gone")?
     }
 
     /// How many frontier rows are in flight or will become due within
@@ -414,6 +437,20 @@ impl Db {
             lang,
             simhash,
         });
+    }
+
+    /// Upsert a meta key. Ordered behind everything already sent, so a
+    /// bootstrap checkpoint can never land before its chunk's ingests.
+    pub async fn meta_put(&self, key: String, value: String) {
+        let _ = self.tx.send(Cmd::MetaPut { key, value }).await;
+    }
+
+    pub async fn meta_get(&self, key: String) -> Option<String> {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(Cmd::MetaGet { key, reply }).await.is_err() {
+            return None;
+        }
+        rx.await.unwrap_or(None)
     }
 
     pub async fn counter(&self, name: &'static str, delta: i64) {
@@ -653,6 +690,12 @@ impl Writer {
                             let _ = reply.send(jobs);
                         }));
                     }
+                    Cmd::Seed { entries, reply } => {
+                        let res = seed_into(&tx, now(), &entries);
+                        replies.push(Box::new(move || {
+                            let _ = reply.send(res);
+                        }));
+                    }
                     Cmd::PendingSoon {
                         now,
                         horizon,
@@ -766,6 +809,26 @@ impl Writer {
                         {
                             tracing::error!("update doc {doc_id} failed: {e}");
                         }
+                    }
+                    Cmd::MetaPut { key, value } => {
+                        if let Err(e) = tx
+                            .prepare_cached(
+                                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            )
+                            .and_then(|mut s| s.execute(params![key, value]))
+                        {
+                            tracing::error!("meta put {key} failed: {e}");
+                        }
+                    }
+                    Cmd::MetaGet { key, reply } => {
+                        let v = tx
+                            .prepare_cached("SELECT value FROM meta WHERE key = ?1")
+                            .and_then(|mut s| s.query_row([&key], |r| r.get(0)))
+                            .ok();
+                        replies.push(Box::new(move || {
+                            let _ = reply.send(v);
+                        }));
                     }
                     Cmd::Counter { name, delta } => {
                         *self.counters.entry(name).or_insert(0) += delta;
@@ -1251,6 +1314,37 @@ fn fail_permanent(tx: &Transaction, frontier_id: i64, reason: &str) -> Result<()
     )?
     .execute(params![reason, frontier_id])?;
     Ok(())
+}
+
+/// The `mycel seed` write: activate each host and enqueue its start URL.
+/// Shared by the CLI (own connection + transaction) and the writer thread
+/// (batch transaction).
+pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> Result<(u64, u64)> {
+    let (mut hosts_n, mut urls_n) = (0u64, 0u64);
+    for (host, url) in entries {
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES (?1, 1, ?2)
+             ON CONFLICT(host) DO UPDATE SET state = 1",
+            params![host, now],
+        )?;
+        hosts_n += 1;
+        let host_id: i64 =
+            conn.query_row("SELECT id FROM hosts WHERE host = ?1", [host], |r| r.get(0))?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO frontier (host_id, url, kind, state, next_attempt_at, attempts,
+                                             depth, discovered_at)
+             VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)",
+            params![host_id, url, now],
+        )?;
+        if inserted > 0 {
+            urls_n += 1;
+            conn.execute(
+                "UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1",
+                [host_id],
+            )?;
+        }
+    }
+    Ok((hosts_n, urls_n))
 }
 
 /// Record a candidate host + webgraph edge, and enqueue the URL if its host is

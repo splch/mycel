@@ -57,6 +57,24 @@ fn finish(mut u: Url) -> Option<String> {
     (s.len() <= MAX_URL_LEN).then_some(s)
 }
 
+/// One `mycel seed` entry, from the CLI or the admin page: a bare host name
+/// (enqueues its https root) or a full URL. Returns (host key, normalized URL).
+pub fn parse_seed_entry(entry: &str) -> std::result::Result<(String, String), String> {
+    if entry.contains("://") {
+        let url = normalize(entry).ok_or_else(|| format!("not a crawlable URL: {entry}"))?;
+        let host = host_of(&url).ok_or_else(|| format!("no host in: {entry}"))?;
+        Ok((host, url))
+    } else {
+        let host = entry.trim().trim_end_matches('/').to_ascii_lowercase();
+        if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+            return Err(format!("not a host name: {entry}"));
+        }
+        let url = normalize(&format!("https://{host}/"))
+            .ok_or_else(|| format!("not a host name: {entry}"))?;
+        Ok((host, url))
+    }
+}
+
 /// The host key used for the hosts table: lowercase, punycode, no port,
 /// no trailing dot. None for IP-less/hostless URLs is impossible after
 /// normalize(), but this is also called on raw operator input.

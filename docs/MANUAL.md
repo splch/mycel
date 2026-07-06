@@ -1,6 +1,6 @@
 # mycel user manual
 
-This manual describes mycel 0.1.1. It covers installation, configuration,
+This manual describes mycel 0.2.0. It covers installation, configuration,
 every command, the query language, the HTTP API, crawler behavior, Common
 Crawl bootstrapping, federation, and day-2 operations. The design rationale
 lives in [RESEARCH.md](RESEARCH.md) and the specification in [SPEC.md](SPEC.md);
@@ -64,7 +64,7 @@ $ git clone https://github.com/splch/mycel
 $ cd mycel
 $ cargo build --release
 $ ./target/release/mycel version
-mycel 0.1.1
+mycel 0.2.0
 ```
 
 There are no runtime dependencies: SQLite is bundled, TLS is rustls. The
@@ -433,6 +433,10 @@ exits non-zero if any peer failed.
 Print the version (`--version`/`-V` also work) or the usage summary
 (`--help`/`-h`; also printed when no command is given).
 
+While `mycel run` is up, everything above except `init` and full `reindex`
+is also available in the browser at `/admin` (see
+[the admin page](#get-admin-the-admin-page)).
+
 ## 7. Query syntax and ranking
 
 Queries are capped at 512 characters. Tokens are matched against title and
@@ -467,7 +471,7 @@ clamped to 20. The `total` field is the exact match count.
 
 Served by `mycel run` at `api.bind` (default `127.0.0.1:8080`). No
 authentication, no TLS, and CORS headers are not set: treat it as a local or
-reverse-proxied service. All responses are JSON except `/`.
+reverse-proxied service. All responses are JSON except `/` and `/admin`.
 
 ### `GET /`
 
@@ -514,6 +518,31 @@ Server-rendered HTML search UI with pagination. Accepts the same `q`,
 Probes every configured peer (see `mycel peers check`). Returns
 `{"peers": [{"peer": "bee", "ok": true, "detail": ""}]}`. HTTP 400 with
 `federation is not enabled` when the daemon runs without federation.
+
+### `GET /admin` (the admin page)
+
+Server-rendered forms that expose the CLI against the running daemon:
+node identity and status (the `mycel id` / `mycel status` gauges), `seed`,
+`rank [--force]`, `ingest`, `bootstrap`, an "index pending docs" button
+(= `reindex --missing`), `peers check`, and a `mycel.toml` editor. Long
+operations (rank, ingest, bootstrap) run in-process, one at a time; the page
+shows the last job's outcome, and detailed progress stays on stderr.
+
+Two commands are deliberately absent: `init` (a running daemon presupposes
+it) and full `reindex` (it needs the index writer lock the daemon holds).
+
+The config editor edits the raw file (comments survive), validates through
+the real parser before writing, and rejects unknown keys exactly like
+startup does. Saved changes apply on the next daemon start; the running
+daemon keeps its boot config.
+
+Every mutation is a `POST /admin/<action>` form carrying a CSRF token minted
+at boot, and all `/admin` routes require a `Host` header matching `api.bind`
+(or its `127.0.0.1`/`localhost`/`[::1]` equivalents), so a web page you
+happen to visit cannot drive your node. This is browser-attack hardening,
+not authentication: anything that can already send local HTTP can read the
+token from the page. The API's trust model is unchanged (keep it on
+localhost or behind a reverse proxy; a proxy must forward a matching `Host`).
 
 ### `GET /healthz`
 
@@ -860,11 +889,15 @@ writer would truncate and append the same open shard file and corrupt it.
 | command | touches | safe while `run`/`crawl` is active? |
 |---|---|---|
 | `run`, `crawl` | everything | one of these at a time |
-| `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | **no**, stop the daemon first |
+| `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | **no** as a second process; use the admin page instead |
 | `reindex` (full) | index + db | refuses by itself (writer-lock probe) |
 | `seed`, `bootstrap --hosts`, `rank` | db (short write txn) | yes |
 | `search`, `status`, `id`, `peers check` | read-only | yes |
 | external `sqlite3` reads | db read | yes (WAL) |
+
+The admin page's ingest/bootstrap/sweep run *inside* the daemon, through its
+own db-writer and open shard, which is exactly why they are safe while the
+CLI versions (a second process, a second writer) are not.
 
 ### Running as a service
 
@@ -1037,9 +1070,10 @@ are decisions, not gaps):
   rather than the ranking.
 - No custom storage formats: SQLite, WARC, and tantivy, all inspectable
   with standard tooling (`sqlite3`, `zcat`/`warcio`).
-- No auth/TLS on the HTTP API (bind it locally or proxy it), no per-request
-  page size, no live config reload, no host blocklist tooling, no deletion
-  workflow.
+- No auth/TLS on the HTTP API (bind it locally or proxy it; the admin page's
+  CSRF token and Host check only stop cross-site browser attacks), no
+  per-request page size, no live config reload (the admin editor writes the
+  file; restart to apply), no host blocklist tooling, no deletion workflow.
 
 ## Appendix A: environment variables
 

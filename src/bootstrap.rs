@@ -223,16 +223,13 @@ pub struct BootstrapCfg {
 
 pub async fn fetch_records(
     dbh: &Db,
-    meta_conn: &rusqlite::Connection,
     cfg: &BootstrapCfg,
     records: &[RecordPointer],
     key: &str,
 ) -> Result<(u64, u64)> {
-    let start: usize = meta_conn
-        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
+    let start: usize = dbh
+        .meta_get(key.to_string())
+        .await
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     if start >= records.len() {
@@ -296,11 +293,8 @@ pub async fn fetch_records(
         // Chunk complete: make it durable, then advance the resume watermark.
         dbh.flush().await;
         let completed = start + (chunk_no + 1) * 100;
-        meta_conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, completed.min(total).to_string()],
-        )?;
+        dbh.meta_put(key.to_string(), completed.min(total).to_string())
+            .await;
         tracing::info!(
             "bootstrap progress: {}/{total} ({failed} failed)",
             completed.min(total)

@@ -5,7 +5,7 @@ use crate::{Result, db, search};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,7 @@ pub struct Api {
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
     pub page_size: usize,
     pub fed: Option<FedState>,
+    pub admin: Arc<crate::admin::AdminState>,
 }
 
 /// Federation context for the API: fan-out + peer checks.
@@ -32,6 +33,14 @@ pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Resu
         .route("/api/peers/check", get(peers_check))
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/admin", get(crate::admin::page))
+        .route("/admin/seed", post(crate::admin::seed))
+        .route("/admin/sweep", post(crate::admin::sweep))
+        .route("/admin/rank", post(crate::admin::rank_job))
+        .route("/admin/ingest", post(crate::admin::ingest_job))
+        .route("/admin/bootstrap", post(crate::admin::bootstrap_job))
+        .route("/admin/peers", post(crate::admin::peers_probe))
+        .route("/admin/config", post(crate::admin::save_config))
         .with_state(api);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("api listening on http://{bind}");
@@ -114,58 +123,88 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
     if !q.trim().is_empty() {
         match run_search(&api, q.clone(), page, p.federated).await {
             Ok((total, hits)) => {
-                results.push_str(&format!("<p class=meta>{total} results</p>"));
+                results.push_str(&format!("<p><small>{total} results</small></p>"));
                 for h in &hits {
                     let badge = match &h.source {
-                        Some(s) => format!(" <span class=badge>{}</span>", search::html_escape(s)),
+                        Some(s) => format!(" <small>[{}]</small>", search::html_escape(s)),
                         None => String::new(),
                     };
                     results.push_str(&format!(
-                        "<div class=hit><a href=\"{url}\">{title}</a>{badge}\
-                         <div class=url>{url_show}</div><div class=snip>{snippet}</div></div>",
+                        "<article><a href=\"{url}\">{title}</a>{badge}<cite>{url}</cite>\
+                         <p>{snippet}</p></article>",
                         url = search::html_escape(&h.url),
                         title =
                             search::html_escape(if h.title.is_empty() { &h.url } else { &h.title }),
-                        url_show = search::html_escape(&h.url),
-                        snippet = h.snippet, // SnippetGenerator output is already escaped
+                        // Escaped by the SnippetGenerator; the JSON API keeps its <b> tags.
+                        snippet = h
+                            .snippet
+                            .replace("<b>", "<mark>")
+                            .replace("</b>", "</mark>"),
                     ));
                 }
-                let qe = search::html_escape(&q);
+                let qe = crate::urlencode(&q);
                 if page > 0 {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}\">&larr; prev</a> ",
+                        "<a href=\"/?q={qe}&page={}\">← prev</a> ",
                         page - 1
                     ));
                 }
                 if (page + 1) * api.page_size < total {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}\">next &rarr;</a>",
+                        "<a href=\"/?q={qe}&page={}\">next →</a>",
                         page + 1
                     ));
                 }
             }
-            Err(_) => results.push_str("<p class=meta>search failed</p>"),
+            Err(_) => results.push_str("<p class=err>search failed</p>"),
         }
     }
+    // Explicit with/local select instead of a checkbox: an unchecked checkbox
+    // sends nothing, which cannot express "force local" when fanout defaults on.
+    let fed_sel = match &api.fed {
+        Some(f) => {
+            let want = p.federated.map(|v| v != 0).unwrap_or(f.default_on);
+            format!(
+                "<select name=federated aria-label=scope>\
+                 <option value=1{}>with peers<option value=0{}>local only</select> ",
+                if want { " selected" } else { "" },
+                if want { "" } else { " selected" }
+            )
+        }
+        None => String::new(),
+    };
     Html(format!(
-        "<!doctype html><html><head><meta charset=utf-8>\
-         <meta name=viewport content=\"width=device-width, initial-scale=1\">\
-         <title>mycel</title><style>{CSS}</style></head><body>\
-         <form action=/ method=get><h1>mycel</h1>\
-         <input name=q value=\"{q}\" autofocus placeholder=\"search…\">\
-         <button>search</button></form>{results}</body></html>",
+        "<!doctype html><html lang=en><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>mycel</title><style>{CSS}</style>\
+         <nav><b>search</b> · <a href=/admin>admin</a></nav>\
+         <search><form><h1>mycel</h1>\
+         <input type=search name=q value=\"{q}\" placeholder=search… aria-label=search autofocus> \
+         {fed_sel}<button>search</button></form></search>{results}",
         q = search::html_escape(&q),
     ))
 }
 
-const CSS: &str = "body{font:16px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;\
-padding:0 1rem;color:#1a1a1a}h1{display:inline;font-size:1.3rem;margin-right:.8rem}\
-input{width:60%;padding:.45rem .6rem;font-size:1rem;border:1px solid #bbb;border-radius:4px}\
-button{padding:.45rem .9rem;font-size:1rem}.hit{margin:1.1rem 0}.hit a{font-size:1.05rem}\
-.url{color:#0a7d33;font-size:.85rem;overflow-wrap:anywhere}.snip{color:#444;font-size:.92rem}\
-.snip b{background:#fff2a8;font-weight:600}.meta{color:#777;font-size:.85rem}.badge{background:#e3ecff;color:#274690;border-radius:3px;padding:0 .35rem;font-size:.75rem}\
-@media(prefers-color-scheme:dark){body{background:#111;color:#ddd}.snip{color:#aaa}\
-.snip b{background:#5c4d00;color:#fff}input{background:#222;color:#ddd;border-color:#444}}";
+/// Shared by the search page and /admin.
+pub(crate) const CSS: &str = ":root{color-scheme:light dark}\
+*{box-sizing:border-box}\
+body{max-width:44rem;margin:2rem auto;padding:0 1rem;font:1rem/1.5 system-ui,sans-serif}\
+h1{display:inline;font-size:1.3rem;margin-right:.8rem}\
+h2{font-size:1.05rem;margin:1.4rem 0 .5rem;padding-top:1rem;border-top:1px solid light-dark(#ddd,#333)}\
+button,input,select,textarea{font:inherit}\
+input[type=search]{width:60%}\
+input[type=text],textarea{width:100%;font-family:ui-monospace,monospace}\
+form{margin:.8rem 0}\
+article{margin:1.2rem 0}\
+article p{margin:.2rem 0}\
+cite{display:block;font-style:normal;font-size:.85em;color:light-dark(#070,#8c8);overflow-wrap:anywhere}\
+dl{display:grid;grid-template-columns:max-content auto;gap:0 .7rem}\
+dd{margin:0;overflow-wrap:anywhere}\
+td{padding:.05rem .7rem .05rem 0;vertical-align:top}\
+nav{font-size:.85em}\
+nav,dt,small{color:light-dark(#555,#aaa)}\
+.msg{color:light-dark(#060,#7c7)}\
+.err{color:light-dark(#b00,#f77)}";
 
 async fn peers_check(State(api): State<Arc<Api>>) -> impl IntoResponse {
     let Some(fed) = &api.fed else {

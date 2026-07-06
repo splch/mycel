@@ -2,7 +2,7 @@
 
 ## Context
 
-The repo (`/home/spencer/Repositories/mycel`) is empty except `RESEARCH.md`, the adversarially-verified founding research (2026-07-04). Its six decisions and anti-feature list are **binding**: (1) federated full-stack nodes, no DHT; (2) BM25 + local harmonic-centrality boost; (3) tantivy index, WARC as source of truth; (4) iroh 1.0 endpoint only, own protocols on raw QUIC, explicit peers; (5) hand-rolled crawler on reqwest+tokio+texting_robots; (6) SQLite + WARC storage. This plan turns that research into a complete, correct, minimal v1: **one binary, ~6.3k LoC production + ~1.7k tests, 26 boring dependencies**. Every node is a whole search engine; federation is additive and off by default.
+The repo (`/home/spencer/Repositories/mycel`) is empty except `RESEARCH.md`, the adversarially-verified founding research (2026-07-04). Its six decisions and anti-feature list are **binding**: (1) federated full-stack nodes, no DHT; (2) BM25 + local harmonic-centrality boost; (3) tantivy index, WARC as source of truth; (4) iroh 1.0 endpoint only, own protocols on raw QUIC, explicit peers; (5) hand-rolled crawler on reqwest+tokio+texting_robots; (6) SQLite + WARC storage. This plan turns that research into a complete, correct, minimal v1: **one binary, ~6.3k LoC production + ~1.7k tests, 27 boring dependencies**. Every node is a whole search engine; federation is additive and off by default.
 
 Two spec-time API facts verified live during planning: iroh 1.0 renamed `NodeId`→`EndpointId` and "discovery"→"address lookup" (`SecretKey::generate()` takes no rng); cc-host-index's table is `cchost_index_testing_v2` with `surt_host_name`/`hcrank10`/`fetch_200_lote_pct`/`robots_*` columns.
 
@@ -37,6 +37,7 @@ src/
   search.rs    site: pre-parse, QueryParser, tweak_score, snippets               ~200
   rank.rs      HyperBall (own HLL) + exact-BFS fallback, percentile normalize    ~300
   api.rs       axum: /, /api/search, /healthz, /stats; format! HTML + escaper    ~260
+  admin.rs     /admin page: CLI-parity operations over the daemon's HTTP UI      ~500
   net/proto.rs ALPNs, message structs, u32-LE+JSON frame codec                   ~150
   net/endpoint.rs identity, endpoint build, accept loop, allowlist gate          ~200
   net/sync.rs  sync server + pull state machine, quota, verify/commit/ingest     ~350
@@ -72,6 +73,7 @@ csv             = "1"                                       # hosts.csv / record
 hex             = "0.4"
 fastrand        = "2"                                       # jitter
 axum            = { version = "0.8", default-features = false, features = ["http1","tokio","json","query"] }
+rustls          = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }  # reqwest+iroh link two crypto providers; main() must pick the default
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt","env-filter"] }
 ```
@@ -280,7 +282,7 @@ Indexer thread: consumes in-memory channel from crawl (already-extracted text, n
 
 - Query: extract `site:host` tokens (→ host TermQuery AND'd in), rest → `QueryParser` on [title×2.0, body], conjunction-by-default, fuzzy off, `parse_query_lenient`. `TopDocs::with_limit(...).and_offset(...)` + `tweak_score` reading centrality fast field + Count. Caps: query 512 chars, page ≤20. SnippetGenerator on body (~200 chars, escaped). Search in `spawn_blocking`.
 - Centrality baked at index time (docs pick up new ranks on recrawl/reindex: accepted staleness; per-segment ord→boost map is the designated upgrade if it annoys).
-- `rank` job: harmonic centrality H(v)=Σ 1/d(u,v) on the **transposed** host graph in RAM. n ≤ 20k → exact BFS all-sources; else **HyperBall** with own HLL (p=6, 64 registers, ~10% rel. error, ~64 B/host; ~60 LoC) iterating `B_t(v) = B_{t−1}(v) ∪ ⋃ B_{t−1}(w)` until no register changes. Percentile-normalize → batch UPDATE. Hosts absent from local graph keep CC seed. Refuses <500 hosts unless `--force`. Manual/cron; runs beside daemon (own read conn).
+- `rank` job: harmonic centrality H(v)=Σ 1/d(u,v) on the **transposed** host graph in RAM. n ≤ 20k → exact BFS all-sources; else **HyperBall** with own HLL (p=6, 64 registers, ~13% rel. error, ~64 B/host; ~60 LoC) iterating `B_t(v) = B_{t−1}(v) ∪ ⋃ B_{t−1}(w)` until no register changes. Percentile-normalize → batch UPDATE. Hosts absent from local graph keep CC seed. Refuses <500 hosts unless `--force`. Manual/cron; runs beside daemon (own read conn).
 
 ## 10. CLI + HTTP
 
@@ -300,7 +302,7 @@ status [--json]            counters, queue depths, shards, disk, last_rank_at
 seed <host|url>… [--from-file F]    promote hosts to active + enqueue roots
 ```
 
-axum (spec-time choice; fallback raw hyper): `GET /api/search?q&page[&federated=0|1]` → JSON `{query,page,total,hits:[{url,host,title,snippet,score,fetched_at,source?}]}`; `GET /` server-rendered HTML (format! + 5-line escaper, no template engine); `GET /healthz` (db round-trip + reader check); `GET /stats`.
+axum (spec-time choice; fallback raw hyper): `GET /api/search?q&page[&federated=0|1]` → JSON `{query,page,total,hits:[{url,host,title,snippet,score,fetched_at,source?}]}`; `GET /` server-rendered HTML (format! + 5-line escaper, no template engine); `GET /healthz` (db round-trip + reader check); `GET /stats`; `GET /admin` + `POST /admin/{seed,rank,sweep,ingest,bootstrap,peers,config}` (post-v1 extension): CLI-parity forms against the running daemon, gated by a per-boot CSRF token + Host check, long jobs in-process one at a time through the daemon's own writer paths; `init` and full `reindex` stay CLI-only (writer lock).
 
 ## 11. Federation (iroh)
 
@@ -375,9 +377,9 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 ## 16. Spec-time choices RESEARCH.md did not verify (fallback each)
 
-1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, tracing** → plumbing beyond research's list, all ecosystem defaults.
+1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list.
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10).
 
 ## Verification (end-to-end, after M5)
 

@@ -1,6 +1,6 @@
 [package]
 name = "mycel"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A fast, decentralized web crawler, indexer, and search engine"
 license = "AGPL-3.0-only"
@@ -30,7 +30,7 @@ serde_json = "1"
 csv = "1"
 hex = "0.4"
 fastrand = "2"
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "form"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
