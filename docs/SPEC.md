@@ -116,6 +116,9 @@ shard_mb = 1024          # seal open shard at ~1 GiB
 bind = "127.0.0.1:8080"
 page_size = 10
 
+[admin]
+allowed_hosts = []       # extra Host headers accepted on /admin (post-v1 extension)
+
 [federation]
 enabled = false          # peerless default: no socket bound, nothing published
 fanout = true

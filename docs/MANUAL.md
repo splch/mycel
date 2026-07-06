@@ -249,7 +249,7 @@ process start; nothing reloads live.
 
 | key | default | meaning |
 |---|---|---|
-| `allowed_hosts` | `[]` | Extra `Host` header values accepted on `/admin`, on top of `api.bind` and its `127.0.0.1`/`localhost`/`[::1]` equivalents. Needed to reach `/admin` by LAN IP or hostname when `api.bind` is a wildcard address (e.g. `0.0.0.0:8080`). See "the admin page" above. |
+| `allowed_hosts` | `[]` | Extra `Host` header values accepted on `/admin`, on top of `api.bind` and its `127.0.0.1`/`localhost`/`[::1]` equivalents. Needed to reach `/admin` by LAN IP or hostname when `api.bind` is a wildcard address (e.g. `0.0.0.0:8080`). See [the admin page](#get-admin-the-admin-page). |
 
 ### `[federation]`
 
@@ -290,9 +290,11 @@ Allowlist changes require a restart.
 ### Validation
 
 At startup mycel rejects: unknown keys anywhere; `crawl.scope` other than
-`"host"`; empty `index.languages`; `crawl.concurrency = 0`; a
-`federation.preset` other than `"n0"`/`"empty"`; a peer `id` that is not 64
-hex chars; a peer `addr` that is not `ip:port`.
+`"host"`; empty `index.languages`; `crawl.concurrency = 0`; an
+`admin.allowed_hosts` entry that is empty or contains `/` or whitespace
+(it could never equal a real `Host` header, so it would silently never
+match); a `federation.preset` other than `"n0"`/`"empty"`; a peer `id`
+that is not 64 hex chars; a peer `addr` that is not `ip:port`.
 
 ## 6. Command reference
 
@@ -560,8 +562,12 @@ allowed_hosts = ["mynode.lan:8080", "192.168.1.50:8080"]
 ```
 
 This is additive to the api.bind/loopback defaults, not a replacement, and
-still requires an exact (case-insensitive) `Host` match — it does not open
-`/admin` to arbitrary hosts.
+still requires an exact (case-insensitive) `Host` match, so a web page you
+happen to visit still cannot drive the node through a name you did not
+list. It is not authentication: anyone who can reach the port and send a
+listed name gets the page, its CSRF token, and every operation on it. If
+the network is not trusted, front the node with an authenticating reverse
+proxy instead.
 
 ### `GET /healthz`
 
