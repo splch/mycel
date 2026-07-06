@@ -36,8 +36,7 @@ pub struct AdminState {
     pub started_at: i64,
     /// Per-boot token embedded in every form; POSTs without it are refused.
     csrf: String,
-    /// Host headers accepted on /admin routes (DNS-rebinding guard):
-    /// api.bind + loopback aliases, plus any admin.allowed_hosts overrides.
+    /// Host headers accepted on /admin routes (DNS-rebinding guard).
     allowed_hosts: Vec<String>,
     job: Mutex<Option<Job>>,
     pub index_tx: std::sync::mpsc::Sender<IndexMsg>,

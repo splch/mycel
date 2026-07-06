@@ -175,9 +175,8 @@ impl Default for ApiCfg {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminCfg {
-    /// Extra Host header values accepted on /admin routes, on top of
-    /// api.bind and the loopback aliases (DNS-rebinding guard allowlist).
-    /// Needed to reach /admin by LAN IP or hostname rather than loopback.
+    /// Extra Host headers accepted on /admin, beyond api.bind and its
+    /// loopback aliases (the DNS-rebinding guard's allowlist).
     pub allowed_hosts: Vec<String>,
 }
 
@@ -293,8 +292,6 @@ impl Config {
         if self.crawl.concurrency == 0 {
             return Err("crawl.concurrency must be > 0".into());
         }
-        // An entry that can never equal a Host header (scheme, path,
-        // whitespace, empty) would otherwise just silently never match.
         for h in &self.admin.allowed_hosts {
             if h.is_empty() || h.contains('/') || h.contains(char::is_whitespace) {
                 return Err(
@@ -388,18 +385,15 @@ mod tests {
         let cfg: Config =
             toml::from_str("[admin]\nallowed_hosts = [\"mycel.lan:8080\"]\n").unwrap();
         assert_eq!(cfg.admin.allowed_hosts, vec!["mycel.lan:8080"]);
-        cfg.validate().unwrap();
     }
 
     #[test]
     fn admin_allowed_hosts_validated() {
-        // IPv6 literals stay legal: the check must not tighten past "Host header".
-        let good: Config = toml::from_str("[admin]\nallowed_hosts = [\"[::1]:8080\"]\n").unwrap();
-        good.validate().unwrap();
+        let good = "[admin]\nallowed_hosts = [\"mycel.lan:8080\", \"[::1]:8080\"]\n";
+        toml::from_str::<Config>(good).unwrap().validate().unwrap();
         for bad in ["", " ", "http://mycel.lan:8080", "mycel.lan:8080/admin"] {
-            let cfg: Config =
-                toml::from_str(&format!("[admin]\nallowed_hosts = [{bad:?}]\n")).unwrap();
-            assert!(cfg.validate().is_err(), "{bad:?} must be rejected");
+            let cfg = format!("[admin]\nallowed_hosts = [{bad:?}]\n");
+            assert!(toml::from_str::<Config>(&cfg).unwrap().validate().is_err());
         }
     }
 
