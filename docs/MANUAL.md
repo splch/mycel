@@ -245,6 +245,12 @@ process start; nothing reloads live.
 | `bind` | `"127.0.0.1:8080"` | HTTP listen address for `mycel run`. The API has no authentication or TLS; keep it on localhost or put a reverse proxy in front. |
 | `page_size` | `10` | Results per page, for the API, the web UI, and `mycel search`. There is no per-request size parameter. |
 
+### `[admin]`
+
+| key | default | meaning |
+|---|---|---|
+| `allowed_hosts` | `[]` | Extra `Host` header values accepted on `/admin`, beyond `api.bind` and its loopback equivalents; needed when `api.bind` is a wildcard like `0.0.0.0:8080`. See [the admin page](#get-admin-the-admin-page). |
+
 ### `[federation]`
 
 | key | default | meaning |
@@ -284,7 +290,8 @@ Allowlist changes require a restart.
 ### Validation
 
 At startup mycel rejects: unknown keys anywhere; `crawl.scope` other than
-`"host"`; empty `index.languages`; `crawl.concurrency = 0`; a
+`"host"`; empty `index.languages`; `crawl.concurrency = 0`; an
+`admin.allowed_hosts` entry that is empty or contains `/` or whitespace; a
 `federation.preset` other than `"n0"`/`"empty"`; a peer `id` that is not 64
 hex chars; a peer `addr` that is not `ip:port`.
 
@@ -543,6 +550,18 @@ happen to visit cannot drive your node. This is browser-attack hardening,
 not authentication: anything that can already send local HTTP can read the
 token from the page. The API's trust model is unchanged (keep it on
 localhost or behind a reverse proxy; a proxy must forward a matching `Host`).
+
+If `api.bind` is a wildcard like `0.0.0.0:PORT`, reaching `/admin` by LAN
+IP or hostname requires listing those Host values in `admin.allowed_hosts`:
+
+```toml
+[admin]
+allowed_hosts = ["mynode.lan:8080", "192.168.1.50:8080"]
+```
+
+The match stays exact and case-insensitive, so a web page you happen to
+visit still cannot drive the node. It is not authentication: anyone who
+can reach the port under a listed name can.
 
 ### `GET /healthz`
 

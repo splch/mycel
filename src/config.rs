@@ -38,6 +38,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # bind = "127.0.0.1:8080"
 # page_size = 10
 
+[admin]
+# allowed_hosts = []       # extra Host headers accepted on /admin, e.g. ["mycel.lan:8080"]
+
 [federation]
 # enabled = false          # peerless default: no socket bound, nothing published
 # fanout = true
@@ -67,6 +70,7 @@ pub struct Config {
     pub rank: RankCfg,
     pub warc: WarcCfg,
     pub api: ApiCfg,
+    pub admin: AdminCfg,
     pub federation: FederationCfg,
     pub sync: SyncCfg,
     pub bootstrap: BootstrapCfg,
@@ -166,6 +170,14 @@ impl Default for ApiCfg {
             page_size: 10,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminCfg {
+    /// Extra Host headers accepted on /admin, beyond api.bind and its
+    /// loopback aliases (the DNS-rebinding guard's allowlist).
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,6 +292,13 @@ impl Config {
         if self.crawl.concurrency == 0 {
             return Err("crawl.concurrency must be > 0".into());
         }
+        for h in &self.admin.allowed_hosts {
+            if h.is_empty() || h.contains('/') || h.contains(char::is_whitespace) {
+                return Err(
+                    format!("admin.allowed_hosts entries must be host[:port] (got {h:?})").into(),
+                );
+            }
+        }
         if !matches!(self.federation.preset.as_str(), "n0" | "empty") {
             return Err(format!(
                 "federation.preset must be \"n0\" or \"empty\" (got {:?})",
@@ -357,6 +376,25 @@ mod tests {
         toml::from_str::<Config>(&good).unwrap().validate().unwrap();
         let bad = "[[federation.peers]]\nid = \"nope\"\n";
         assert!(toml::from_str::<Config>(bad).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn admin_allowed_hosts_defaults_empty() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.admin.allowed_hosts.is_empty());
+        let cfg: Config =
+            toml::from_str("[admin]\nallowed_hosts = [\"mycel.lan:8080\"]\n").unwrap();
+        assert_eq!(cfg.admin.allowed_hosts, vec!["mycel.lan:8080"]);
+    }
+
+    #[test]
+    fn admin_allowed_hosts_validated() {
+        let good = "[admin]\nallowed_hosts = [\"mycel.lan:8080\", \"[::1]:8080\"]\n";
+        toml::from_str::<Config>(good).unwrap().validate().unwrap();
+        for bad in ["", " ", "http://mycel.lan:8080", "mycel.lan:8080/admin"] {
+            let cfg = format!("[admin]\nallowed_hosts = [{bad:?}]\n");
+            assert!(toml::from_str::<Config>(&cfg).unwrap().validate().is_err());
+        }
     }
 
     #[test]

@@ -58,6 +58,12 @@ impl AdminState {
                 allowed_hosts.push(v);
             }
         }
+        for h in &cfg.admin.allowed_hosts {
+            let h = h.to_ascii_lowercase();
+            if !allowed_hosts.contains(&h) {
+                allowed_hosts.push(h);
+            }
+        }
         Self {
             cfg,
             cfg_path,
