@@ -60,3 +60,4 @@ Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): the db-w
 - SQLite schema changes go through `PRAGMA user_version` migrations in `db.rs` (`SCHEMA_VERSION`).
 - Milestone-style commits: gates green + acceptance exercised against the real binary before committing.
 - Releases: push a `v*` tag matching `Cargo.toml`'s version; `.github/workflows/release.yml` gates on fmt/clippy/test, then builds Linux x86_64/aarch64 + macOS arm64 tarballs onto the GitHub release.
+- `site/` is the GitHub Pages site (static, no build step; CDN-pinned libraries only), deployed by `.github/workflows/pages.yml` on pushes to main. Regenerate `site/og.png` from `site/og.html` (instructions in its header comment) whenever the hero design changes.

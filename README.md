@@ -2,6 +2,8 @@
 
 A fast, decentralized web crawler, indexer, and search engine in one Rust binary.
 
+**Website:** <https://splch.github.io/mycel/>
+
 Every mycel node is a **complete search engine**: a polite crawler, a WARC
 document store (the source of truth), a [tantivy](https://github.com/quickwit-oss/tantivy)
 index (disposable, always rebuildable), BM25 + harmonic-centrality ranking, and

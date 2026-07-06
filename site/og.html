@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- Fallback generator for og.png (1200x630).
+     The shipped og.png is a capture of the live 3D hero (serve site/, hide
+     .nav/.scroll-cue/.hero-hint, screenshot the first viewport at 1200x630).
+     This file renders a deterministic 2D variant if a quick regen is needed:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+       --headless=new --screenshot=site/og.png --window-size=1200,630 \
+       --hide-scrollbars --virtual-time-budget=6000 file://$PWD/site/og.html -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;width:1200px;height:630px;overflow:hidden;background:#0a0d0b}
+  canvas{position:absolute;inset:0}
+  .scrim{position:absolute;inset:0;background:radial-gradient(ellipse 60% 62% at 50% 52%,rgba(10,13,11,.9),rgba(10,13,11,.35) 60%,rgba(10,13,11,0) 85%)}
+  .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+  .eyebrow{font:500 17px "IBM Plex Mono",monospace;letter-spacing:.3em;text-transform:uppercase;color:#6fae6b;margin-bottom:10px}
+  h1{font:400 168px/0.95 "Instrument Serif",serif;color:#e4ebdd;margin:0 0 6px;text-shadow:0 0 60px rgba(168,230,161,.16)}
+  h1 span{color:#a8e6a1;text-shadow:0 0 40px rgba(168,230,161,.55)}
+  .tag{font:italic 400 34px "Instrument Serif",serif;color:#c3cebb;margin-bottom:22px}
+  .sub{font:400 18px "IBM Plex Mono",monospace;color:#8fa088}
+  .sub b{color:#a8e6a1;font-weight:500}
+</style>
+</head>
+<body>
+<canvas id="c" width="2400" height="1260" style="width:1200px;height:630px"></canvas>
+<div class="scrim"></div>
+<div class="in">
+  <div class="eyebrow">decentralized web search</div>
+  <h1>m<span>y</span>cel</h1>
+  <div class="tag">search, grown like a fungus.</div>
+  <div class="sub">crawler · warc · tantivy · bm25 × centrality · federation — <b>one rust binary</b></div>
+</div>
+<script>
+  // deterministic mycelium still — seeded LCG so the image is reproducible
+  const ctx = document.getElementById("c").getContext("2d");
+  ctx.setTransform(2, 0, 0, 2, 0, 0);
+  const W = 1200, H = 630;
+  let s = 42;
+  const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+  ctx.fillStyle = "#0a0d0b"; ctx.fillRect(0, 0, W, H);
+  ctx.lineCap = "round";
+  let tips = [];
+  const newTip = (x, y, a, g) => tips.length < 110 && tips.push({ x, y, a, g, sp: .5 + rnd() * .6, life: 260 + rnd() * 400, w: Math.max(.4, 1.2 - g * .22) });
+  const glows = [];
+  for (let i = 0; i < 7; i++) {
+    const x = W * (.08 + .84 * rnd()), y = H * (.1 + .8 * rnd());
+    glows.push([x, y, 2.4]);
+    for (let k = 0, n = 3 + (rnd() * 3 | 0); k < n; k++) newTip(x, y, rnd() * Math.PI * 2, 0);
+  }
+  for (let f = 0; f < 1500; f++) {
+    for (let i = tips.length - 1; i >= 0; i--) {
+      const t = tips[i];
+      t.a += (rnd() - .5) * .34;
+      const nx = t.x + Math.cos(t.a) * t.sp, ny = t.y + Math.sin(t.a) * t.sp;
+      ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(nx, ny);
+      ctx.lineWidth = t.w; ctx.strokeStyle = `hsla(${108 + t.g * 9},30%,72%,.3)`; ctx.stroke();
+      t.x = nx; t.y = ny;
+      if (rnd() < .013) { newTip(nx, ny, t.a + (rnd() < .5 ? -1 : 1) * (.5 + rnd() * .7), t.g + 1); if (rnd() < .3) glows.push([nx, ny, 1.1 + rnd() * 1.4]); }
+      if (--t.life < 0 || nx < -20 || ny < -20 || nx > W + 20 || ny > H + 20) tips.splice(i, 1);
+    }
+    if (tips.length < 30) { const x = W * rnd(), y = H * rnd(); for (let k = 0; k < 3; k++) newTip(x, y, rnd() * Math.PI * 2, 0); }
+  }
+  for (const [x, y, r] of glows.slice(0, 120)) {
+    ctx.beginPath(); ctx.arc(x, y, r * 3, 0, 7); ctx.fillStyle = "rgba(168,230,161,.05)"; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fillStyle = "rgba(211,247,201,.42)"; ctx.fill();
+  }
+</script>
+</body>
+</html>
