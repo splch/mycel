@@ -1,473 +1,311 @@
 <!doctype html>
-<!--
-  mycel — https://github.com/splch/mycel
-  Static site, no build step. Hand-rolled on top of a small, pinned set of
-  CDN libraries: three.js (WebGL organism), GSAP + ScrollTrigger + SplitText
-  (scroll choreography), Lenis (smooth scroll), d3 (federation playground).
-  Everything degrades: no WebGL -> 2D canvas sim; no JS -> readable document.
--->
-<html lang="en">
+<html lang="en" data-view="garden">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mycel — a decentralized web search engine in one binary</title>
-<meta name="description" content="mycel is a decentralized web search engine in one Rust binary: polite crawler, WARC archive, tantivy index, BM25 × harmonic-centrality ranking, HTTP API. Complete with zero peers; federation is additive. No DHT, no tokens, no cloud.">
+<title>mycel: a search engine you can grow</title>
+<meta name="description" content="mycel is a fast, decentralized web search engine in one Rust binary: a polite crawler, a WARC archive, a tantivy index, and federation over QUIC. Every node is a complete search engine; peers are chosen, never discovered.">
 <link rel="canonical" href="https://splch.github.io/mycel/">
-<meta name="theme-color" content="#070a08">
 <meta property="og:type" content="website">
-<meta property="og:title" content="mycel — a decentralized web search engine in one binary">
-<meta property="og:description" content="Every node is a complete search engine: polite crawler, WARC archive, tantivy index, BM25 × centrality ranking, HTTP API. Federation is additive — no DHT, no tokens, no cloud.">
+<meta property="og:title" content="mycel: a search engine you can grow">
+<meta property="og:description" content="A fast, decentralized web search engine in one Rust binary. Every node is complete alone; federation is additive. No DHT, no tokens, no telemetry.">
 <meta property="og:url" content="https://splch.github.io/mycel/">
 <meta property="og:image" content="https://splch.github.io/mycel/og.png">
 <meta name="twitter:card" content="summary_large_image">
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "mycel",
-  "description": "A fast, decentralized web crawler, indexer, and search engine in one Rust binary.",
-  "url": "https://splch.github.io/mycel/",
-  "sameAs": "https://github.com/splch/mycel",
-  "applicationCategory": "DeveloperApplication",
-  "operatingSystem": "Linux, macOS",
-  "license": "https://www.gnu.org/licenses/agpl-3.0.html",
-  "offers": {"@type": "Offer", "price": "0"}
-}
-</script>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cg fill='none' stroke='%23a8e6a1' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M32 60V36'/%3E%3Cpath d='M32 36C32 24 21 26 16 13'/%3E%3Cpath d='M32 36C32 24 43 26 48 11'/%3E%3Cpath d='M32 46C25 43 18 45 9 38'/%3E%3Cpath d='M32 46C39 43 46 45 55 38'/%3E%3C/g%3E%3Cg fill='%23a8e6a1'%3E%3Ccircle cx='16' cy='13' r='4'/%3E%3Ccircle cx='48' cy='11' r='4'/%3E%3Ccircle cx='9' cy='38' r='3.4'/%3E%3Ccircle cx='55' cy='38' r='3.4'/%3E%3C/g%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="main.css">
-
-<!-- pinned libraries (classic globals), then our modules -->
-<script defer src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/SplitText.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/lenis@1.3.4/dist/lenis.min.js" crossorigin="anonymous"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js" crossorigin="anonymous"></script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0705'/%3E%3Cpath d='M32 54 V30 M32 38 C22 34 18 26 17 16 M32 34 C42 30 46 22 47 13 M32 44 C25 42 21 38 20 31 M32 42 C40 40 44 35 45 27' stroke='%23e8a33d' stroke-width='3.5' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='17' cy='13' r='3' fill='%23ffcf7d'/%3E%3Ccircle cx='47' cy='10' r='3' fill='%23ffcf7d'/%3E%3Ccircle cx='20' cy='28' r='2.2' fill='%237fe0cf'/%3E%3Ccircle cx='45' cy='24' r='2.2' fill='%237fe0cf'/%3E%3C/svg%3E">
 <script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/"
-  }
-}
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js" } }
 </script>
-<script type="module" src="js/main.js"></script>
+<link rel="stylesheet" href="main.css">
 </head>
 <body>
+<a class="skip" href="#story">skip to content</a>
 
-<!-- the organism: fixed webgl (or 2d fallback) canvas behind everything -->
-<div id="gl" aria-hidden="true"></div>
-<div class="root-line" aria-hidden="true"></div>
+<!-- The underground: one fixed WebGL layer behind everything. Pure decoration. -->
+<canvas id="world" aria-hidden="true"></canvas>
+<div id="vignette" aria-hidden="true"></div>
 
-<!-- ======================= nav ======================= -->
-<nav class="nav" aria-label="site">
-  <div class="nav-in">
-    <a class="brand" href="#top" aria-label="mycel — home">
-      <svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="#a8e6a1" stroke-width="4" stroke-linecap="round"><path d="M32 60V36"/><path d="M32 36C32 24 21 26 16 13"/><path d="M32 36C32 24 43 26 48 11"/><path d="M32 46C25 43 18 45 9 38"/><path d="M32 46C39 43 46 45 55 38"/></g><g fill="#a8e6a1"><circle cx="16" cy="13" r="4"/><circle cx="48" cy="11" r="4"/><circle cx="9" cy="38" r="3.4"/><circle cx="55" cy="38" r="3.4"/></g></svg>
-      mycel
-    </a>
-    <div class="nav-links">
-      <a href="#engine">engine</a>
-      <a href="#demo">demo</a>
-      <a href="#federation">federation</a>
-      <a href="#refusals">refusals</a>
-      <a href="#quickstart">quickstart</a>
-      <a href="https://github.com/splch/mycel/blob/main/docs/MANUAL.md">manual ↗</a>
-      <a class="gh-btn" href="https://github.com/splch/mycel">
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-        <span id="stars" aria-label="GitHub"><span class="star">★</span> GitHub</span>
-      </a>
-    </div>
+<nav class="topnav">
+  <a class="wordmark" href="#top">mycel<svg class="wordthread" viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true"><path d="M0,4 C15,7 25,1 40,4 C55,7 62,1 74,4 C86,7 93,3 100,4" pathLength="100"/></svg></a>
+  <div class="navlinks">
+    <a href="#soil">descend</a>
+    <a href="#instruments">instruments</a>
+    <a href="#plant">plant one</a>
+    <a href="https://github.com/splch/mycel" rel="external">github</a>
+    <button class="viewtoggle" type="button" aria-pressed="false" title="see this page the way a crawler sees it">crawler view</button>
   </div>
 </nav>
 
-<!-- ======================= hero ======================= -->
-<header class="hero" id="top">
-  <div class="hero-in">
-    <p class="eyebrow">decentralized web search &middot; one rust binary</p>
-    <h1 id="heroTitle">m<span class="tip">y</span>cel</h1>
-    <p class="hero-tag" id="heroTag">search, grown like a fungus.</p>
-    <div id="heroRest">
-      <p class="hero-lede">
-        Every node is a <b>complete search engine</b> — polite crawler, WARC archive,
-        tantivy index, BM25&nbsp;×&nbsp;centrality ranking, HTTP API. Fully useful with
-        <b>zero peers</b>. Federation is additive: dial peers you trust by public key,
-        fan out queries, exchange crawl corpora. <b>No DHT. No tokens. No cloud.</b>
-      </p>
-      <div class="cta-row">
-        <a class="btn btn-solid" href="#quickstart">Grow a node</a>
-        <a class="btn btn-ghost" href="https://github.com/splch/mycel">View source ↗</a>
-      </div>
-      <div class="hero-cmd" role="img" aria-label="mycel seed, then crawl, then search">
-        <span class="p">$</span> mycel seed <b>→</b> mycel crawl <b>→</b> mycel search <span class="dim">&nbsp;// that's the whole loop</span>
-      </div>
-    </div>
+<div id="depth" aria-hidden="true"><span id="depthval">surface</span></div>
+
+<!-- ============================== SURFACE ============================== -->
+<header id="top" class="surface">
+  <canvas id="fog" aria-hidden="true"></canvas>
+  <div class="hero">
+    <p class="kicker">mycel · a fast, decentralized web search engine in one Rust binary</p>
+    <h1 class="elegy">Every decentralized search engine you've&nbsp;heard&nbsp;of is buried&nbsp;here.</h1>
+    <p class="elegy-sub">This is what grew back.</p>
+    <p class="scrollcue" aria-hidden="true">descend<span class="cue-line"></span></p>
   </div>
-  <div class="hero-hint" id="heroHint">the network is alive — click the dark to seed it</div>
-  <a class="scroll-cue" href="#engine" aria-label="scroll down">↓</a>
+
+  <section class="graveyard" aria-label="the graveyard of decentralized search">
+    <h2 class="visually-hidden">The graveyard</h2>
+
+    <article class="stone stone--dead" tabindex="0">
+      <h3>stract</h3>
+      <p class="dates">† april 2026</p>
+      <p class="epitaph">Open-source web search in Rust. Essentially one developer. Archived by its owner; no successor.</p>
+      <div class="rebuttal">
+        <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C4,48 16,40 9,28 C4,19 13,12 10,0" pathLength="100"/></svg>
+        <p><strong>what grew back:</strong> survivability as architecture. ~6,300 lines, 27 boring dependencies, and data formats that stay valuable even if development pauses for a year.</p>
+      </div>
+    </article>
+
+    <article class="stone stone--dead" tabindex="0">
+      <h3>ipfs-search</h3>
+      <p class="dates">† 2023</p>
+      <p class="epitaph">The decentralized part was never built. Its design contained no ranking at all. Died of funding exhaustion.</p>
+      <div class="rebuttal">
+        <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C16,50 5,42 11,30 C16,20 6,10 10,0" pathLength="100"/></svg>
+        <p><strong>what grew back:</strong> no moonshot. A node is complete alone; federation is additive. Ranking was designed first: BM25 × harmonic centrality.</p>
+      </div>
+    </article>
+
+    <article class="stone stone--dead" tabindex="0">
+      <h3>toshi</h3>
+      <p class="dates">asleep since 2023</p>
+      <p class="epitaph">"Elasticsearch in Rust." Said "far from production ready" for four straight years. Zero releases, ever.</p>
+      <div class="rebuttal">
+        <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C5,50 15,44 8,32 C3,22 14,10 10,0" pathLength="100"/></svg>
+        <p><strong>what grew back:</strong> no custom index server. tantivy + SQLite + WARC: someone else's well-tested problem, with multi-decade format guarantees.</p>
+      </div>
+    </article>
+
+    <article class="stone stone--standing" tabindex="0">
+      <h3>yacy</h3>
+      <p class="dates">est. 2003 · still standing</p>
+      <p class="epitaph">A global index sharded across a DHT. Six-second timeouts; NAT'd peers that cannot answer; ranking nobody fixed.</p>
+      <div class="rebuttal">
+        <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C15,49 6,41 12,29 C17,19 7,9 10,0" pathLength="100"/></svg>
+        <p><strong>the lesson:</strong> keep no global anything. Whole engines, explicit peers, and scores that are never compared across nodes.</p>
+      </div>
+    </article>
+
+    <article class="stone stone--lantern" tabindex="0">
+      <h3>marginalia</h3>
+      <p class="dates">est. 2021 · alive</p>
+      <p class="epitaph">Still standing. 969&thinsp;million documents. One person. About $200 a month.</p>
+      <div class="rebuttal">
+        <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C6,50 14,42 9,30 C5,20 12,10 10,0" pathLength="100"/></svg>
+        <p><strong>the seed:</strong> mycel is planted from this lesson: a million high-quality documents beat a billion mixed ones.</p>
+      </div>
+    </article>
+  </section>
+
+  <p class="graveyard-note">The mortality record above is the founding research finding. The failures were never the algorithms. They were weight: infrastructure bills, custom formats, global indexes, one exhausted maintainer. <em>mycel is designed against the graveyard.</em></p>
 </header>
 
-<main>
-<!-- ======================= act I: the node ======================= -->
-<div class="band">
-  <!-- stat strip -->
-  <div class="strip">
-    <div class="strip-in">
-      <div class="stat"><div class="n"><em>1</em></div><div class="l">binary</div></div>
-      <div class="stat"><div class="n" data-count="8447">8,447</div><div class="l">lines of rust</div></div>
-      <div class="stat"><div class="n" data-count="27">27</div><div class="l">crates, listed in full</div></div>
-      <div class="stat"><div class="n"><em>0</em></div><div class="l">peers required</div></div>
-      <div class="stat"><div class="n">AGPL</div><div class="l">3.0-only</div></div>
-    </div>
-  </div>
-
-  <section id="engine">
-    <div class="wrap">
-      <p class="eyebrow">the engine</p>
-      <h2 data-split>Complete at <em>n&nbsp;=&nbsp;1</em>.</h2>
-      <p class="lede">
-        A mycel node with zero peers is not a degraded mode — it is the product.
-        One process runs the entire pipeline over the hosts <i>you</i> choose,
-        and every stage is inspectable with standard tools:
-        <code>sqlite3</code>, <code>zcat</code>, plain HTTP.
-      </p>
-
-      <div class="pipe" id="pipe" aria-label="pipeline: crawl, archive, index, rank, serve">
-        <div class="stage"><span class="ic">🕸</span><span class="nm">crawl</span><span class="d">RFC 9309 robots<br>1 req/host, always</span></div>
-        <div class="conn"><i style="--fd:0s"></i></div>
-        <div class="stage"><span class="ic">🗃</span><span class="nm">archive</span><span class="d">.warc.gz members<br>fsync before commit</span></div>
-        <div class="conn"><i style="--fd:.9s"></i></div>
-        <div class="stage"><span class="ic">🔍</span><span class="nm">index</span><span class="d">tantivy, stemmed<br>simhash near-dup gate</span></div>
-        <div class="conn"><i style="--fd:1.8s"></i></div>
-        <div class="stage"><span class="ic">🌿</span><span class="nm">rank</span><span class="d">bm25 × harmonic<br>host centrality</span></div>
-        <div class="conn"><i style="--fd:2.7s"></i></div>
-        <div class="stage"><span class="ic">📡</span><span class="nm">serve</span><span class="d">JSON API + HTML UI<br>on 127.0.0.1:8080</span></div>
-      </div>
-
-      <div class="aside">
-        <h3>Two pens, two owners.</h3>
-        <p>
-          Two dedicated OS threads own the two single-writer resources; everything else is tokio.
-          The <b>db-writer</b> thread holds the only SQLite write connection <i>and</i> the open WARC
-          shard — every state change is one ordered command stream, drain-batched into single
-          transactions. The <b>indexer</b> thread owns the tantivy writer and the near-duplicate gate.
-        </p>
-        <p>
-          Crash safety is a protocol, not a hope: a page is fsync'd into WARC and its database row
-          lands <b>in the same transaction</b> that advances the shard watermark. On boot, the shard
-          truncates back to the watermark. No torn writes, no phantom pages.
-        </p>
-      </div>
-    </div>
-  </section>
-
-  <!-- demo -->
-  <section id="demo" style="padding-top:0">
-    <div class="wrap">
-      <p class="eyebrow">ninety seconds to a search engine</p>
-      <h2 data-split>Watch a node <em>grow</em>.</h2>
-      <p class="lede">Four commands. Real output. The crawler refuses to start until
-        <code>crawl.contact_url</code> says who you are — politeness is not optional.</p>
-
-      <div class="term" id="term">
-        <div class="term-bar">
-          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          <span class="ttl">you@node:~</span>
-          <button class="term-replay" id="replay" type="button">↺ replay</button>
-        </div>
-        <div class="term-body" id="termBody">
-<div class="tl" data-k="c"><span class="pr">$ </span><span class="cm">mycel init</span></div>
-<div class="tl" data-k="o">wrote mycel.toml</div>
-<div class="tl" data-k="o">created identity ~/.local/share/mycel/identity.key</div>
-<div class="tl" data-k="o">node id: ee52f6c8a3b17d94c0de81b52f4a6f9d…</div>
-<div class="tl" data-k="o">data dir: ~/.local/share/mycel</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="c"><span class="pr">$ </span><span class="cm">mycel seed marginalia.nu example.com</span></div>
-<div class="tl" data-k="o">activated 2 hosts, enqueued 2 urls</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="c"><span class="pr">$ </span><span class="cm">mycel crawl --limit 500</span></div>
-<div class="tl" data-k="o"><span class="ts">2026-07-05T17:02:11.402193Z</span>  <span class="lv">INFO</span> opened shard 000001.warc.gz</div>
-<div class="tl" data-k="o"><span class="cmt"># …one request per host at a time; minutes of polite pacing elapse</span></div>
-<div class="tl" data-k="o"><span class="ts">2026-07-05T17:03:11.518274Z</span>  <span class="lv">INFO</span> crawl: 217 fetched, 2 in flight</div>
-<div class="tl" data-k="o"><span class="ts">2026-07-05T17:04:11.630881Z</span>  <span class="lv">INFO</span> crawl: 461 fetched, 2 in flight</div>
-<div class="tl" data-k="o"><span class="ts">2026-07-05T17:04:39.108252Z</span>  <span class="lv">INFO</span> fetch limit reached</div>
-<div class="tl" data-k="o"><span class="ts">2026-07-05T17:04:39.114006Z</span>  <span class="lv">INFO</span> crawl finished: 500 fetches</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="c"><span class="pr">$ </span><span class="cm">mycel status</span></div>
-<div class="tl" data-k="o">hosts     active 2, candidate 31</div>
-<div class="tl" data-k="o">frontier  queued 214, in-flight 0, failed 9</div>
-<div class="tl" data-k="o">docs      486 total, 12 pending, 461 indexed</div>
-<div class="tl" data-k="o">webgraph  57 host edges</div>
-<div class="tl" data-k="o">warc      1 shards, 9812345 bytes</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="c"><span class="pr">$ </span><span class="cm">mycel search "mycelium networks"</span></div>
-<div class="tl" data-k="o">42 results</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="o"><span class="ttl">Mycelium as a communication network</span></div>
-<div class="tl" data-k="o">  <span class="url">https://fungi.example.org/nets</span></div>
-<div class="tl" data-k="o">  the fungal <span class="hit">mycelium</span> is a living <span class="hit">network</span> connecting trees across…</div>
-<div class="tl" data-k="g">&nbsp;</div>
-<div class="tl" data-k="o"><span class="ttl">The wood-wide web, revisited</span></div>
-<div class="tl" data-k="o">  <span class="url">https://forest.example.net/wood-wide-web</span></div>
-<div class="tl" data-k="o">  beneath the forest floor, <span class="hit">mycelium</span> forms <span class="hit">networks</span> that carry…</div>
-        </div>
-      </div>
-      <p class="small" style="margin-top:14px">
-        Logs go to <b>stderr</b>, data to <b>stdout</b> — pipe accordingly. Add <code>--json</code>
-        to <code>search</code>/<code>status</code> for machines. <code>mycel run</code> keeps
-        crawling and serves the HTTP API as a daemon.
-      </p>
-    </div>
-  </section>
-
-  <!-- features -->
-  <section id="features" style="padding-top:0">
-    <div class="wrap">
-      <p class="eyebrow">what's in the binary</p>
-      <h2 data-split>Boring dependencies, <em>opinionated</em> plumbing.</h2>
-
-      <div class="grid">
-        <div class="card"><span class="ic">🤝</span>
-          <h3>Polite by construction</h3>
-          <p>One in-flight request per host, enforced by the claim query — not by good intentions.
-          RFC 9309 robots, sticky 429 backoff that only ever rises, and a crawler that refuses to
-          start until <code>crawl.contact_url</code> identifies you in the user agent.</p>
-        </div>
-        <div class="card"><span class="ic">🗄</span>
-          <h3>WARC is the truth</h3>
-          <p>Every fetch lands in standard <code>.warc.gz</code> — the same format as the Internet
-          Archive and Common Crawl. SQLite and the tantivy index are derived state, rebuildable from
-          the archive at any time. Peers exchange shards, never index segments.</p>
-        </div>
-        <div class="card"><span class="ic">📖</span>
-          <h3>Ranking you can read</h3>
-          <p><code>score&nbsp;=&nbsp;bm25&nbsp;×&nbsp;(1&nbsp;+&nbsp;0.3&nbsp;×&nbsp;centrality)</code>.
-          Text relevance from tantivy; host-level harmonic centrality from your own webgraph
-          with HyperBall. Explainable end to end — no embeddings, no oracle.</p>
-        </div>
-        <div class="card"><span class="ic">🔑</span>
-          <h3>Federation without ceremony</h3>
-          <p>iroh QUIC: dial peers by ed25519 public key, ~90% direct through NAT, relays as
-          fallback. The allowlist is the <i>only</i> auth gate. <code>preset&nbsp;=&nbsp;"empty"</code>
-          runs a LAN or airgapped mesh with zero external infrastructure.</p>
-        </div>
-        <div class="card"><span class="ic">🌍</span>
-          <h3>Bootstrap from Common Crawl</h3>
-          <p>Don't crawl the planet — it's been crawled. Feed mycel two CSVs and it pulls ranged GETs
-          from <code>data.commoncrawl.org</code>: throttled, resumable, seeded with real host
-          centrality, straight into your own WARC store.</p>
-        </div>
-        <div class="card"><span class="ic">🔧</span>
-          <h3>Hand-rolled where it counts</h3>
-          <p>The WARC writer is ~380 lines. CLI parsing is by hand. The search UI is
-          <code>format!</code>-ed HTML. 27 dependencies, chosen to be boring — the spec lists every
-          one, and every deliberate absence (no clap, no chrono, no anyhow…).</p>
-        </div>
-      </div>
-    </div>
-  </section>
+<!-- ============================== SOIL LINE ============================== -->
+<div id="soil" aria-hidden="true">
+  <div class="soil-crust"></div>
+  <p class="soil-label">· the soil line ·</p>
 </div>
 
-<!-- ======================= interstitial I ======================= -->
-<div class="inter" aria-hidden="true"><p data-inter>alone, a search engine.<br>together, a <em>network</em>.</p></div>
+<!-- ============================== UNDERGROUND ============================== -->
+<main id="story">
+  <section class="chapter" data-phase="seed" id="ch-seed">
+    <div class="panel">
+      <p class="chlabel">01 · seed</p>
+      <h2>It starts with one address.</h2>
+      <p>Nothing is crawled that you didn't plant. <code>mycel seed blog.example.org</code> activates a host and enqueues its root. Links discovered off-host become <em>candidates</em>, recorded in the webgraph but never fetched, until you promote them.</p>
+      <p class="cmd"><code>$ mycel seed blog.example.org</code></p>
+    </div>
+  </section>
 
-<!-- ======================= act II: federation ======================= -->
-<div class="band">
-  <section id="federation">
-    <div class="wrap">
-      <p class="eyebrow">federation</p>
-      <h2 data-split>Trust is <em>social</em>, not cryptographic-economic.</h2>
-      <p class="lede">
-        There is no open network to join and no token to stake. Each node lists the peers it
-        accepts; that allowlist, checked after the QUIC handshake, is the single gate.
-        Exchange node ids out of band — like SSH keys, like phone numbers.
-      </p>
+  <section class="chapter" data-phase="crawl" id="ch-crawl">
+    <div class="panel">
+      <p class="chlabel">02 · crawl</p>
+      <h2>It knocks, and then it waits.</h2>
+      <p>robots.txt is obeyed per RFC&nbsp;9309. One request per host, <em>ever</em>, enforced by the claim query rather than by good intentions. A 429 doubles that host's delay, sticky, never lowered again. And it refuses to crawl at all until <code>contact_url</code> puts your name in the user agent.</p>
+      <ol class="minilog" aria-label="example crawl log"></ol>
+      <noscript><p class="mutenote">(a live crawl log animates here)</p></noscript>
+    </div>
+  </section>
 
-      <div class="fed-grid">
-        <div>
-          <div class="fed-viz">
-            <svg id="fedSim" aria-label="interactive diagram: your node fans a query out to peers alice, bee, and cep; a rogue node not on the allowlist is refused"></svg>
-            <span class="fed-hint">drag the nodes</span>
-            <button class="fed-run" id="fedRun" type="button">▸ run federated query</button>
-            <span class="fed-note">badges stamped from the dialed key — unspoofable</span>
-          </div>
-          <ul class="results" id="fedResults" aria-label="interleaved federated results">
-            <li><span class="t">Mycelium as a communication network</span><span class="u">fungi.example.org/nets</span><span class="b local">local</span></li>
-            <li><span class="t">Soil carbon and fungal partners</span><span class="u">dirt.example.net/carbon</span><span class="b">alice</span></li>
-            <li><span class="t">Beekeeping notes, June</span><span class="u">hive.example.io/june</span><span class="b">bee</span></li>
-            <li><span class="t">Porcini habitat mapping</span><span class="u">bolete.example.ch/map</span><span class="b">cep</span></li>
-            <li><span class="t">The wood-wide web, revisited</span><span class="u">forest.example.net/www</span><span class="b local">local</span></li>
-          </ul>
-          <p class="small" style="margin-top:12px">
-            Results interleave <b>round-robin</b>, deduped by URL — never a cross-node score sort,
-            because BM25 scores from different corpora aren't comparable, so mycel doesn't pretend
-            they are.
-          </p>
+  <section class="chapter" data-phase="store" id="ch-store">
+    <div class="panel">
+      <p class="chlabel">03 · store</p>
+      <h2>Pages are archived, not scraped.</h2>
+      <p>Every fetch is appended to WARC, the same format Common Crawl publishes, and fsynced; only then does the <em>same transaction</em> advance the durable watermark. Kill the process mid-write: nothing corrupts, nothing orphans.</p>
+      <p class="doctrine">WARC is the source of truth. Everything else regrows.</p>
+    </div>
+  </section>
+
+  <section class="chapter" data-phase="index" id="ch-index">
+    <div class="panel">
+      <p class="chlabel">04 · index</p>
+      <h2>The index is a regrowable organ.</h2>
+      <p>Text is extracted; near-duplicates are composted, exact by sha256, near by simhash. What survives enters a tantivy BM25 index. Corrupt it, upgrade it, delete it: <code>mycel reindex</code> grows it back from WARC.</p>
+      <figure class="dedup" id="dedup" aria-label="near-duplicate pages collapsing into one indexed document">
+        <div class="dup-lines">
+          <p class="dup-line">10 Best Hikes Near Portland (2026 Edition, Updated)</p>
+          <p class="dup-line">10 Best Hikes Near Portland, 2026 Edition [Updated]</p>
+          <p class="dup-line">The 10 Best Hikes Near Portland, Updated for 2026</p>
+          <p class="dup-line">10 Best Hikes Near Portland (Updated 2026 Edition)</p>
+          <p class="dup-line">Best Hikes Near Portland: Top 10, 2026 Update</p>
+          <p class="dup-line">10 Best Portland Hikes: Updated 2026 Edition</p>
+          <p class="dup-line dup-line--keep">10 Best Hikes Near Portland (2026 Edition, Updated)</p>
         </div>
+        <figcaption><span id="dedup-count">7 fetched</span> → <strong>1 indexed</strong> · <code>skip_reason: dup-near · simhash Δ ≤ 3</code></figcaption>
+      </figure>
+    </div>
+  </section>
 
-        <div class="fed-copy">
-          <h3>Two verbs, one protocol.</h3>
-          <p><b style="color:var(--body)">Query fan-out</b> — <code>search --federated</code> asks
-          every peer in parallel behind a hard timeout. Slow peers get dropped, not waited on.</p>
-          <p><b style="color:var(--body)">Shard sync</b> — pull a peer's crawl corpus as immutable,
-          blake3-verified WARC shards: quota-capped, resumable, self-origin only. No transitive
-          flooding — you replicate the peers you chose, not the peers they chose.</p>
-          <div class="codeblock"><button class="cp" type="button">copy</button><pre><span class="c"># mycel.toml</span>
-[federation]
-enabled = true
+  <section class="chapter" data-phase="rank" id="ch-rank">
+    <div class="panel">
+      <p class="chlabel">05 · rank</p>
+      <h2>Well-connected soil ranks higher.</h2>
+      <p>mycel computes harmonic centrality over its <em>own</em> host webgraph, offline, and folds it into every score: <code>bm25 × (1 + 0.3 × centrality)</code>. Text relevance dwarfs link signals; centrality is a boost, never the ranking.</p>
+    </div>
+  </section>
 
-[[federation.peers]]
-id   = <span class="s">"&lt;bee's 64-hex endpoint id&gt;"</span>
-name = <span class="s">"bee"</span>   <span class="c"># result badge</span>
-sync = <span class="k">true</span>    <span class="c"># pull bee's corpus</span></pre></div>
-          <p><code>mycel peers check</code> proves dial + auth + protocol for every peer in one
-          round trip. A peerless node binds no sockets and publishes nothing.</p>
-        </div>
+  <section class="chapter" data-phase="search" id="ch-search">
+    <div class="panel">
+      <p class="chlabel">06 · search</p>
+      <h2>Then it answers.</h2>
+      <p>Phrases, <code>site:</code> filters, highlighted snippets. From your corpus, on your machine, in milliseconds. The daemon serves a UI and a JSON API on localhost.</p>
+      <div class="resultcard" role="img" aria-label="an example mycel search result">
+        <p class="r-title">Mycorrhizal networks and how forests share</p>
+        <p class="r-url">https://fungi.example.org/nets</p>
+        <p class="r-snip">…fungal <mark>mycelium</mark> <mark>networks</mark> connect trees underground and move nutrients between them…</p>
       </div>
-    </div>
-  </section>
-</div>
-
-<!-- ======================= interstitial II ======================= -->
-<div class="inter" aria-hidden="true"><p data-inter>small. legible. <em>yours</em>.</p></div>
-
-<!-- ======================= act III: durability & philosophy ======================= -->
-<div class="band">
-  <section id="recovery">
-    <div class="wrap">
-      <p class="eyebrow">durability</p>
-      <h2 data-split>The index is <em>never</em> precious.</h2>
-      <p class="lede">
-        WARC is the source of truth; everything else is derived state. Recovery is a normal
-        code path, not a disaster plan — the same <code>ingest</code> and <code>reindex</code>
-        you'd use any other day.
-      </p>
-      <div class="rec-grid">
-        <div class="rec">
-          <h3>Index corrupt?</h3>
-          <p>Or tantivy upgraded across versions. Delete it. It was always disposable.</p>
-          <pre>rm -rf &lt;data&gt;/index
-mycel reindex</pre>
-        </div>
-        <div class="rec">
-          <h3>Database lost?</h3>
-          <p>WARC intact means nothing is lost. Rebuild the catalog, then the index.</p>
-          <pre>mycel ingest &lt;data&gt;/warc
-mycel reindex</pre>
-        </div>
-        <div class="rec">
-          <h3>Backups?</h3>
-          <p>Two things, and pointedly not the index — it's derived state; never back it up.</p>
-          <pre>sqlite3 mycel.sqlite ".backup …"
-rsync -a warc/ backup/warc/</pre>
-        </div>
-      </div>
+      <p class="cmd"><code>$ mycel search '"mycelium networks" site:fungi.example.org'</code></p>
     </div>
   </section>
 
-  <section id="refusals" style="padding-top:0">
-    <div class="wrap">
-      <p class="eyebrow">decisions, not gaps</p>
-      <h2 data-split>What mycel <em>refuses</em> to do.</h2>
-      <p class="lede">
-        Every feature below was considered, researched, and rejected with written evidence.
-        The refusals are binding: they live in
-        <a href="https://github.com/splch/mycel/blob/main/docs/SPEC.md">SPEC.md §9</a>, defended in
-        <a href="https://github.com/splch/mycel/blob/main/docs/RESEARCH.md">RESEARCH.md</a>.
-      </p>
-      <ul class="refusals">
-        <li><span class="x">no.</span><div><h3><s>JavaScript rendering</s></h3><p>Pages are indexed as served. A headless browser farm is a different product with a different cost curve.</p></div></li>
-        <li><span class="x">no.</span><div><h3><s>Embeddings &amp; vector search</s></h3><p>BM25 × host centrality is cheap, explainable, and good. Semantic search adds a GPU bill and an oracle you can't audit.</p></div></li>
-        <li><span class="x">no.</span><div><h3><s>DHT &amp; peer discovery</s></h3><p>You list your peers; the allowlist is the gate. Open networks inherit open-network spam, sybils, and poisoning.</p></div></li>
-        <li><span class="x">no.</span><div><h3><s>Trustless peering</s></h3><p>No reputation systems, no staking, no "token anything". Trust is social — the same way you trust an SSH key.</p></div></li>
-        <li><span class="x">no.</span><div><h3><s>Custom storage formats</s></h3><p>SQLite, WARC, tantivy. Every byte on disk is inspectable with <code>sqlite3</code> and <code>zcat</code>, and outlives this project.</p></div></li>
-      </ul>
+  <section class="chapter chapter--wide" data-phase="federate" id="ch-federate">
+    <div class="panel">
+      <p class="chlabel">07 · federate</p>
+      <h2>Everything you just watched is one node.</h2>
+      <p>Peers dial each other by public key over QUIC. An allowlist is the only gate; trust is social, not cryptographic. Queries fan out and results interleave round-robin, so a peer's score can never buy rank. Corpora travel as sealed, blake3-verified WARC shards: no DHT, no tokens, no transitive flooding.</p>
+      <p class="doctrine">When both sides list each other, the network exists. Otherwise it simply doesn't.</p>
     </div>
   </section>
-
-  <section id="quickstart" style="padding-top:0">
-    <div class="wrap">
-      <p class="eyebrow">quickstart</p>
-      <h2 data-split>Grow your <em>own</em>.</h2>
-
-      <div class="qs-grid">
-        <div class="qs">
-          <h3>1 · Install</h3>
-          <p>Prebuilt tarballs for Linux (x86_64, aarch64) and macOS (Apple&nbsp;Silicon) are on the
-          <a href="https://github.com/splch/mycel/releases">releases page</a> — one static-ish binary,
-          drop it on your <code>PATH</code>. Or build from source (Rust ≥ 1.85):</p>
-          <div class="codeblock"><button class="cp" type="button">copy</button><pre>git clone https://github.com/splch/mycel
-cd mycel &amp;&amp; cargo build --release</pre></div>
-          <h3 style="margin-top:26px">2 · Crawl &amp; search</h3>
-          <div class="codeblock"><button class="cp" type="button">copy</button><pre>mycel init                  <span class="c"># config, data dir, identity</span>
-$EDITOR mycel.toml          <span class="c"># set crawl.contact_url</span>
-mycel seed blog.example.org
-mycel crawl --limit 500
-mycel search <span class="s">"some phrase"</span>
-mycel run                   <span class="c"># daemon + API on :8080</span></pre></div>
-          <p>An empty <code>mycel.toml</code> is valid — every setting has a default. Then open
-          <code>http://127.0.0.1:8080</code> for the built-in search UI, or hit
-          <code>/api/search?q=…</code> for JSON.</p>
-        </div>
-
-        <div class="qs">
-          <h3>Every command</h3>
-          <div class="tbl-scroll"><table class="cmds">
-            <thead><tr><th>command</th><th>what it does</th></tr></thead>
-            <tbody>
-              <tr><td>init</td><td>config, data dir, database, identity.key</td></tr>
-              <tr><td>id</td><td>print this node's endpoint id for peers</td></tr>
-              <tr><td>seed &lt;host|url&gt;…</td><td>activate hosts + enqueue their roots</td></tr>
-              <tr><td>crawl [--limit N]</td><td>crawl + index until the frontier drains</td></tr>
-              <tr><td>run</td><td>daemon: crawler + indexer + HTTP API</td></tr>
-              <tr><td>search &lt;q&gt;</td><td>one-shot query; <code>site:</code> filters work</td></tr>
-              <tr><td>bootstrap</td><td>seed centrality + fetch Common Crawl records</td></tr>
-              <tr><td>ingest &lt;path&gt;…</td><td>register + index local .warc / .warc.gz</td></tr>
-              <tr><td>rank</td><td>harmonic centrality over the host webgraph</td></tr>
-              <tr><td>reindex</td><td>rebuild the index from WARC</td></tr>
-              <tr><td>status</td><td>counters, queue depths, shards</td></tr>
-              <tr><td>peers check</td><td>prove dial + auth + protocol per peer</td></tr>
-            </tbody>
-          </table></div>
-        </div>
-      </div>
-    </div>
-  </section>
-</div>
 </main>
 
-<!-- ======================= footer ======================= -->
-<footer>
-  <div class="wrap">
-    <svg class="foot-glyph" viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="#a8e6a1" stroke-width="3.4" stroke-linecap="round"><path d="M32 60V36"/><path d="M32 36C32 24 21 26 16 13"/><path d="M32 36C32 24 43 26 48 11"/><path d="M32 46C25 43 18 45 9 38"/><path d="M32 46C39 43 46 45 55 38"/></g><g fill="#a8e6a1"><circle cx="16" cy="13" r="3.6"/><circle cx="48" cy="11" r="3.6"/><circle cx="9" cy="38" r="3"/><circle cx="55" cy="38" r="3"/></g></svg>
-    <div class="foot-line">grow your own <em>corner of the web</em>.</div>
-    <p>
-      <a href="https://github.com/splch/mycel/blob/main/LICENSE">AGPL-3.0-only</a>. Run it,
-      self-host it, fork it. But if you offer a modified mycel to users over a network, publish
-      your modifications — the same reciprocity that shard sync asks of your corpus, applied to
-      the code.
-    </p>
-    <div class="foot-links">
-      <a href="https://github.com/splch/mycel">github</a>
-      <a href="https://github.com/splch/mycel/blob/main/docs/MANUAL.md">manual</a>
-      <a href="https://github.com/splch/mycel/blob/main/docs/SPEC.md">spec</a>
-      <a href="https://github.com/splch/mycel/blob/main/docs/RESEARCH.md">research</a>
-      <a href="https://github.com/splch/mycel/releases">releases</a>
-      <a href="https://github.com/splch/mycel/issues">issues</a>
-    </div>
-    <p class="foot-fine">
-      static site, no build step — hand-rolled on top of
-      <a href="https://threejs.org">three.js</a>, <a href="https://gsap.com">gsap</a>,
-      <a href="https://lenis.darkroom.engineering">lenis</a> and <a href="https://d3js.org">d3</a>,
-      all pinned from CDN. no WebGL? you get a 2D organism. no JS? you get a readable document.
-      <a href="https://github.com/splch/mycel/tree/main/site">view source</a>.
-    </p>
+<!-- ============================== INSTRUMENTS ============================== -->
+<section id="instruments">
+  <header class="sectionhead">
+    <p class="chlabel">the instruments</p>
+    <h2>Don't take the story's word for it.</h2>
+    <p>These panels run the real rules: the same invariants the binary enforces, animated. Poke them.</p>
+  </header>
+
+  <article class="inst" id="inst-claim">
+    <h3><span class="instno">instrument 01</span> the claim</h3>
+    <p>One request per host is not a promise in the fetch code; it is a property of the SQL that hands out work. Watch four hosts get crawled: each lane holds exactly one token, and the politeness gate must drain before the next claim. Throttle a host and its delay doubles, sticky, never lowered.</p>
+    <div class="demo" data-demo="claim"></div>
+    <details class="sqlbox">
+      <summary>the actual claim query (src/db.rs)</summary>
+<pre><code>SELECT h.id, h.host, f.id, f.url, f.kind, f.attempts, f.depth,
+       h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256
+FROM hosts h
+JOIN frontier f ON f.id = (
+   SELECT f2.id FROM frontier f2
+   WHERE f2.host_id = h.id AND f2.state = 0 AND f2.next_attempt_at &lt;= ?1
+   ORDER BY f2.next_attempt_at, f2.id LIMIT 1)
+LEFT JOIN docs d ON d.url = f.url
+WHERE <mark>h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at &lt;= ?1</mark>
+ORDER BY h.next_fetch_at
+LIMIT ?2</code></pre>
+    </details>
+  </article>
+
+  <article class="inst" id="inst-plug">
+    <h3><span class="instno">instrument 02</span> the watermark</h3>
+    <p>A WARC member is appended and fsynced, and the <em>same transaction</em> that catalogs it advances <code>shards.bytes</code>, the durable watermark. So pull the plug. Go on. On reboot the shard is truncated back to the watermark: torn tails are unobservable, orphans are impossible.</p>
+    <div class="demo" data-demo="plug"></div>
+  </article>
+
+  <article class="inst" id="inst-merge">
+    <h3><span class="instno">instrument 03</span> the merge</h3>
+    <p>Federated results interleave round-robin (local first, then each peer), deduplicated by URL. They are <em>never</em> re-sorted by score: BM25 scores from different indexes aren't comparable, so a malicious 99.9 buys nothing. Kill a peer mid-query; it contributes zero hits and zero delay.</p>
+    <div class="demo" data-demo="merge"></div>
+  </article>
+</section>
+
+<!-- ============================== THE LABEL ============================== -->
+<section id="label">
+  <div class="numbers">
+    <div class="num"><strong data-count="1">1</strong><span>binary</span></div>
+    <div class="num"><strong data-count="27">27</strong><span>dependencies</span></div>
+    <div class="num"><strong data-count="6300" data-approx="~" data-format="comma">~6,300</strong><span>lines of rust</span></div>
+    <div class="num"><strong data-count="0">0</strong><span>servers required</span></div>
   </div>
+
+  <div class="labelgrid">
+    <aside class="nutrition" aria-label="nutrition facts">
+      <h2>mycel</h2>
+      <p class="nf-sub">nutrition facts · per node</p>
+      <hr>
+      <ul>
+        <li>polite crawler <span>RFC 9309</span></li>
+        <li>WARC archive <span>source of truth</span></li>
+        <li>tantivy index <span>disposable</span></li>
+        <li>harmonic ranking <span>offline</span></li>
+        <li>HTTP API + UI <span>localhost</span></li>
+        <li>federation <span>off by default</span></li>
+      </ul>
+      <hr>
+      <p class="nf-zero">contains <strong>0&thinsp;g</strong>:</p>
+      <ul class="nf-zeros">
+        <li>JavaScript rendering</li>
+        <li>vector search</li>
+        <li>DHT</li>
+        <li>tokenomics</li>
+        <li>trustless peering</li>
+        <li>custom storage formats</li>
+        <li>telemetry</li>
+      </ul>
+    </aside>
+    <div class="provenance">
+      <h2>Grown from evidence.</h2>
+      <p>The architecture is the product of adversarially verified research: <strong>282 agents</strong>, three rounds, every load-bearing claim attacked by independent verifiers. <strong>59 claims survived; 8 were refuted</strong>, and the refuted ones are logged so they can never silently re-enter the design.</p>
+      <p>The graveyard upstairs isn't decoration. It's section one of the research: the dominant failure mode of this project category is maintainer collapse and funding exhaustion, not algorithms. Every design decision cites its evidence.</p>
+      <p class="doclinks"><a href="https://github.com/splch/mycel/blob/main/docs/RESEARCH.md">RESEARCH.md</a> · <a href="https://github.com/splch/mycel/blob/main/docs/SPEC.md">SPEC.md</a> · <a href="https://github.com/splch/mycel/blob/main/docs/MANUAL.md">MANUAL.md</a></p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PLANT ONE ============================== -->
+<section id="plant">
+  <header class="sectionhead">
+    <p class="chlabel">plant one</p>
+    <h2>Grow your own.</h2>
+    <p>Prebuilt binaries for Linux and macOS are on the <a href="https://github.com/splch/mycel/releases">releases page</a>, or build from source. It refuses to crawl until you sign your name.</p>
+  </header>
+  <div class="terminal" aria-label="quickstart commands">
+    <div class="tbar"><span></span><span></span><span></span><em>~/mycel</em></div>
+    <pre><code><span class="tline"><span class="p">$</span> cargo build --release</span>
+<span class="tline"><span class="p">$</span> mycel init                     <span class="c"># config, data dir, node identity</span></span>
+<span class="tline"><span class="p">$</span> $EDITOR mycel.toml             <span class="c"># set crawl.contact_url: sign your name</span></span>
+<span class="tline"><span class="p">$</span> mycel seed blog.example.org</span>
+<span class="tline"><span class="p">$</span> mycel crawl --limit 500</span>
+<span class="tline"><span class="p">$</span> mycel search "some phrase"</span>
+<span class="tline"><span class="p">$</span> mycel run                      <span class="c"># daemon: crawler + indexer + UI on :8080</span></span><span class="cursor" aria-hidden="true"></span></code></pre>
+  </div>
+  <p class="aside">No planet-scale crawl required: bootstrap 1 to 100M documents from <strong>Common Crawl</strong> with two CSVs. Ranged fetches, throttled, resumable. Recipes in the <a href="https://github.com/splch/mycel#bootstrapping-from-common-crawl">README</a>.</p>
+  <p class="aside license">AGPL-3.0: run it, self-host it, fork it. Serve a modified mycel over a network? Publish your changes. <em>The reciprocity shard sync asks of your corpus, applied to code.</em></p>
+</section>
+
+<footer>
+  <p class="indexable">We index the web, so this page is indexable: every word here is semantic HTML; the mycelium is <code>aria-hidden</code> decoration. See for yourself: <button class="viewtoggle" type="button" aria-pressed="false">crawler view</button></p>
+  <p class="colophon">no build step · three pinned libraries · the words arrive before the garden does</p>
+  <p class="colophon"><a href="https://github.com/splch/mycel">github.com/splch/mycel</a> · AGPL-3.0</p>
 </footer>
 
+<script defer src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js"></script>
+<script type="module" src="js/site.js"></script>
 </body>
 </html>
