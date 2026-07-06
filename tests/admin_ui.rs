@@ -65,8 +65,9 @@ fn admin_page_drives_the_node() {
     let port = free_tcp_port();
     let base_cfg = format!(
         "data_dir = \"{}\"\n[crawl]\ncontact_url = \"http://example.com/test\"\n\
-         [index]\ncommit_secs = 1\n[api]\nbind = \"127.0.0.1:{port}\"\n\
-         [admin]\nallowed_hosts = [\"extra.example:{port}\"]\n",
+         [index]\ncommit_secs = 1\n\
+         [admin]\nallowed_hosts = [\"extra.example:{port}\"]\n\
+         [api]\nbind = \"127.0.0.1:{port}\"\n",
         dir.join("data").display()
     );
     std::fs::write(dir.join("mycel.toml"), &base_cfg).unwrap();

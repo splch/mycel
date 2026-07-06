@@ -173,21 +173,13 @@ impl Default for ApiCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminCfg {
     /// Extra Host header values accepted on /admin routes, on top of
     /// api.bind and the loopback aliases (DNS-rebinding guard allowlist).
     /// Needed to reach /admin by LAN IP or hostname rather than loopback.
     pub allowed_hosts: Vec<String>,
-}
-
-impl Default for AdminCfg {
-    fn default() -> Self {
-        Self {
-            allowed_hosts: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,8 +377,8 @@ mod tests {
     fn admin_allowed_hosts_defaults_empty() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.admin.allowed_hosts.is_empty());
-        let cfg: Config = toml::from_str("[admin]\nallowed_hosts = [\"mycel.lan:8080\"]\n")
-            .unwrap();
+        let cfg: Config =
+            toml::from_str("[admin]\nallowed_hosts = [\"mycel.lan:8080\"]\n").unwrap();
         assert_eq!(cfg.admin.allowed_hosts, vec!["mycel.lan:8080"]);
     }
 
