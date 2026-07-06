@@ -38,6 +38,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # bind = "127.0.0.1:8080"
 # page_size = 10
 
+[admin]
+# allowed_hosts = []       # extra Host headers accepted on /admin, beyond api.bind + loopback
+                           # (DNS-rebinding guard allowlist); e.g. ["mycel.lan:8080"] for LAN access
+
 [federation]
 # enabled = false          # peerless default: no socket bound, nothing published
 # fanout = true
@@ -67,6 +71,7 @@ pub struct Config {
     pub rank: RankCfg,
     pub warc: WarcCfg,
     pub api: ApiCfg,
+    pub admin: AdminCfg,
     pub federation: FederationCfg,
     pub sync: SyncCfg,
     pub bootstrap: BootstrapCfg,
@@ -164,6 +169,23 @@ impl Default for ApiCfg {
         Self {
             bind: "127.0.0.1:8080".into(),
             page_size: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminCfg {
+    /// Extra Host header values accepted on /admin routes, on top of
+    /// api.bind and the loopback aliases (DNS-rebinding guard allowlist).
+    /// Needed to reach /admin by LAN IP or hostname rather than loopback.
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for AdminCfg {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -357,6 +379,15 @@ mod tests {
         toml::from_str::<Config>(&good).unwrap().validate().unwrap();
         let bad = "[[federation.peers]]\nid = \"nope\"\n";
         assert!(toml::from_str::<Config>(bad).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn admin_allowed_hosts_defaults_empty() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.admin.allowed_hosts.is_empty());
+        let cfg: Config = toml::from_str("[admin]\nallowed_hosts = [\"mycel.lan:8080\"]\n")
+            .unwrap();
+        assert_eq!(cfg.admin.allowed_hosts, vec!["mycel.lan:8080"]);
     }
 
     #[test]

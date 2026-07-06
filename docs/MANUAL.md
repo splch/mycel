@@ -245,6 +245,12 @@ process start; nothing reloads live.
 | `bind` | `"127.0.0.1:8080"` | HTTP listen address for `mycel run`. The API has no authentication or TLS; keep it on localhost or put a reverse proxy in front. |
 | `page_size` | `10` | Results per page, for the API, the web UI, and `mycel search`. There is no per-request size parameter. |
 
+### `[admin]`
+
+| key | default | meaning |
+|---|---|---|
+| `allowed_hosts` | `[]` | Extra `Host` header values accepted on `/admin`, on top of `api.bind` and its `127.0.0.1`/`localhost`/`[::1]` equivalents. Needed to reach `/admin` by LAN IP or hostname when `api.bind` is a wildcard address (e.g. `0.0.0.0:8080`). See "the admin page" above. |
+
 ### `[federation]`
 
 | key | default | meaning |
@@ -543,6 +549,19 @@ happen to visit cannot drive your node. This is browser-attack hardening,
 not authentication: anything that can already send local HTTP can read the
 token from the page. The API's trust model is unchanged (keep it on
 localhost or behind a reverse proxy; a proxy must forward a matching `Host`).
+
+If `api.bind` is `0.0.0.0:PORT` (or another wildcard/multi-address bind) and
+you want to reach `/admin` by LAN IP or hostname rather than loopback, list
+those Host values explicitly in `admin.allowed_hosts`:
+
+```toml
+[admin]
+allowed_hosts = ["mynode.lan:8080", "192.168.1.50:8080"]
+```
+
+This is additive to the api.bind/loopback defaults, not a replacement, and
+still requires an exact (case-insensitive) `Host` match — it does not open
+`/admin` to arbitrary hosts.
 
 ### `GET /healthz`
 

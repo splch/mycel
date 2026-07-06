@@ -65,7 +65,8 @@ fn admin_page_drives_the_node() {
     let port = free_tcp_port();
     let base_cfg = format!(
         "data_dir = \"{}\"\n[crawl]\ncontact_url = \"http://example.com/test\"\n\
-         [index]\ncommit_secs = 1\n[api]\nbind = \"127.0.0.1:{port}\"\n",
+         [index]\ncommit_secs = 1\n[api]\nbind = \"127.0.0.1:{port}\"\n\
+         [admin]\nallowed_hosts = [\"extra.example:{port}\"]\n",
         dir.join("data").display()
     );
     std::fs::write(dir.join("mycel.toml"), &base_cfg).unwrap();
@@ -106,6 +107,14 @@ fn admin_page_drives_the_node() {
     assert_eq!(code, 403, "bad token must be refused");
     let (code, _) = http(&["-H", "Host: evil.example:1", &format!("{api}/admin")]);
     assert_eq!(code, 403, "foreign Host header must be refused");
+
+    // admin.allowed_hosts admits an extra Host value beyond api.bind + loopback.
+    let (code, _) = http(&[
+        "-H",
+        &format!("Host: extra.example:{port}"),
+        &format!("{api}/admin"),
+    ]);
+    assert_eq!(code, 200, "admin.allowed_hosts entry must be accepted");
 
     // Seed through the writer: hosts activate, roots enqueue (.invalid never
     // resolves, so the crawler generates no real traffic).
