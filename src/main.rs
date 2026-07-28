@@ -484,6 +484,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
                 searcher: searcher.clone().expect("searcher built for api"),
                 db: db.clone(),
                 stats_conn: tokio::sync::Mutex::new(db::open(&data.join("mycel.sqlite"))?),
+                stats_cache: Default::default(),
                 page_size: cfg.api.page_size,
                 fed,
                 admin: std::sync::Arc::new(admin::AdminState::new(

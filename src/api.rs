@@ -14,10 +14,25 @@ pub struct Api {
     pub searcher: Arc<search::Searcher>,
     pub db: db::Db,
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
+    pub stats_cache: StatsCache,
     pub page_size: usize,
     pub fed: Option<FedState>,
     pub admin: Arc<crate::admin::AdminState>,
 }
+
+/// Serve-stale cache for /stats: the gauge counts are unindexed full-table
+/// scans (O(corpus)), so recompute at most once per STATS_TTL and never
+/// block a request behind a recompute.
+#[derive(Default)]
+pub struct StatsCache(std::sync::Mutex<StatsCacheState>);
+
+#[derive(Default)]
+struct StatsCacheState {
+    snapshot: Option<(std::time::Instant, Arc<serde_json::Value>)>,
+    refreshing: bool,
+}
+
+const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -241,9 +256,41 @@ async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
 }
 
 async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
-    let conn = api.stats_conn.lock().await;
+    {
+        let mut cache = api.stats_cache.0.lock().expect("stats cache poisoned");
+        if let Some((at, snap)) = &cache.snapshot
+            && (at.elapsed() < STATS_TTL || cache.refreshing)
+        {
+            return axum::Json(snap.clone()).into_response();
+        }
+        cache.refreshing = true;
+    }
+    let computed = tokio::task::spawn_blocking({
+        let api = api.clone();
+        move || {
+            let conn = api.stats_conn.blocking_lock();
+            stats_json(&conn, api.searcher.num_docs())
+        }
+    })
+    .await;
+    let mut cache = api.stats_cache.0.lock().expect("stats cache poisoned");
+    cache.refreshing = false;
+    match computed {
+        Ok(v) => {
+            let v = Arc::new(v);
+            cache.snapshot = Some((std::time::Instant::now(), v.clone()));
+            axum::Json(v).into_response()
+        }
+        Err(e) => {
+            tracing::error!("stats computation panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "stats failed").into_response()
+        }
+    }
+}
+
+fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value {
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
-    let body = serde_json::json!({
+    serde_json::json!({
         "hosts": {
             "active": count("SELECT count(*) FROM hosts WHERE state = 1"),
             "candidate": count("SELECT count(*) FROM hosts WHERE state = 0"),
@@ -264,7 +311,45 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
             "count": count("SELECT count(*) FROM shards"),
             "warc_bytes": count("SELECT COALESCE(sum(bytes),0) FROM shards"),
         },
-        "index_docs": api.searcher.num_docs(),
-    });
-    axum::Json(body)
+        "index_docs": index_docs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn stats_json_reports_table_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (host, state, added_at) VALUES
+               ('a.com', 1, 0), ('b.com', 0, 0);
+             INSERT INTO shards (name, origin_node, bytes, created_at)
+               VALUES ('s1', 'self', 100, 0);
+             INSERT INTO frontier (host_id, url, state, discovered_at) VALUES
+               (1, 'http://a.com/', 0, 0), (1, 'http://a.com/x', 1, 0),
+               (1, 'http://a.com/y', 2, 0);
+             INSERT INTO docs (url, host_id, shard_id, offset, len, sha256,
+                               http_status, fetched_at, indexed) VALUES
+               ('http://a.com/', 1, 1, 0, 10, x'00', 200, 0, 0),
+               ('http://a.com/z', 1, 1, 10, 10, x'01', 200, 0, 1),
+               ('http://a.com/w', 1, 1, 20, 10, x'02', 200, 0, 2);
+             INSERT INTO links (from_host, to_host) VALUES (1, 2);",
+        )
+        .unwrap();
+        let v = super::stats_json(&conn, 42);
+        assert_eq!(v["hosts"]["active"], 1);
+        assert_eq!(v["hosts"]["candidate"], 1);
+        assert_eq!(v["frontier"]["queued"], 1);
+        assert_eq!(v["frontier"]["in_flight"], 1);
+        assert_eq!(v["frontier"]["failed_permanent"], 1);
+        assert_eq!(v["docs"]["total"], 3);
+        assert_eq!(v["docs"]["pending"], 1);
+        assert_eq!(v["docs"]["indexed"], 1);
+        assert_eq!(v["docs"]["skipped"], 1);
+        assert_eq!(v["webgraph_edges"], 1);
+        assert_eq!(v["shards"]["count"], 1);
+        assert_eq!(v["shards"]["warc_bytes"], 100);
+        assert_eq!(v["index_docs"], 42);
+    }
 }
