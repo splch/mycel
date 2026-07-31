@@ -17,6 +17,12 @@ use tantivy::{Index, Term, doc};
 
 /// Hamming radius for near-duplicate simhash matches (Manku et al.).
 const NEAR_DUP_RADIUS: usize = 3;
+
+/// gaoya's LSH matches at Hamming distance STRICTLY less than the bound given
+/// to SimHashIndex::new, so pass radius + 1 to actually honor NEAR_DUP_RADIUS.
+fn new_lsh() -> SimHashIndex<u64, i64> {
+    SimHashIndex::new(6, NEAR_DUP_RADIUS + 1)
+}
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
 const SWEEP_BATCH: usize = 200;
 
@@ -138,7 +144,7 @@ impl Indexer {
         let f = fields(&index.schema());
         let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
         // Rebuild the near-dup LSH from every indexed doc (a rebuildable cache).
-        let mut lsh = SimHashIndex::new(6, NEAR_DUP_RADIUS);
+        let mut lsh = new_lsh();
         {
             let mut stmt = conn.prepare(
                 "SELECT id, simhash FROM docs WHERE indexed = 1 AND simhash IS NOT NULL",
@@ -387,7 +393,7 @@ pub fn rebuild(
     let index = open_or_create(dest)?;
     let f = fields(&index.schema());
     let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
-    let mut lsh: SimHashIndex<u64, i64> = SimHashIndex::new(6, NEAR_DUP_RADIUS);
+    let mut lsh: SimHashIndex<u64, i64> = new_lsh();
     let mut seen_sha: HashSet<Vec<u8>> = HashSet::new();
     let mut marks: Vec<(i64, i64, Option<&'static str>)> = Vec::new();
     let (mut n_indexed, mut n_skipped) = (0u64, 0u64);
@@ -500,6 +506,20 @@ mod tests {
         let s = schema();
         let f = fields(&s);
         assert_ne!(f.url, f.body);
+    }
+
+    #[test]
+    fn near_dup_radius_is_inclusive() {
+        let mut lsh = new_lsh();
+        lsh.insert(1, 0u64);
+        assert!(
+            lsh.query_one(&0b111).is_some(),
+            "distance 3 is within the radius"
+        );
+        assert!(
+            lsh.query_one(&0b1111).is_none(),
+            "distance 4 is outside the radius"
+        );
     }
 
     #[test]
