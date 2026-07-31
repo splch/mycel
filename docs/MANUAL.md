@@ -407,6 +407,16 @@ immediately everywhere via `mycel reindex`. Safe to run beside the daemon
   stopped**; the command probes the index writer lock and refuses with
   `the index is in use; stop 'mycel run'/'crawl' before reindexing`.
   Prints `reindexed from WARC: N indexed, M skipped`.
+  The rebuild is single-threaded and re-reads every WARC record: budget
+  roughly an hour per million documents (a ~2M-document corpus takes
+  ~2.5 hours), during which search is down. Keep the daemon stopped for
+  the whole run — if anything (a watchdog, a second operator) starts it
+  mid-rebuild, it will crawl and index into the *old* index directory
+  that the swap then deletes, and those documents end up marked `indexed`
+  but unsearchable. Recovery: after the rebuild, set the rows created
+  during the window back to pending (`UPDATE docs SET indexed = 0 WHERE
+  id > <max id at rebuild start> AND indexed = 1`) and let the daemon's
+  reconciliation sweep re-index them.
 - `mycel reindex --missing`: index only documents still marked pending
   (crash leftovers, freshly ingested files). Also requires the daemon to be
   stopped (see [One writer at a time](#one-writer-at-a-time)).
