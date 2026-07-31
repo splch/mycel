@@ -174,6 +174,7 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
                 },
                 next_delay_ms: 3_600_000,
                 sticky_delay_ms: None,
+                host_fault: true,
                 now_ms: db::now_ms(),
             })
             .await;
@@ -193,6 +194,7 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
                 outcome: Outcome::Denied,
                 next_delay_ms: 0,
                 sticky_delay_ms: None,
+                host_fault: false,
                 now_ms: db::now_ms(),
             })
             .await;
@@ -205,6 +207,12 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
         job.crawl_delay_ms,
     );
     let (outcome, sticky) = do_fetch(&st, &job, robot.as_ref()).await;
+    let host_fault = match &outcome {
+        Outcome::RetryAt { reason, .. } | Outcome::PermanentFail { reason } => {
+            is_host_fault_reason(reason)
+        }
+        _ => false,
+    };
     st.fetched.fetch_add(1, Ordering::Relaxed);
     st.db
         .complete(Completion {
@@ -215,6 +223,7 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
             outcome,
             next_delay_ms: delay_ms,
             sticky_delay_ms: sticky,
+            host_fault,
             now_ms: db::now_ms(),
         })
         .await;
@@ -230,6 +239,20 @@ fn effective_delay_ms(cfg: &CrawlCfg, robots_delay_s: Option<f32>, host_delay_ms
     (cfg.default_delay_ms as i64)
         .max(robots_ms)
         .max(host_delay_ms)
+}
+
+/// Does this failure indict the host? Transport failures and 5xx (incl. 503
+/// and robots-unavailable stalls) mean a sick host; 4xx, content-type rejects,
+/// redirect outcomes and 429 (the host is alive and asking us to slow down)
+/// are the host answering fine and never count toward the circuit breaker.
+fn is_host_fault_reason(reason: &str) -> bool {
+    reason == "robots-unavailable"
+        || reason.starts_with("timeout")
+        || reason.starts_with("network")
+        || reason.starts_with("body")
+        || reason
+            .strip_prefix("http-")
+            .is_some_and(|s| s.starts_with('5'))
 }
 
 /// 5xx/network retry schedule: 60s · 4^(n−1), n = attempts so far (≥1).
@@ -714,6 +737,34 @@ mod tests {
         assert_eq!(effective_delay_ms(&c, Some(9999.0), 0), 30_000);
         // sticky host delay wins when larger
         assert_eq!(effective_delay_ms(&c, Some(2.0), 60_000), 60_000);
+    }
+
+    #[test]
+    fn host_fault_classification() {
+        for fault in [
+            "timeout",
+            "timeout: elapsed",
+            "network",
+            "network: dns",
+            "body: eof",
+            "http-500",
+            "http-503",
+            "robots-unavailable",
+        ] {
+            assert!(is_host_fault_reason(fault), "{fault}");
+        }
+        for fine in [
+            "http-404",
+            "http-403",
+            "http-429",
+            "content-type:application/pdf",
+            "robots",
+            "robots-redirect",
+            "redirect-loop",
+            "sitemap-gunzip",
+        ] {
+            assert!(!is_host_fault_reason(fine), "{fine}");
+        }
     }
 
     #[test]

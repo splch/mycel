@@ -214,6 +214,7 @@ process start; nothing reloads live.
 | `max_body_bytes` | `2097152` | Page body cap. Larger bodies are truncated at the cap and stored with `WARC-Truncated: length`. |
 | `recrawl_days` | `14` | Revisit interval for successfully fetched URLs (pages and sitemaps). |
 | `max_urls_per_host` | `50000` | Admission cap on URLs accepted into the frontier per host. |
+| `block_after_failures` | `25` | Circuit breaker: block a host (state 2, unclaimable) after this many consecutive host-level failures — transport errors, 5xx, robots-unavailable stalls. 4xx, content-type rejects and 429s do not count (the host answered); any success resets. `0` disables. Re-activate a blocked host with `mycel seed <host>`. |
 | `scope` | `"host"` | Crawl scope. `"host"` (exact-host) is the only accepted value in v1. |
 
 ### `[index]`
@@ -651,6 +652,15 @@ request, and the host's turn is not consumed.
 
 When a previously indexed URL fails permanently, it is deleted from the
 search index (dead pages fall out on their recrawl).
+
+**Host circuit breaker.** Failures that indict the host itself — transport
+errors, 5xx (including repeated 503), and robots-unavailable stalls — are
+counted per host (`consecutive_failures`); any success resets the count.
+At `crawl.block_after_failures` consecutive faults (default 25) the host is
+blocked (`state=2`): it becomes unclaimable and stops consuming crawl turns
+until re-activated with `mycel seed <host>` (which also resets the count).
+HTTP responses that prove the host answered — 4xx, content-type rejects,
+429 — never count toward the breaker.
 
 **Content gates.** Pages must have `Content-Type` `text/html` or
 `application/xhtml+xml` (a missing header is accepted). Bodies are streamed

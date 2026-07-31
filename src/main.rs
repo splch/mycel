@@ -382,6 +382,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
         max_urls_per_host: cfg.crawl.max_urls_per_host as i64,
         max_depth: 32,
         languages: cfg.index.languages.clone(),
+        block_after_failures: cfg.crawl.block_after_failures as i64,
     };
     let indexer_cfg = index::IndexerCfg {
         index_dir: data.join("index"),

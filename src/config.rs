@@ -19,6 +19,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # max_body_bytes = 2097152
 # recrawl_days = 14
 # max_urls_per_host = 50000
+# block_after_failures = 25  # block a host (state=2) after this many consecutive
+#                            # host-level failures (transport/5xx/robots-down);
+#                            # 0 disables; `mycel seed` re-activates
 # scope = "host"           # exact-host membership in the hosts table (only v1 value)
 
 [index]
@@ -88,6 +91,8 @@ pub struct CrawlCfg {
     pub max_body_bytes: u64,
     pub recrawl_days: u64,
     pub max_urls_per_host: u64,
+    /// Block a host after this many consecutive host-level failures; 0 = never.
+    pub block_after_failures: u64,
     pub scope: String,
 }
 
@@ -103,6 +108,7 @@ impl Default for CrawlCfg {
             max_body_bytes: 2 * 1024 * 1024,
             recrawl_days: 14,
             max_urls_per_host: 50_000,
+            block_after_failures: 25,
             scope: "host".into(),
         }
     }
@@ -348,6 +354,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.crawl.concurrency, 64);
         assert_eq!(cfg.crawl.default_delay_ms, 1000);
+        assert_eq!(cfg.crawl.block_after_failures, 25);
         assert_eq!(cfg.index.languages, vec!["en"]);
         assert!((cfg.rank.weight - 0.3).abs() < f64::EPSILON);
         assert!(!cfg.federation.enabled);

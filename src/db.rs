@@ -239,6 +239,10 @@ pub struct Completion {
     pub next_delay_ms: i64,
     /// Sticky 429 doubling: new persistent crawl_delay_ms for the host.
     pub sticky_delay_ms: Option<i64>,
+    /// True when the failure indicts the host itself (transport error, 5xx,
+    /// robots-unavailable); 4xx/content-type/429/robots outcomes are the host
+    /// answering fine and don't count toward the circuit breaker.
+    pub host_fault: bool,
     pub now_ms: i64,
 }
 
@@ -490,6 +494,32 @@ pub struct DbCfg {
     pub max_depth: i64,
     /// Languages to index (ISO 639-1); others stored, not indexed.
     pub languages: Vec<String>,
+    /// Block a host (state=2) after this many consecutive host-level failures
+    /// (the circuit breaker); <= 0 disables. `mycel seed` re-activates.
+    pub block_after_failures: i64,
+}
+
+fn block_threshold(cfg: &DbCfg) -> i64 {
+    if cfg.block_after_failures <= 0 {
+        i64::MAX
+    } else {
+        cfg.block_after_failures
+    }
+}
+
+/// Log once when the circuit breaker flips a host to blocked (state=2). A
+/// blocked host is never claimed again, so this cannot repeat until re-seeded.
+fn warn_if_blocked(tx: &Transaction, host_id: i64, threshold: i64) -> Result<()> {
+    let state: i64 = tx
+        .prepare_cached("SELECT state FROM hosts WHERE id = ?1")?
+        .query_row([host_id], |r| r.get(0))?;
+    if state == 2 {
+        tracing::warn!(
+            "blocked host {host_id} after {threshold} consecutive host-level failures; \
+             reactivate with `mycel seed`"
+        );
+    }
+    Ok(())
 }
 
 struct WarcState {
@@ -981,11 +1011,26 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     } else {
         gate_at(m.now_ms, m.delay_ms)
     };
+    // A served robots (even an empty allow-all) proves the host is alive and
+    // resets the failure count; unavailability counts toward the breaker.
+    let fault = matches!(m.result, RobotsResult::Unavailable { .. });
+    let threshold = block_threshold(cfg);
     tx.prepare_cached(
         "UPDATE hosts SET robots_body = ?1, robots_status = ?2, robots_fetched_at = ?3,
-                          next_fetch_at = ?4, in_flight = 0 WHERE id = ?5",
+                          next_fetch_at = ?4, in_flight = 0,
+                          consecutive_failures = CASE WHEN ?6 THEN consecutive_failures + 1
+                                                      ELSE 0 END,
+                          state = CASE WHEN ?6 AND state = 1
+                                            AND consecutive_failures + 1 >= ?7
+                                       THEN 2 ELSE state END
+         WHERE id = ?5",
     )?
-    .execute(params![body, status, now, gate, m.host_id])?;
+    .execute(params![
+        body, status, now, gate, m.host_id, fault, threshold
+    ])?;
+    if fault {
+        warn_if_blocked(tx, m.host_id, threshold)?;
+    }
     // The claimed URL gave its turn to the robots fetch: refund the attempt.
     tx.prepare_cached(
         "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
@@ -1281,18 +1326,32 @@ fn handle_complete(
         tx.prepare_cached("UPDATE hosts SET in_flight = 0 WHERE id = ?1")?
             .execute([c.host_id])?;
     } else {
+        // Circuit breaker: only host-level faults (host_fault) count, and any
+        // success resets. At the threshold the host is blocked (state=2) and
+        // drops out of claim/pending_soon until manually re-seeded.
+        let threshold = block_threshold(cfg);
         tx.prepare_cached(
             "UPDATE hosts SET in_flight = 0, next_fetch_at = ?1,
                     crawl_delay_ms = COALESCE(?2, crawl_delay_ms),
-                    consecutive_failures = CASE WHEN ?3 THEN 0 ELSE consecutive_failures + 1 END
+                    consecutive_failures = CASE WHEN ?3 THEN 0
+                                                WHEN ?5 THEN consecutive_failures + 1
+                                                ELSE consecutive_failures END,
+                    state = CASE WHEN NOT ?3 AND ?5 AND state = 1
+                                      AND consecutive_failures + 1 >= ?6
+                                 THEN 2 ELSE state END
              WHERE id = ?4",
         )?
         .execute(params![
             gate_at(c.now_ms, c.next_delay_ms),
             c.sticky_delay_ms,
             success,
-            c.host_id
+            c.host_id,
+            c.host_fault,
+            threshold,
         ])?;
+        if !success && c.host_fault {
+            warn_if_blocked(tx, c.host_id, threshold)?;
+        }
     }
     Ok(())
 }
@@ -1322,9 +1381,11 @@ fn fail_permanent(tx: &Transaction, frontier_id: i64, reason: &str) -> Result<()
 pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> Result<(u64, u64)> {
     let (mut hosts_n, mut urls_n) = (0u64, 0u64);
     for (host, url) in entries {
+        // Seeding is also the operator's re-activation path for hosts the
+        // circuit breaker blocked: state back to 1, failure count cleared.
         conn.execute(
             "INSERT INTO hosts (host, state, added_at) VALUES (?1, 1, ?2)
-             ON CONFLICT(host) DO UPDATE SET state = 1",
+             ON CONFLICT(host) DO UPDATE SET state = 1, consecutive_failures = 0",
             params![host, now],
         )?;
         hosts_n += 1;
@@ -1500,6 +1561,7 @@ mod tests {
             max_urls_per_host: 50_000,
             max_depth: 32,
             languages: vec!["en".into()],
+            block_after_failures: 1000,
         }
     }
 
@@ -1562,6 +1624,7 @@ mod tests {
             }),
             next_delay_ms: 1000,
             sticky_delay_ms: None,
+            host_fault: false,
             now_ms: t * 1000,
         })
         .await;
@@ -1663,6 +1726,7 @@ mod tests {
             },
             next_delay_ms: 2000,
             sticky_delay_ms: Some(2000),
+            host_fault: false,
             now_ms: t * 1000,
         })
         .await;
@@ -1689,6 +1753,129 @@ mod tests {
         assert_eq!(state, 0);
         assert_eq!(at, t + 120);
         assert_eq!(attempts, 1, "claim's attempt increment is kept for retries");
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_blocks_and_seed_reactivates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let mut cfg = test_cfg();
+        cfg.block_after_failures = 3;
+        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), cfg, None).unwrap();
+
+        let t = now();
+        let fault = |job: &Job, at: i64| Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::RetryAt {
+                at,
+                reason: "timeout".into(),
+            },
+            next_delay_ms: 0,
+            sticky_delay_ms: None,
+            host_fault: true,
+            now_ms: t * 1000,
+        };
+
+        // A 404 (the host answered) does not count toward the breaker.
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(Completion {
+            outcome: Outcome::PermanentFail {
+                reason: "http-404".into(),
+            },
+            host_fault: false,
+            ..fault(&job, t)
+        })
+        .await;
+        db.flush().await;
+        db.seed(vec![("example.com".into(), "http://example.com/b".into())])
+            .await
+            .unwrap();
+
+        // Three consecutive transport failures trip the breaker.
+        for i in 1..=3i64 {
+            let job = db.claim(t + i, 1).await.pop().unwrap();
+            db.complete(fault(&job, t + i)).await;
+            db.flush().await;
+        }
+        assert!(
+            db.claim(t + 10, 1).await.is_empty(),
+            "blocked host is not claimable"
+        );
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let (state, failures): (i64, i64) = conn
+            .query_row(
+                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state, failures), (2, 3));
+
+        // Re-seeding re-activates and clears the failure count.
+        seed_into(
+            &conn,
+            now(),
+            &[("example.com".into(), "http://example.com/".into())],
+        )
+        .unwrap();
+        let (state, failures): (i64, i64) = conn
+            .query_row(
+                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state, failures), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn robots_unavailable_trips_breaker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let mut cfg = test_cfg();
+        cfg.block_after_failures = 2;
+        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), cfg, None).unwrap();
+
+        let t = now();
+        for i in 0..2i64 {
+            let job = db.claim(t + i * 3600, 1).await.pop().unwrap();
+            db.robots_done(RobotsMsg {
+                host_id: job.host_id,
+                frontier_id: job.frontier_id,
+                result: RobotsResult::Unavailable { status: None },
+                sitemaps: vec![],
+                delay_ms: 1000,
+                now_ms: (t + i * 3600) * 1000,
+            })
+            .await;
+            db.flush().await;
+        }
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let (state, failures): (i64, i64) = conn
+            .query_row(
+                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state, failures), (2, 2), "two dead-robots cycles block");
     }
 
     #[tokio::test]
