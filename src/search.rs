@@ -70,11 +70,8 @@ impl Searcher {
         let searcher = self.reader.searcher();
         let index = searcher.index();
 
-        // Query semantics: conjunctive first (precision); when it matches
-        // nothing, retry disjunctive and let BM25 rank partial matches — the
-        // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
-        // weakAnd). site: filters are explicit intent and never relax.
-        let build = |conjunctive: bool| {
+        let w = self.weight;
+        let run = |conjunctive: bool| -> Result<(usize, Vec<Hit>)> {
             let mut parser =
                 QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
             if conjunctive {
@@ -83,12 +80,27 @@ impl Searcher {
             parser.set_field_boost(self.fields.title, 2.0);
             let text_query: Option<Box<dyn Query>> =
                 (!text.is_empty()).then(|| parser.parse_query_lenient(&text).0);
-            let query: Box<dyn Query> = match (&text_query, site_hosts.is_empty()) {
-                (Some(_), true) => parser.parse_query_lenient(&text).0,
-                _ => {
+
+            // The generator collects its terms from the query without
+            // retaining a borrow, so build it before the query moves into
+            // the boolean composition. One parse per pass, reused everywhere.
+            let snippet_gen = text_query
+                .as_ref()
+                .and_then(|q| {
+                    tantivy::snippet::SnippetGenerator::create(&searcher, &**q, self.fields.body)
+                        .ok()
+                })
+                .map(|mut g| {
+                    g.set_max_num_chars(SNIPPET_CHARS);
+                    g
+                });
+
+            let query: Box<dyn Query> = match (text_query, site_hosts.is_empty()) {
+                (Some(q), true) => q,
+                (text_q, _) => {
                     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-                    if !text.is_empty() {
-                        clauses.push((Occur::Must, parser.parse_query_lenient(&text).0));
+                    if let Some(q) = text_q {
+                        clauses.push((Occur::Must, q));
                     }
                     if !site_hosts.is_empty() {
                         let hosts: Vec<(Occur, Box<dyn Query>)> = site_hosts
@@ -108,13 +120,7 @@ impl Searcher {
                     Box::new(BooleanQuery::new(clauses))
                 }
             };
-            (query, text_query)
-        };
 
-        let w = self.weight;
-        let run = |query: &dyn Query,
-                   text_query: &Option<Box<dyn Query>>|
-         -> Result<(usize, Vec<Hit>)> {
             let collector = TopDocs::with_limit(page_size.max(1))
                 .and_offset(page * page_size)
                 .tweak_score(move |segment: &tantivy::SegmentReader| {
@@ -124,18 +130,7 @@ impl Searcher {
                         None => score,
                     }
                 });
-            let (top, total) = searcher.search(query, &(collector, Count))?;
-
-            let snippet_gen = text_query
-                .as_ref()
-                .and_then(|q| {
-                    tantivy::snippet::SnippetGenerator::create(&searcher, &**q, self.fields.body)
-                        .ok()
-                })
-                .map(|mut g| {
-                    g.set_max_num_chars(SNIPPET_CHARS);
-                    g
-                });
+            let (top, total) = searcher.search(&query, &(collector, Count))?;
 
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
@@ -174,15 +169,17 @@ impl Searcher {
             Ok((total, hits))
         };
 
-        let (query, text_query) = build(true);
-        let (total, hits) = run(&*query, &text_query)?;
+        // Query semantics: conjunctive first (precision); when it matches
+        // nothing, retry disjunctive and let BM25 rank partial matches — the
+        // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
+        // weakAnd). site: filters are explicit intent and never relax.
+        let (total, hits) = run(true)?;
         // A lone term behaves identically under both semantics; only
         // multi-term queries can benefit from the fallback pass.
         if total > 0 || text.split_whitespace().nth(1).is_none() {
             return Ok((total, hits, false));
         }
-        let (query, text_query) = build(false);
-        let (total, hits) = run(&*query, &text_query)?;
+        let (total, hits) = run(false)?;
         Ok((total, hits, true))
     }
 }
