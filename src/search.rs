@@ -146,16 +146,26 @@ impl Searcher {
 
             let mut kept: Vec<u64> = Vec::with_capacity(top.len());
             let mut collapsed = 0usize;
+            let mut sim_cols: std::collections::HashMap<
+                u32,
+                Option<tantivy::fastfield::Column<u64>>,
+            > = std::collections::HashMap::new();
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
                 // Serve-time near-dup collapse: hide hits within the simhash
                 // radius of a better-ranked hit on this page. Docs without a
-                // simhash never collapse.
-                if let Some(sim) = searcher
-                    .segment_reader(addr.segment_ord)
-                    .fast_fields()
-                    .u64("simhash")
-                    .ok()
+                // simhash never collapse. The column is resolved once per
+                // segment, not once per hit.
+                if let Some(sim) = sim_cols
+                    .entry(addr.segment_ord)
+                    .or_insert_with(|| {
+                        searcher
+                            .segment_reader(addr.segment_ord)
+                            .fast_fields()
+                            .u64("simhash")
+                            .ok()
+                    })
+                    .as_ref()
                     .and_then(|c| c.first(addr.doc_id))
                 {
                     if kept
@@ -174,14 +184,17 @@ impl Searcher {
                         .unwrap_or_default()
                         .to_string()
                 };
-                let body = text_of(self.fields.body);
                 let snippet = snippet_gen
                     .as_ref()
                     .map(|g| g.snippet_from_doc(&doc).to_html())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| {
-                        let mut s: String = body.chars().take(SNIPPET_CHARS).collect();
-                        if body.chars().count() > SNIPPET_CHARS {
+                        // The body string is only materialized on this path
+                        // (the generator usually wins); one bounded scan.
+                        let body = text_of(self.fields.body);
+                        let mut it = body.chars();
+                        let mut s: String = it.by_ref().take(SNIPPET_CHARS).collect();
+                        if it.next().is_some() {
                             s.push('…');
                         }
                         html_escape(&s)
