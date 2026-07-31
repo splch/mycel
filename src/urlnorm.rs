@@ -65,12 +65,16 @@ pub fn parse_seed_entry(entry: &str) -> std::result::Result<(String, String), St
         let host = host_of(&url).ok_or_else(|| format!("no host in: {entry}"))?;
         Ok((host, url))
     } else {
-        let host = entry.trim().trim_end_matches('/').to_ascii_lowercase();
-        if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+        let raw = entry.trim().trim_end_matches('/').to_ascii_lowercase();
+        if raw.is_empty() || raw.contains('/') || raw.contains(char::is_whitespace) {
             return Err(format!("not a host name: {entry}"));
         }
-        let url = normalize(&format!("https://{host}/"))
+        let url = normalize(&format!("https://{raw}/"))
             .ok_or_else(|| format!("not a host name: {entry}"))?;
+        // Key the hosts row through host_of (port-less), not the raw input:
+        // discovered links key the same way, and a port in the key would fork
+        // the host into two rows and stall crawl expansion.
+        let host = host_of(&url).ok_or_else(|| format!("not a host name: {entry}"))?;
         Ok((host, url))
     }
 }
@@ -159,6 +163,29 @@ mod tests {
             normalize_rel(&base, "#frag"),
             Some("http://example.com/dir/page.html".into())
         );
+    }
+
+    #[test]
+    fn seed_entries() {
+        let (h, u) = parse_seed_entry("example.com").unwrap();
+        assert_eq!(
+            (h.as_str(), u.as_str()),
+            ("example.com", "https://example.com/")
+        );
+        // bare host:port: the hosts-table key drops the port (host_of semantics),
+        // the enqueued URL keeps it
+        let (h, u) = parse_seed_entry("Example.COM:8080/").unwrap();
+        assert_eq!(
+            (h.as_str(), u.as_str()),
+            ("example.com", "https://example.com:8080/")
+        );
+        let (h, u) = parse_seed_entry("http://example.com:8080/x").unwrap();
+        assert_eq!(
+            (h.as_str(), u.as_str()),
+            ("example.com", "http://example.com:8080/x")
+        );
+        assert!(parse_seed_entry("not a host").is_err());
+        assert!(parse_seed_entry("example.com/path").is_err());
     }
 
     #[test]
