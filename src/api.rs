@@ -14,7 +14,7 @@ pub struct Api {
     pub searcher: Arc<search::Searcher>,
     pub db: db::Db,
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
-    pub stats_cache: StatsCache,
+    pub stats_cache: Arc<StatsCache>,
     pub page_size: usize,
     pub fed: Option<FedState>,
     pub admin: Arc<crate::admin::AdminState>,
@@ -33,6 +33,17 @@ struct StatsCacheState {
 }
 
 const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Clears `refreshing` on drop. axum drops the handler future when the client
+/// disconnects, and without this a cancelled mid-recompute request wedges the
+/// flag: every later request then serves the stale snapshot forever.
+struct RefreshGuard(Arc<StatsCache>);
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.0.lock().expect("stats cache poisoned").refreshing = false;
+    }
+}
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -265,6 +276,7 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
         }
         cache.refreshing = true;
     }
+    let _guard = RefreshGuard(api.stats_cache.clone());
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
@@ -274,7 +286,6 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
     })
     .await;
     let mut cache = api.stats_cache.0.lock().expect("stats cache poisoned");
-    cache.refreshing = false;
     match computed {
         Ok(v) => {
             let v = Arc::new(v);
@@ -317,6 +328,17 @@ fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refresh_guard_clears_the_flag_on_drop() {
+        let cache = std::sync::Arc::new(super::StatsCache::default());
+        cache.0.lock().unwrap().refreshing = true;
+        let api_like = cache.clone();
+        {
+            let _guard = super::RefreshGuard(api_like);
+        } // simulates the handler future being dropped mid-recompute
+        assert!(!cache.0.lock().unwrap().refreshing);
+    }
+
     #[test]
     fn stats_json_reports_table_counts() {
         let dir = tempfile::tempdir().unwrap();
