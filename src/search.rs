@@ -1,5 +1,6 @@
-//! Query-side: site: filter, conjunctive QueryParser over title+body, BM25
-//! score × (1 + w·centrality) via the fast field, snippets.
+//! Query-side: site: filter, QueryParser over title+body (conjunctive with a
+//! disjunctive zero-results fallback), BM25 score × (1 + w·centrality) via
+//! the fast field, snippets.
 
 pub mod fanout;
 
@@ -50,106 +51,139 @@ impl Searcher {
         self.reader.searcher().num_docs()
     }
 
-    /// One page of results: (total matches, hits).
-    pub fn search(&self, raw: &str, page: usize, page_size: usize) -> Result<(usize, Vec<Hit>)> {
+    /// One page of results: (total matches, hits, relaxed). `relaxed` is
+    /// true when the conjunctive parse matched nothing and the hits come
+    /// from the disjunctive fallback (partial matches, BM25-ranked).
+    pub fn search(
+        &self,
+        raw: &str,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(usize, Vec<Hit>, bool)> {
         let raw: String = raw.chars().take(MAX_QUERY_CHARS).collect();
         let page = page.min(MAX_PAGE);
         let (site_hosts, text) = split_site_filters(&raw);
         if text.is_empty() && site_hosts.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), false));
         }
 
         let searcher = self.reader.searcher();
         let index = searcher.index();
-        let mut parser = QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
-        parser.set_conjunction_by_default();
-        parser.set_field_boost(self.fields.title, 2.0);
 
-        let text_query: Option<Box<dyn Query>> =
-            (!text.is_empty()).then(|| parser.parse_query_lenient(&text).0);
-        let query: Box<dyn Query> = match (&text_query, site_hosts.is_empty()) {
-            (Some(_), true) => parser.parse_query_lenient(&text).0,
-            _ => {
-                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-                if !text.is_empty() {
-                    clauses.push((Occur::Must, parser.parse_query_lenient(&text).0));
-                }
-                if !site_hosts.is_empty() {
-                    let hosts: Vec<(Occur, Box<dyn Query>)> = site_hosts
-                        .iter()
-                        .map(|h| {
-                            (
-                                Occur::Should,
-                                Box::new(TermQuery::new(
-                                    Term::from_field_text(self.fields.host, h),
-                                    IndexRecordOption::Basic,
-                                )) as Box<dyn Query>,
-                            )
-                        })
-                        .collect();
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(hosts))));
-                }
-                Box::new(BooleanQuery::new(clauses))
+        // Query semantics: conjunctive first (precision); when it matches
+        // nothing, retry disjunctive and let BM25 rank partial matches — the
+        // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
+        // weakAnd). site: filters are explicit intent and never relax.
+        let build = |conjunctive: bool| {
+            let mut parser =
+                QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
+            if conjunctive {
+                parser.set_conjunction_by_default();
             }
+            parser.set_field_boost(self.fields.title, 2.0);
+            let text_query: Option<Box<dyn Query>> =
+                (!text.is_empty()).then(|| parser.parse_query_lenient(&text).0);
+            let query: Box<dyn Query> = match (&text_query, site_hosts.is_empty()) {
+                (Some(_), true) => parser.parse_query_lenient(&text).0,
+                _ => {
+                    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                    if !text.is_empty() {
+                        clauses.push((Occur::Must, parser.parse_query_lenient(&text).0));
+                    }
+                    if !site_hosts.is_empty() {
+                        let hosts: Vec<(Occur, Box<dyn Query>)> = site_hosts
+                            .iter()
+                            .map(|h| {
+                                (
+                                    Occur::Should,
+                                    Box::new(TermQuery::new(
+                                        Term::from_field_text(self.fields.host, h),
+                                        IndexRecordOption::Basic,
+                                    )) as Box<dyn Query>,
+                                )
+                            })
+                            .collect();
+                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(hosts))));
+                    }
+                    Box::new(BooleanQuery::new(clauses))
+                }
+            };
+            (query, text_query)
         };
 
         let w = self.weight;
-        let collector = TopDocs::with_limit(page_size.max(1))
-            .and_offset(page * page_size)
-            .tweak_score(move |segment: &tantivy::SegmentReader| {
-                let col = segment.fast_fields().f64("centrality").ok();
-                move |doc: tantivy::DocId, score: tantivy::Score| match &col {
-                    Some(c) => score * (1.0 + w * c.first(doc).unwrap_or(0.0)) as f32,
-                    None => score,
-                }
-            });
-        let (top, total) = searcher.search(&query, &(collector, Count))?;
-
-        let snippet_gen = text_query
-            .as_ref()
-            .and_then(|q| {
-                tantivy::snippet::SnippetGenerator::create(&searcher, &**q, self.fields.body).ok()
-            })
-            .map(|mut g| {
-                g.set_max_num_chars(SNIPPET_CHARS);
-                g
-            });
-
-        let mut hits = Vec::with_capacity(top.len());
-        for (score, addr) in top {
-            let doc: TantivyDocument = searcher.doc(addr)?;
-            let text_of = |f: tantivy::schema::Field| {
-                doc.get_first(f)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            let body = text_of(self.fields.body);
-            let snippet = snippet_gen
-                .as_ref()
-                .map(|g| g.snippet_from_doc(&doc).to_html())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    let mut s: String = body.chars().take(SNIPPET_CHARS).collect();
-                    if body.chars().count() > SNIPPET_CHARS {
-                        s.push('…');
+        let run = |query: &dyn Query,
+                   text_query: &Option<Box<dyn Query>>|
+         -> Result<(usize, Vec<Hit>)> {
+            let collector = TopDocs::with_limit(page_size.max(1))
+                .and_offset(page * page_size)
+                .tweak_score(move |segment: &tantivy::SegmentReader| {
+                    let col = segment.fast_fields().f64("centrality").ok();
+                    move |doc: tantivy::DocId, score: tantivy::Score| match &col {
+                        Some(c) => score * (1.0 + w * c.first(doc).unwrap_or(0.0)) as f32,
+                        None => score,
                     }
-                    html_escape(&s)
                 });
-            hits.push(Hit {
-                url: text_of(self.fields.url),
-                host: text_of(self.fields.host),
-                title: text_of(self.fields.title),
-                snippet,
-                score,
-                fetched_at: doc
-                    .get_first(self.fields.fetched_at)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                source: None,
-            });
+            let (top, total) = searcher.search(query, &(collector, Count))?;
+
+            let snippet_gen = text_query
+                .as_ref()
+                .and_then(|q| {
+                    tantivy::snippet::SnippetGenerator::create(&searcher, &**q, self.fields.body)
+                        .ok()
+                })
+                .map(|mut g| {
+                    g.set_max_num_chars(SNIPPET_CHARS);
+                    g
+                });
+
+            let mut hits = Vec::with_capacity(top.len());
+            for (score, addr) in top {
+                let doc: TantivyDocument = searcher.doc(addr)?;
+                let text_of = |f: tantivy::schema::Field| {
+                    doc.get_first(f)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let body = text_of(self.fields.body);
+                let snippet = snippet_gen
+                    .as_ref()
+                    .map(|g| g.snippet_from_doc(&doc).to_html())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let mut s: String = body.chars().take(SNIPPET_CHARS).collect();
+                        if body.chars().count() > SNIPPET_CHARS {
+                            s.push('…');
+                        }
+                        html_escape(&s)
+                    });
+                hits.push(Hit {
+                    url: text_of(self.fields.url),
+                    host: text_of(self.fields.host),
+                    title: text_of(self.fields.title),
+                    snippet,
+                    score,
+                    fetched_at: doc
+                        .get_first(self.fields.fetched_at)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    source: None,
+                });
+            }
+            Ok((total, hits))
+        };
+
+        let (query, text_query) = build(true);
+        let (total, hits) = run(&*query, &text_query)?;
+        // A lone term behaves identically under both semantics; only
+        // multi-term queries can benefit from the fallback pass.
+        if total > 0 || text.split_whitespace().nth(1).is_none() {
+            return Ok((total, hits, false));
         }
-        Ok((total, hits))
+        let (query, text_query) = build(false);
+        let (total, hits) = run(&*query, &text_query)?;
+        Ok((total, hits, true))
     }
 }
 
@@ -239,7 +273,8 @@ mod tests {
 
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
-        let (total, hits) = s.search("mycelium networks", 0, 10).unwrap();
+        let (total, hits, relaxed) = s.search("mycelium networks", 0, 10).unwrap();
+        assert!(!relaxed);
         assert_eq!(total, 2);
         // identical BM25, but c.com carries the centrality boost
         assert_eq!(hits[0].url, "http://c.com/1");
@@ -250,14 +285,69 @@ mod tests {
             hits[0].snippet
         );
 
-        // conjunction by default: unrelated pair matches nothing
-        let (total, _) = s.search("mycelium pasta", 0, 10).unwrap();
-        assert_eq!(total, 0);
+        // zero-results fallback: no doc has both terms, so the disjunctive
+        // pass returns the partial matches
+        let (total, _, relaxed) = s.search("mycelium pasta", 0, 10).unwrap();
+        assert!(relaxed);
+        assert_eq!(total, 3);
 
         // site: filter
-        let (total, hits) = s.search("mycelium site:a.com", 0, 10).unwrap();
+        let (total, hits, relaxed) = s.search("mycelium site:a.com", 0, 10).unwrap();
+        assert!(!relaxed);
         assert_eq!(total, 1);
         assert_eq!(hits[0].host, "a.com");
+    }
+
+    #[test]
+    fn zero_results_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        let mut w: tantivy::IndexWriter = index.writer(64 * 1024 * 1024).unwrap();
+        let add = |url: &str, host: &str, title: &str, body: &str| {
+            w.add_document(tantivy::doc!(
+                f.url => url, f.host => host, f.title => title, f.body => body,
+                f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+            ))
+            .unwrap();
+        };
+        add(
+            "http://a.com/1",
+            "a.com",
+            "Alpha beta",
+            "alpha beta together",
+        );
+        add("http://b.com/1", "b.com", "Gamma", "only gamma here");
+        w.commit().unwrap();
+
+        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        s.reader.reload().unwrap();
+
+        // no doc has all three terms: AND misses, OR ranks the 2-term doc first
+        let (total, hits, relaxed) = s.search("alpha beta gamma", 0, 10).unwrap();
+        assert!(relaxed);
+        assert_eq!(total, 2);
+        assert_eq!(hits[0].url, "http://a.com/1");
+
+        // single term: nothing to relax
+        let (total, _, relaxed) = s.search("alpha", 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert!(!relaxed);
+
+        // conjunctive hit: no fallback
+        let (total, _, relaxed) = s.search("alpha beta", 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert!(!relaxed);
+
+        // site: stays mandatory even when the text relaxes
+        let (total, _, relaxed) = s.search("alpha beta site:b.com", 0, 10).unwrap();
+        assert_eq!(total, 0);
+        assert!(relaxed);
+
+        // nothing matches under either semantics
+        let (total, _, relaxed) = s.search("delta epsilon", 0, 10).unwrap();
+        assert_eq!(total, 0);
+        assert!(relaxed);
     }
     /// Deterministic corpus + queries; top-3 URLs snapshotted in
     /// tests/golden/queries.toml. Regenerate with UPDATE_GOLDENS=1 after an
@@ -376,7 +466,7 @@ mod tests {
         let mut rendered =
             String::from("# generated by golden_queries; UPDATE_GOLDENS=1 to refresh\n");
         for q in queries {
-            let (total, hits) = s.search(q, 0, 3).unwrap();
+            let (total, hits, _) = s.search(q, 0, 3).unwrap();
             rendered.push_str(&format!(
                 "\n[[case]]\nquery = {q:?}\ntotal = {total}\ntop = ["
             ));

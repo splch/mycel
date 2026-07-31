@@ -606,18 +606,22 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         });
     }
     let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
-    let (total, hits) = searcher.search(&q, 0, cfg.api.page_size)?;
+    let (total, hits, relaxed) = searcher.search(&q, 0, cfg.api.page_size)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "query": q, "total": total, "hits": hits
+                "query": q, "total": total, "hits": hits, "relaxed": relaxed
             }))?
         );
     } else if hits.is_empty() {
         println!("no results ({} docs indexed)", searcher.num_docs());
     } else {
-        println!("{total} results");
+        if relaxed {
+            println!("{total} results (including partial matches)");
+        } else {
+            println!("{total} results");
+        }
         for h in hits {
             let snippet = h
                 .snippet

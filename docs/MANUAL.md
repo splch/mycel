@@ -462,7 +462,7 @@ body with English stemming.
 
 | syntax | meaning |
 |---|---|
-| `rust ownership` | Conjunction by default: documents must match **all** terms. |
+| `rust ownership` | Conjunction first: documents matching **all** terms win. If nothing matches all terms, the query is retried with any-terms matching (BM25 ranks the fullest matches first) and the response is marked `relaxed`. |
 | `"quick brown fox"` | Phrase query (positions are indexed). |
 | `title:rust` | Field prefix, per tantivy query syntax. Default fields are title and body. |
 | `site:example.com rust` | Restrict to a host. Multiple `site:` filters are OR-ed together. A trailing `/` is tolerated; hosts are matched exactly (subdomains are distinct). |
@@ -518,6 +518,7 @@ Server-rendered HTML search UI with pagination. Accepts the same `q`,
 ```
 
 - `q` empty or missing returns `total: 0, hits: []`.
+- `relaxed` is true when the all-terms query matched nothing and the hits are partial matches from the any-terms retry. `site:` filters stay mandatory under the fallback.
 - `page` defaults to 0.
 - `federated` defaults to the config (`federation.fanout` when federation is
   enabled, otherwise off). `federated=1` forces fan-out, `federated=0` forces

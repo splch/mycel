@@ -237,7 +237,7 @@ async fn query_stream(
     let searcher = state.searcher.clone();
     let q = req.query.clone();
     let reply = match tokio::task::spawn_blocking(move || searcher.search(&q, 0, limit)).await {
-        Ok(Ok((_total, hits))) => Reply::Ok(proto::QueryOk {
+        Ok(Ok((_total, hits, _relaxed))) => Reply::Ok(proto::QueryOk {
             hits: hits
                 .into_iter()
                 .map(|h| proto::RemoteHit {

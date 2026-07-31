@@ -70,7 +70,7 @@ async fn run_search(
     q: String,
     page: usize,
     federated: Option<u8>,
-) -> std::result::Result<(usize, Vec<search::Hit>), String> {
+) -> std::result::Result<(usize, Vec<search::Hit>, bool), String> {
     let searcher = api.searcher.clone();
     let page_size = api.page_size;
     api.db.counter("queries", 1).await;
@@ -87,12 +87,12 @@ async fn run_search(
         let local_q = q.clone();
         let local = tokio::task::spawn_blocking(move || searcher.search(&local_q, 0, page_size));
         let peer_lists = fed.fanout.search_peers(&q, page_size).await;
-        let (total, local_hits) = local
+        let (total, local_hits, relaxed) = local
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         let merged = search::fanout::merge(local_hits, peer_lists, page_size);
-        return Ok((total.max(merged.len()), merged));
+        return Ok((total.max(merged.len()), merged, relaxed));
     }
     tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size))
         .await
@@ -108,13 +108,13 @@ async fn api_search(
     let page = p.page.unwrap_or(0);
     if q.trim().is_empty() {
         return axum::Json(serde_json::json!({
-            "query": q, "page": page, "total": 0, "hits": []
+            "query": q, "page": page, "total": 0, "hits": [], "relaxed": false
         }))
         .into_response();
     }
     match run_search(&api, q.clone(), page, p.federated).await {
-        Ok((total, hits)) => axum::Json(serde_json::json!({
-            "query": q, "page": page, "total": total, "hits": hits
+        Ok((total, hits, relaxed)) => axum::Json(serde_json::json!({
+            "query": q, "page": page, "total": total, "hits": hits, "relaxed": relaxed
         }))
         .into_response(),
         Err(e) => {
@@ -130,8 +130,13 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
     let mut results = String::new();
     if !q.trim().is_empty() {
         match run_search(&api, q.clone(), page, p.federated).await {
-            Ok((total, hits)) => {
-                results.push_str(&format!("<p><small>{total} results</small></p>"));
+            Ok((total, hits, relaxed)) => {
+                let note = if relaxed {
+                    " · including partial matches"
+                } else {
+                    ""
+                };
+                results.push_str(&format!("<p><small>{total} results{note}</small></p>"));
                 for h in &hits {
                     let badge = match &h.source {
                         Some(s) => format!(" <small>[{}]</small>", search::html_escape(s)),
