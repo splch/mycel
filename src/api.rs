@@ -21,18 +21,9 @@ pub struct Api {
 }
 
 /// Serve-stale cache for /stats: the gauge counts are unindexed full-table
-/// scans (O(corpus)), so recompute at most once per STATS_TTL. The snapshot
-/// sits behind a cheap std mutex; `refresh` is a tokio mutex used as a
-/// one-recompute-at-a-time permit. Holding the permit across the recompute
-/// makes cancellation safe for free: axum drops the handler future when the
-/// client disconnects, the permit releases, and the next request refreshes —
-/// where a bool flag would stay set and freeze /stats on the stale snapshot
-/// forever.
+/// scans, so recompute at most once per STATS_TTL.
 #[derive(Default)]
-pub struct StatsCache {
-    snapshot: std::sync::Mutex<Option<(std::time::Instant, Arc<serde_json::Value>)>>,
-    refresh: tokio::sync::Mutex<()>,
-}
+pub struct StatsCache(std::sync::Mutex<Option<(std::time::Instant, Arc<serde_json::Value>)>>);
 
 const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -258,32 +249,17 @@ async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
 }
 
 async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
-    let snapshot =
-        |cache: &StatsCache| cache.snapshot.lock().expect("stats cache poisoned").clone();
-    if let Some((at, v)) = snapshot(&api.stats_cache)
-        && at.elapsed() < STATS_TTL
-    {
+    let cached = api
+        .stats_cache
+        .0
+        .lock()
+        .expect("stats cache poisoned")
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < STATS_TTL)
+        .map(|(_, v)| v.clone());
+    if let Some(v) = cached {
         return axum::Json(v).into_response();
     }
-
-    // One recompute at a time. While another request holds the permit, serve
-    // the stale snapshot; if there is none yet (first request after boot),
-    // wait out the in-flight refresh and serve its result — or recompute
-    // ourselves if it was cancelled before producing one.
-    let _permit = match api.stats_cache.refresh.try_lock() {
-        Ok(p) => p,
-        Err(_) => {
-            if let Some((_, v)) = snapshot(&api.stats_cache) {
-                return axum::Json(v).into_response();
-            }
-            let p = api.stats_cache.refresh.lock().await;
-            if let Some((_, v)) = snapshot(&api.stats_cache) {
-                return axum::Json(v).into_response();
-            }
-            p
-        }
-    };
-
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
@@ -295,10 +271,8 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
     match computed {
         Ok(v) => {
             let v = Arc::new(v);
-            *api.stats_cache
-                .snapshot
-                .lock()
-                .expect("stats cache poisoned") = Some((std::time::Instant::now(), v.clone()));
+            *api.stats_cache.0.lock().expect("stats cache poisoned") =
+                Some((std::time::Instant::now(), v.clone()));
             axum::Json(v).into_response()
         }
         Err(e) => {
@@ -337,22 +311,6 @@ fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn cancelled_refresh_releases_the_permit() {
-        let cache = super::StatsCache::default();
-        {
-            let _permit = cache.refresh.try_lock().expect("first refresh");
-            assert!(
-                cache.refresh.try_lock().is_err(),
-                "a second request serves stale while one refreshes"
-            );
-        } // dropped here, as when axum cancels the handler mid-recompute
-        assert!(
-            cache.refresh.try_lock().is_ok(),
-            "cancellation releases the permit so /stats can refresh again"
-        );
-    }
-
     #[test]
     fn stats_json_reports_table_counts() {
         let dir = tempfile::tempdir().unwrap();
