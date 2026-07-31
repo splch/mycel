@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use url::Url;
 
 const MAX_LINKS_PER_PAGE: usize = 2000;
-/// Below this many characters of extracted text a page is indexed as 'empty'.
+/// Below this many characters of extracted text a page leans on its title;
+/// with no usable title either, it is indexed as 'empty'.
 const MIN_TEXT_CHARS: usize = 100;
 
 pub struct PageMeta {
@@ -118,7 +119,10 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
 const READABILITY_MAX_BYTES: usize = 512 * 1024;
 
 /// Main-content extraction: dom_smoothie Readability first, scraper fallback
-/// (title tag + whole-body text). None = too little text to be worth indexing.
+/// (title tag + whole-body text). None = neither a usable title nor enough
+/// text to be worth indexing. Thin-but-titled pages (paywalled, JS shells,
+/// metadata-only records) ARE indexed: engines rank title/anchor-only pages
+/// rather than dropping them; BM25 scores the thin content down.
 pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     let (mut title, mut text) = if html.len() > READABILITY_MAX_BYTES {
         (String::new(), String::new())
@@ -140,14 +144,17 @@ pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
             title = t2;
         }
     }
-    if text.chars().count() < MIN_TEXT_CHARS {
+    if text.chars().count() < MIN_TEXT_CHARS && title.is_empty() {
         return None;
     }
     if title.is_empty() {
         title = text.chars().take(80).collect();
     }
-    let lang = lang_code(whichlang::detect_language(&text));
-    let simhash = simhash64(&text);
+    // Language id and simhash over whatever content exists (a thin page may
+    // have only its title).
+    let content = if text.is_empty() { &title } else { &text };
+    let lang = lang_code(whichlang::detect_language(content));
+    let simhash = simhash64(content);
     Some(Extracted {
         title,
         text,
@@ -308,7 +315,18 @@ mod tests {
 
     #[test]
     fn tiny_pages_are_empty() {
+        // neither title nor text: not worth indexing
         assert!(full("http://e.com/", "<html><body>hi</body></html>").is_none());
+    }
+
+    #[test]
+    fn title_only_pages_are_indexable() {
+        let ex = full(
+            "http://e.com/paywalled",
+            "<html><head><title>Paywalled journal article on mycorrhizal networks</title></head><body>Subscribe</body></html>",
+        )
+        .expect("title-only pages index; BM25 scores them down");
+        assert!(ex.title.contains("mycorrhizal"));
     }
 
     #[test]

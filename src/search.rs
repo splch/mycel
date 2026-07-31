@@ -5,7 +5,7 @@
 pub mod fanout;
 
 use crate::Result;
-use crate::index::{Fields, fields};
+use crate::index::{Fields, NEAR_DUP_RADIUS, fields};
 use serde::Serialize;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
@@ -35,6 +35,20 @@ pub struct Hit {
     pub source: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct Outcome {
+    /// Matches before near-duplicate collapsing (and before pagination).
+    pub total: usize,
+    pub hits: Vec<Hit>,
+    /// True when the conjunctive parse matched nothing and the hits come
+    /// from the disjunctive fallback (partial matches, BM25-ranked).
+    pub relaxed: bool,
+    /// Hits hidden from this page as near-duplicates of a better-ranked hit
+    /// (simhash Hamming <= NEAR_DUP_RADIUS). Collapsing is presentational:
+    /// nothing is removed from the index.
+    pub collapsed: usize,
+}
+
 impl Searcher {
     pub fn open(index_dir: &Path, weight: f64) -> Result<Self> {
         let index = crate::index::open_or_create(index_dir)?;
@@ -51,27 +65,25 @@ impl Searcher {
         self.reader.searcher().num_docs()
     }
 
-    /// One page of results: (total matches, hits, relaxed). `relaxed` is
-    /// true when the conjunctive parse matched nothing and the hits come
-    /// from the disjunctive fallback (partial matches, BM25-ranked).
-    pub fn search(
-        &self,
-        raw: &str,
-        page: usize,
-        page_size: usize,
-    ) -> Result<(usize, Vec<Hit>, bool)> {
+    /// One page of results; see Outcome for the fields.
+    pub fn search(&self, raw: &str, page: usize, page_size: usize) -> Result<Outcome> {
         let raw: String = raw.chars().take(MAX_QUERY_CHARS).collect();
         let page = page.min(MAX_PAGE);
         let (site_hosts, text) = split_site_filters(&raw);
         if text.is_empty() && site_hosts.is_empty() {
-            return Ok((0, Vec::new(), false));
+            return Ok(Outcome {
+                total: 0,
+                hits: Vec::new(),
+                relaxed: false,
+                collapsed: 0,
+            });
         }
 
         let searcher = self.reader.searcher();
         let index = searcher.index();
 
         let w = self.weight;
-        let run = |conjunctive: bool| -> Result<(usize, Vec<Hit>)> {
+        let run = |conjunctive: bool| -> Result<(usize, Vec<Hit>, usize)> {
             let mut parser =
                 QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
             if conjunctive {
@@ -132,8 +144,29 @@ impl Searcher {
                 });
             let (top, total) = searcher.search(&query, &(collector, Count))?;
 
+            let mut kept: Vec<u64> = Vec::with_capacity(top.len());
+            let mut collapsed = 0usize;
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
+                // Serve-time near-dup collapse: hide hits within the simhash
+                // radius of a better-ranked hit on this page. Docs without a
+                // simhash never collapse.
+                if let Some(sim) = searcher
+                    .segment_reader(addr.segment_ord)
+                    .fast_fields()
+                    .u64("simhash")
+                    .ok()
+                    .and_then(|c| c.first(addr.doc_id))
+                {
+                    if kept
+                        .iter()
+                        .any(|k| (k ^ sim).count_ones() <= NEAR_DUP_RADIUS)
+                    {
+                        collapsed += 1;
+                        continue;
+                    }
+                    kept.push(sim);
+                }
                 let doc: TantivyDocument = searcher.doc(addr)?;
                 let text_of = |f: tantivy::schema::Field| {
                     doc.get_first(f)
@@ -166,21 +199,31 @@ impl Searcher {
                     source: None,
                 });
             }
-            Ok((total, hits))
+            Ok((total, hits, collapsed))
         };
 
         // Query semantics: conjunctive first (precision); when it matches
         // nothing, retry disjunctive and let BM25 rank partial matches — the
         // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
         // weakAnd). site: filters are explicit intent and never relax.
-        let (total, hits) = run(true)?;
+        let (total, hits, collapsed) = run(true)?;
         // A lone term behaves identically under both semantics; only
         // multi-term queries can benefit from the fallback pass.
         if total > 0 || text.split_whitespace().nth(1).is_none() {
-            return Ok((total, hits, false));
+            return Ok(Outcome {
+                total,
+                hits,
+                relaxed: false,
+                collapsed,
+            });
         }
-        let (total, hits) = run(false)?;
-        Ok((total, hits, true))
+        let (total, hits, collapsed) = run(false)?;
+        Ok(Outcome {
+            total,
+            hits,
+            relaxed: true,
+            collapsed,
+        })
     }
 }
 
@@ -263,36 +306,38 @@ mod tests {
             "http://c.com/1",
             "c.com",
             "Mycelium networks",
-            "fungal mycelium networks connect trees underground",
+            "fungal mycelium networks connect trees underground and luminous moss gardens spread wide",
             0.9,
         );
         w.commit().unwrap();
 
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
-        let (total, hits, relaxed) = s.search("mycelium networks", 0, 10).unwrap();
-        assert!(!relaxed);
-        assert_eq!(total, 2);
-        // identical BM25, but c.com carries the centrality boost
-        assert_eq!(hits[0].url, "http://c.com/1");
-        assert!(hits[0].score > hits[1].score);
+        let out = s.search("mycelium networks", 0, 10).unwrap();
+        assert!(!out.relaxed);
+        assert_eq!(out.total, 2);
+        // c.com has the longer body (slightly lower BM25) but the centrality
+        // boost still wins; distinct bodies: nothing collapses
+        assert_eq!(out.collapsed, 0);
+        assert_eq!(out.hits[0].url, "http://c.com/1");
+        assert!(out.hits[0].score > out.hits[1].score);
         assert!(
-            hits[0].snippet.contains("<b>"),
+            out.hits[0].snippet.contains("<b>"),
             "snippet highlights: {}",
-            hits[0].snippet
+            out.hits[0].snippet
         );
 
         // zero-results fallback: no doc has both terms, so the disjunctive
         // pass returns the partial matches
-        let (total, _, relaxed) = s.search("mycelium pasta", 0, 10).unwrap();
-        assert!(relaxed);
-        assert_eq!(total, 3);
+        let out = s.search("mycelium pasta", 0, 10).unwrap();
+        assert!(out.relaxed);
+        assert_eq!(out.total, 3);
 
         // site: filter
-        let (total, hits, relaxed) = s.search("mycelium site:a.com", 0, 10).unwrap();
-        assert!(!relaxed);
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].host, "a.com");
+        let out = s.search("mycelium site:a.com", 0, 10).unwrap();
+        assert!(!out.relaxed);
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits[0].host, "a.com");
     }
 
     #[test]
@@ -321,30 +366,67 @@ mod tests {
         s.reader.reload().unwrap();
 
         // no doc has all three terms: AND misses, OR ranks the 2-term doc first
-        let (total, hits, relaxed) = s.search("alpha beta gamma", 0, 10).unwrap();
-        assert!(relaxed);
-        assert_eq!(total, 2);
-        assert_eq!(hits[0].url, "http://a.com/1");
+        let out = s.search("alpha beta gamma", 0, 10).unwrap();
+        assert!(out.relaxed);
+        assert_eq!(out.total, 2);
+        assert_eq!(out.hits[0].url, "http://a.com/1");
 
         // single term: nothing to relax
-        let (total, _, relaxed) = s.search("alpha", 0, 10).unwrap();
-        assert_eq!(total, 1);
-        assert!(!relaxed);
+        let out = s.search("alpha", 0, 10).unwrap();
+        assert_eq!(out.total, 1);
+        assert!(!out.relaxed);
 
         // conjunctive hit: no fallback
-        let (total, _, relaxed) = s.search("alpha beta", 0, 10).unwrap();
-        assert_eq!(total, 1);
-        assert!(!relaxed);
+        let out = s.search("alpha beta", 0, 10).unwrap();
+        assert_eq!(out.total, 1);
+        assert!(!out.relaxed);
 
         // site: stays mandatory even when the text relaxes
-        let (total, _, relaxed) = s.search("alpha beta site:b.com", 0, 10).unwrap();
-        assert_eq!(total, 0);
-        assert!(relaxed);
+        let out = s.search("alpha beta site:b.com", 0, 10).unwrap();
+        assert_eq!(out.total, 0);
+        assert!(out.relaxed);
 
         // nothing matches under either semantics
-        let (total, _, relaxed) = s.search("delta epsilon", 0, 10).unwrap();
-        assert_eq!(total, 0);
-        assert!(relaxed);
+        let out = s.search("delta epsilon", 0, 10).unwrap();
+        assert_eq!(out.total, 0);
+        assert!(out.relaxed);
+    }
+
+    #[test]
+    fn near_duplicates_collapse_at_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        let mut w: tantivy::IndexWriter = index.writer(64 * 1024 * 1024).unwrap();
+        let body = "shared reporting on the cathedral fire investigation continues today";
+        let add = |url: &str, host: &str, title: &str, text: &str| {
+            w.add_document(tantivy::doc!(
+                f.url => url, f.host => host, f.title => title, f.body => text,
+                f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+                f.simhash => crate::extract::simhash64(text),
+            ))
+            .unwrap();
+        };
+        // same text syndicated on two hosts + one distinct doc
+        add("http://a.com/1", "a.com", "Cathedral fire probe", body);
+        add("http://b.com/1", "b.com", "Cathedral fire probe", body);
+        add(
+            "http://c.com/1",
+            "c.com",
+            "Cathedral fire probe",
+            "shared reporting on the bakery festival investigation continues today",
+        );
+        w.commit().unwrap();
+
+        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        s.reader.reload().unwrap();
+        let out = s.search("shared reporting investigation", 0, 10).unwrap();
+        // total counts matches before collapsing; the syndicated twin is
+        // hidden, the near-miss (bakery vs cathedral) is NOT within radius
+        assert_eq!(out.total, 3);
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(out.collapsed, 1);
+        assert_ne!(out.hits[0].url, out.hits[1].url);
     }
     /// Deterministic corpus + queries; top-3 URLs snapshotted in
     /// tests/golden/queries.toml. Regenerate with UPDATE_GOLDENS=1 after an
@@ -463,7 +545,8 @@ mod tests {
         let mut rendered =
             String::from("# generated by golden_queries; UPDATE_GOLDENS=1 to refresh\n");
         for q in queries {
-            let (total, hits, _) = s.search(q, 0, 3).unwrap();
+            let out = s.search(q, 0, 3).unwrap();
+            let (total, hits) = (out.total, out.hits);
             rendered.push_str(&format!(
                 "\n[[case]]\nquery = {q:?}\ntotal = {total}\ntop = ["
             ));

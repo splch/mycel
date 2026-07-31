@@ -483,7 +483,8 @@ HTML-escaped, with matches wrapped in `<b>`. When no text terms produced a
 snippet (e.g. a pure `site:` query), the leading body text is used.
 
 **Pagination.** Pages are 0-based, `api.page_size` results each, page number
-clamped to 20. The `total` field is the exact match count.
+clamped to 20. The `total` field is the exact match count before
+near-duplicate collapsing.
 
 ## 8. HTTP API
 
@@ -519,6 +520,7 @@ Server-rendered HTML search UI with pagination. Accepts the same `q`,
 
 - `q` empty or missing returns `total: 0, hits: []`.
 - `relaxed` is true when the all-terms query matched nothing and the hits are partial matches from the any-terms retry. `site:` filters stay mandatory under the fallback.
+- `collapsed` counts hits hidden from this page as near-duplicates (simhash Hamming ≤ 3) of a better-ranked hit. Collapsing is presentational only; `total` is the exact match count **before** collapsing.
 - `page` defaults to 0.
 - `federated` defaults to the config (`federation.fanout` when federation is
   enabled, otherwise off). `federated=1` forces fan-out, `federated=0` forces
@@ -703,13 +705,19 @@ are kept. `<sitemapindex>` children are enqueued as further sitemap jobs
 then meta-charset sniff, then UTF-8 lossy), the main content extracted with
 a Readability implementation (documents over 512 KiB skip straight to the
 fallback extractor: `<title>` plus body text minus script/style). Less than
-100 characters of text ⇒ stored but skipped as `empty`. The language is
+100 characters of text *and* no usable `<title>` ⇒ stored but skipped as
+`empty`; thin-but-titled pages (paywalled articles, JS shells,
+metadata-only records) are indexed and simply score low, since a title
+alone can answer a query. The language is
 detected on the extracted text and gated by `index.languages`. The indexer
-then applies two dedup gates: exact (another URL already indexed with the
-same sha256 ⇒ `dup-exact`) and near (64-bit simhash within Hamming distance
-3 of an indexed doc ⇒ `dup-near`). Skipped documents remain in WARC and in
-the catalog; they feed the webgraph and can be shared, but are not
-searchable. The skip reason of every document is recorded:
+then applies its one dedup gate: exact (another URL already indexed with
+the same sha256 ⇒ `dup-exact`). Near-duplicates (64-bit simhash within
+Hamming distance 3 of a better-ranked hit) are all indexed and instead
+collapse at search time: the duplicate hit is hidden and counted in the
+response's `collapsed` field, so no document is ever unfindable. Skipped
+documents remain in WARC and in the catalog; they feed the webgraph and can
+be shared, but are not searchable. The skip reason of every document is
+recorded:
 
 ```console
 $ sqlite3 "<data>/mycel.sqlite" \

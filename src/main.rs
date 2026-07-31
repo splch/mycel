@@ -283,13 +283,27 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         });
     }
     let (cfg, data) = load_env()?;
-    // Refuse while a daemon holds the live index's writer lock.
-    {
-        let live = index::open_or_create(&data.join("index"))?;
-        let probe: std::result::Result<tantivy::IndexWriter, _> = live.writer(64 * 1024 * 1024);
-        if probe.is_err() {
-            return Err("the index is in use; stop `mycel run`/`crawl` before reindexing".into());
+    // Refuse while a daemon holds the live index's writer lock. An old-schema
+    // index cannot even be opened; it is disposable (rebuilt below from
+    // WARC), so move it aside instead of failing.
+    let live_dir = data.join("index");
+    match index::open_or_create(&live_dir) {
+        Ok(live) => {
+            let probe: std::result::Result<tantivy::IndexWriter, _> = live.writer(64 * 1024 * 1024);
+            if probe.is_err() {
+                return Err(
+                    "the index is in use; stop `mycel run`/`crawl` before reindexing".into(),
+                );
+            }
         }
+        Err(e) if e.to_string().contains("schema changed") => {
+            let stale = data.join("index.stale");
+            if stale.exists() {
+                std::fs::remove_dir_all(&stale)?;
+            }
+            std::fs::rename(&live_dir, &stale)?;
+        }
+        Err(e) => return Err(e),
     }
     let dest = data.join("index.new");
     if dest.exists() {
@@ -310,9 +324,17 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
     if old.exists() {
         std::fs::remove_dir_all(&old)?;
     }
-    std::fs::rename(data.join("index"), &old)?;
+    if live_dir.exists() {
+        std::fs::rename(&live_dir, &old)?;
+    }
     std::fs::rename(&dest, data.join("index"))?;
-    std::fs::remove_dir_all(&old)?;
+    if old.exists() {
+        std::fs::remove_dir_all(&old)?;
+    }
+    let stale = data.join("index.stale");
+    if stale.exists() {
+        std::fs::remove_dir_all(&stale)?;
+    }
     println!("reindexed from WARC: {indexed} indexed, {skipped} skipped");
     Ok(())
 }
@@ -606,23 +628,27 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         });
     }
     let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
-    let (total, hits, relaxed) = searcher.search(&q, 0, cfg.api.page_size)?;
+    let out = searcher.search(&q, 0, cfg.api.page_size)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "query": q, "total": total, "hits": hits, "relaxed": relaxed
+                "query": q, "total": out.total, "hits": out.hits,
+                "relaxed": out.relaxed, "collapsed": out.collapsed
             }))?
         );
-    } else if hits.is_empty() {
+    } else if out.hits.is_empty() {
         println!("no results ({} docs indexed)", searcher.num_docs());
     } else {
-        if relaxed {
-            println!("{total} results (including partial matches)");
-        } else {
-            println!("{total} results");
+        let mut line = format!("{} results", out.total);
+        if out.relaxed {
+            line.push_str(" (including partial matches)");
         }
-        for h in hits {
+        if out.collapsed > 0 {
+            line.push_str(&format!(" ({} similar omitted)", out.collapsed));
+        }
+        println!("{line}");
+        for h in out.hits {
             let snippet = h
                 .snippet
                 .replace("<b>", "\x1b[1m")

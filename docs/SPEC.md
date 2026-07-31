@@ -257,22 +257,24 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **Sitemaps**: robots `Sitemap:` lines → frontier `kind=1`; identical politeness; streamed quick-xml parse (urlset→pages, sitemapindex→child sitemaps depth≤3; caps 50k locs / 50 MiB); no WARC/docs rows. Recrawled every `recrawl_days` via the URL-unique frontier row.
 
-## 7. Dedup (gates live in the indexer, in order)
+## 7. Dedup
 
-1. **Exact**: another URL with same `sha256` already indexed → `indexed=2 'dup-exact'`.
-2. **Near**: 64-bit simhash over lowercased word tokens of extracted text; gaoya SimHash LSH at Hamming radius 3; match → `'dup-near'`, miss → insert + proceed. In-memory, rebuilt at indexer start from indexed docs (rebuildable cache).
+1. **Exact** (gate, in the indexer): another URL with same `sha256` already indexed → `indexed=2 'dup-exact'`.
+2. **Near** (collapse, at serve time): 64-bit simhash over lowercased word tokens of extracted text, kept as a tantivy FAST field; a hit within Hamming radius 3 (Manku et al., k=3 at 8B-page scale) of a better-ranked hit on the page is hidden and counted in the response's `collapsed` field. Nothing is rejected: versioned/syndicated content stays findable (the industry pattern — Google's expandable "similar results omitted", Elasticsearch collapse/inner_hits). `total` counts matches before collapsing. Evidence: index-time near-dup dropped 18% of TREC-COVID judged-relevant docs (docs/BENCHMARKING.md, 2026-07).
 
-Dupes stay in WARC and docs (corpus, shareable, webgraph feeds), never indexed.
+Exact dupes stay in WARC and docs (corpus, shareable, webgraph feeds), never indexed.
 
 ## 8. Extract & index
 
-Pipeline (one function shared by crawl hot path, ingest, reconciliation, reindex): bytes → encoding_rs (header charset → meta sniff → UTF-8 lossy) → dom_smoothie Readability {title, text} → on Err or <100 chars: scraper fallback (`<title>` + body text sans script/style) → still <100 → `'empty'` → whichlang (lang ∉ config → `'lang'`, stored not indexed) → simhash → dedup gates → tantivy.
+Pipeline (one function shared by crawl hot path, ingest, reconciliation, reindex): bytes → encoding_rs (header charset → meta sniff → UTF-8 lossy) → dom_smoothie Readability {title, text} → on Err or <100 chars: scraper fallback (`<title>` + body text sans script/style) → still <100 AND no usable `<title>` → `'empty'` (thin-but-titled pages index; engines rank title/anchor-only docs rather than dropping them) → whichlang (lang ∉ config → `'lang'`, stored not indexed) → simhash → exact-dedup gate → tantivy.
 
 ```rust
 // tantivy schema: en_stem pipeline, WithFreqsAndPositions (phrases work)
 url:   STRING | STORED      host: STRING       title: TEXT(en_stem)|STORED
 body:  TEXT(en_stem)|STORED (snippets need no WARC round-trip)
 lang:  STRING | STORED      fetched_at: u64 STORED|FAST     centrality: f64 FAST
+simhash: u64 FAST  (serve-time near-dup collapse; older indexes fail open
+           with a schema error and `reindex` moves them aside + rebuilds)
 ```
 
 Indexer thread: consumes in-memory channel from crawl (already-extracted text, no double work) + 5-min sweep + boot reconciliation of `indexed=0` (re-reads WARC). `delete_term(url)` before every add → idempotent, recrawl updates in place. Commit at 1000 docs / 60s; then batch-set `indexed=1`. Crash-safe in both orderings (tantivy rollback + replay; delete-before-add).

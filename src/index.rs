@@ -1,10 +1,10 @@
-//! The tantivy indexer thread. Owns the IndexWriter, the dedup gates (exact
-//! sha256 via SQLite, near-dup via an in-memory simhash LSH rebuilt at boot),
-//! boot/periodic reconciliation of docs left `indexed = 0`, and batched
-//! commits. All SQLite writes flow back through the db-writer (MarkDocs).
+//! The tantivy indexer thread. Owns the IndexWriter, the exact-dedup gate
+//! (sha256 via SQLite; near-duplicates are NOT gated here — they index and
+//! collapse at serve time, so no document is ever unfindable), boot/periodic
+//! reconciliation of docs left `indexed = 0`, and batched commits. All
+//! SQLite writes flow back through the db-writer (MarkDocs).
 
 use crate::{Result, db, extract, warc};
-use gaoya::simhash::SimHashIndex;
 use rusqlite::params;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,14 +15,11 @@ use tantivy::schema::{
 };
 use tantivy::{Index, Term, doc};
 
-/// Hamming radius for near-duplicate simhash matches (Manku et al.).
-const NEAR_DUP_RADIUS: usize = 3;
+/// Hamming radius for near-duplicate collapsing at serve time (Manku et
+/// al., k=3 at 8B-page scale). Docs closer than this in simhash space are
+/// shown once; nothing is dropped from the index.
+pub const NEAR_DUP_RADIUS: u32 = 3;
 
-/// gaoya's LSH matches at Hamming distance STRICTLY less than the bound given
-/// to SimHashIndex::new, so pass radius + 1 to actually honor NEAR_DUP_RADIUS.
-fn new_lsh() -> SimHashIndex<u64, i64> {
-    SimHashIndex::new(6, NEAR_DUP_RADIUS + 1)
-}
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
 const SWEEP_BATCH: usize = 200;
 
@@ -55,6 +52,7 @@ pub struct Fields {
     pub lang: tantivy::schema::Field,
     pub fetched_at: tantivy::schema::Field,
     pub centrality: tantivy::schema::Field,
+    pub simhash: tantivy::schema::Field,
 }
 
 pub fn schema() -> Schema {
@@ -71,6 +69,7 @@ pub fn schema() -> Schema {
     b.add_text_field("lang", STRING | STORED);
     b.add_u64_field("fetched_at", STORED | FAST);
     b.add_f64_field("centrality", FAST);
+    b.add_u64_field("simhash", FAST);
     b.build()
 }
 
@@ -84,13 +83,29 @@ pub fn fields(schema: &Schema) -> Fields {
         lang: f("lang"),
         fetched_at: f("fetched_at"),
         centrality: f("centrality"),
+        simhash: f("simhash"),
     }
 }
 
-/// Open the index at `dir`, creating it with our schema on first use.
+/// Open the index at `dir`, creating it with our schema on first use. An
+/// index written by an older schema is not an error to paper over: say how
+/// to rebuild (WARC + the catalog are the source of truth; the index is
+/// disposable).
 pub fn open_or_create(dir: &Path) -> Result<Index> {
     let mmap = tantivy::directory::MmapDirectory::open(dir)?;
-    Ok(Index::open_or_create(mmap, schema())?)
+    Index::open_or_create(mmap, schema()).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("schema does not match") {
+            format!(
+                "index at {} was built by an older mycel (schema changed); \
+                 run `mycel reindex` to rebuild it from WARC ({msg})",
+                dir.display()
+            )
+            .into()
+        } else {
+            e.into()
+        }
+    })
 }
 
 pub struct IndexerCfg {
@@ -129,7 +144,6 @@ struct Indexer {
     conn: rusqlite::Connection,
     writer: tantivy::IndexWriter,
     fields: Fields,
-    lsh: SimHashIndex<u64, i64>,
     /// doc_ids added/marked-skipped since the last completed mark round;
     /// keeps the periodic sweep from double-processing in-flight rows.
     in_flight: HashSet<i64>,
@@ -143,25 +157,12 @@ impl Indexer {
     fn new(cfg: IndexerCfg, dbh: db::Db, index: Index, conn: rusqlite::Connection) -> Result<Self> {
         let f = fields(&index.schema());
         let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
-        // Rebuild the near-dup LSH from every indexed doc (a rebuildable cache).
-        let mut lsh = new_lsh();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT id, simhash FROM docs WHERE indexed = 1 AND simhash IS NOT NULL",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (id, sim) = row?;
-                lsh.insert(id, sim as u64);
-            }
-        }
         Ok(Self {
             cfg,
             dbh,
             conn,
             writer,
             fields: f,
-            lsh,
             in_flight: HashSet::new(),
             pending_marks: Vec::new(),
             dirty_ops: 0,
@@ -171,7 +172,7 @@ impl Indexer {
     }
 
     fn run(&mut self, rx: mpsc::Receiver<IndexMsg>) {
-        tracing::info!("indexer up ({} docs near-dup cache)", self.lsh.size());
+        tracing::info!("indexer up");
         // Boot reconciliation: index whatever a previous run left pending.
         self.sweep();
         loop {
@@ -201,7 +202,9 @@ impl Indexer {
         tracing::info!("indexer stopped");
     }
 
-    /// Dedup gates in spec order, then delete-before-add (idempotent).
+    /// Exact-dedup gate (spec order), then delete-before-add (idempotent).
+    /// Near-dups index alongside their twins; search collapses them at
+    /// serve time.
     fn gate_and_add(&mut self, d: IndexDoc) {
         let exact_dup: bool = self
             .conn
@@ -215,13 +218,6 @@ impl Indexer {
             self.mark(d.doc_id, 2, Some("dup-exact"));
             return;
         }
-        if let Some((&near_id, _)) = self.lsh.query_one(&d.simhash)
-            && near_id != d.doc_id
-        {
-            self.mark(d.doc_id, 2, Some("dup-near"));
-            return;
-        }
-        self.lsh.insert(d.doc_id, d.simhash);
         self.writer
             .delete_term(Term::from_field_text(self.fields.url, &d.url));
         let res = self.writer.add_document(doc!(
@@ -232,6 +228,7 @@ impl Indexer {
             self.fields.lang => d.lang,
             self.fields.fetched_at => d.fetched_at.max(0) as u64,
             self.fields.centrality => d.centrality,
+            self.fields.simhash => d.simhash,
         ));
         match res {
             Ok(_) => {
@@ -393,7 +390,6 @@ pub fn rebuild(
     let index = open_or_create(dest)?;
     let f = fields(&index.schema());
     let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
-    let mut lsh: SimHashIndex<u64, i64> = new_lsh();
     let mut seen_sha: HashSet<Vec<u8>> = HashSet::new();
     let mut marks: Vec<(i64, i64, Option<&'static str>)> = Vec::new();
     let (mut n_indexed, mut n_skipped) = (0u64, 0u64);
@@ -443,17 +439,12 @@ pub fn rebuild(
             if !seen_sha.insert(sha) {
                 return Err("dup-exact");
             }
-            if let Some((&nid, _)) = lsh.query_one(&ex.simhash)
-                && nid != doc_id
-            {
-                return Err("dup-near");
-            }
-            lsh.insert(doc_id, ex.simhash);
             writer
                 .add_document(doc!(
                     f.url => url.clone(), f.host => host.clone(), f.title => ex.title.clone(),
                     f.body => ex.text.clone(), f.lang => ex.lang,
                     f.fetched_at => fetched_at.max(0) as u64, f.centrality => centrality,
+                    f.simhash => ex.simhash,
                 ))
                 .map_err(|_| "error")?;
             Ok(())
@@ -506,20 +497,7 @@ mod tests {
         let s = schema();
         let f = fields(&s);
         assert_ne!(f.url, f.body);
-    }
-
-    #[test]
-    fn near_dup_radius_is_inclusive() {
-        let mut lsh = new_lsh();
-        lsh.insert(1, 0u64);
-        assert!(
-            lsh.query_one(&0b111).is_some(),
-            "distance 3 is within the radius"
-        );
-        assert!(
-            lsh.query_one(&0b1111).is_none(),
-            "distance 4 is outside the radius"
-        );
+        assert_ne!(f.simhash, f.centrality);
     }
 
     #[test]

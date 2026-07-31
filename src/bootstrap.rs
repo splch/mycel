@@ -430,8 +430,29 @@ mod tests {
         assert_eq!(ir.url, "http://example.com/page");
         assert_eq!(ir.host, "example.com");
         assert_eq!(ir.fetched_at, 1_700_000_000);
-        assert!(ir.extract.is_none(), "tiny body → empty gate downstream");
+        assert!(
+            ir.extract.is_some(),
+            "title-only pages index downstream (BM25 scores thin content down)"
+        );
         assert_eq!(ir.links.len(), 1);
+
+        // no title AND no text: still the empty gate
+        let payload2 = b"<html><body>hi</body></html>";
+        let sha2 = hex::encode(sha2::Sha256::digest(payload2));
+        let rec2 = warc::parse_record(&warc::build_response_record(
+            "http://example.com/blank",
+            1_700_000_000,
+            b"seed",
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/html",
+            payload2,
+            &sha2,
+            false,
+        ))
+        .unwrap();
+        assert!(
+            prepare_ingest(&rec2, vec![1]).unwrap().extract.is_none(),
+            "no title and no text → empty gate downstream"
+        );
 
         // warcinfo records are not ingestable
         let info = warc::parse_record(&warc::build_warcinfo(0, "http://c/")).unwrap();

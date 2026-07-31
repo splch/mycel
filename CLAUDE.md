@@ -23,7 +23,7 @@ Manual smoke: `mycel init && mycel seed <url> && mycel crawl --limit N && mycel 
 Two dedicated OS threads own the two single-writer resources; everything else is tokio:
 
 - **db-writer thread** (`db.rs`): owns the *only* SQLite write connection *and the open WARC shard*. All state changes flow through its `Cmd` channel and are drain-batched into one transaction. Claims (frontier scheduling) are commands too, so every transition is strictly ordered. **Never open a second write path to the DB from async code**; offline subcommands (`seed`, `rank`, `reindex`) may use their own connections only because the daemon isn't running (reindex probes the tantivy writer lock to enforce this).
-- **indexer thread** (`index.rs`): owns the tantivy `IndexWriter` and the in-memory simhash LSH (a rebuildable cache). It reads via its own connection but writes results back **through the db-writer** (`MarkDocs`/`UpdateDocExtract`). Dedup gates (exact sha256, then near-dup simhash) live here; the cheaper gates (noindex/empty/language) run in the db-writer at doc insert.
+- **indexer thread** (`index.rs`): owns the tantivy `IndexWriter`. Exact-dup (sha256) gating lives here; near-dups are *not* gated — they index and collapse at serve time (simhash FAST field, Hamming ≤ 3), so no document is ever unfindable. It reads via its own connection but writes results back **through the db-writer** (`MarkDocs`/`UpdateDocExtract`). The cheaper gates (noindex/empty/language) run in the db-writer at doc insert.
 - **admin page** (`admin.rs`): a client of the two owners, not a third. Its writes flow through the db-writer (`Cmd::Seed`, `Cmd::MetaPut`/`MetaGet`), and its long jobs (rank, ingest, bootstrap; one at a time) run in-process on the daemon's own `Db` handle and open shard, which is why they are safe while their CLI-as-second-process forms are not; `init` and full `reindex` stay CLI-only (writer lock).
 
 Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): the db-writer appends and fsyncs a WARC member inside batch handling, and the *same transaction* that inserts the docs rows advances `shards.bytes`. On boot the writer truncates the open shard back to `shards.bytes`. Consequences you must preserve: never reorder append vs. row insert; never move the watermark update out of the batch transaction; shard hashing must never touch the append handle's cursor (regression: a failed seal once overwrote the shard head).
@@ -49,7 +49,7 @@ Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): the db-w
 ## Testing gotchas
 
 - Integration tests drive the real binary via `env!("CARGO_BIN_EXE_mycel")` with std-only fixture HTTP servers; the crate has no lib target.
-- Fixture pages need **genuinely distinct text per page**: the near-dup gate correctly eats near-identical filler, and the pages silently never index.
+- Fixture pages need **genuinely distinct text per page**: byte-identical filler is exact-duped (sha256) and the pages silently never index.
 - `warc.shard_mb = 0` seals a shard after every write batch (how the federation test gets exportable shards instantly); a shard holding only its warcinfo record is never sealed.
 - `tests/fixtures/cc-sample.warc.gz` is three real Common Crawl members (see README "Fixture"). Keep it byte-stable; the WARC reader test asserts exact member boundaries.
 - The golden-queries test uses a single-threaded tantivy writer and tie-free boosts for determinism; equal scores + multithreaded segments shuffle order.
