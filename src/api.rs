@@ -14,36 +14,27 @@ pub struct Api {
     pub searcher: Arc<search::Searcher>,
     pub db: db::Db,
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
-    pub stats_cache: Arc<StatsCache>,
+    pub stats_cache: StatsCache,
     pub page_size: usize,
     pub fed: Option<FedState>,
     pub admin: Arc<crate::admin::AdminState>,
 }
 
 /// Serve-stale cache for /stats: the gauge counts are unindexed full-table
-/// scans (O(corpus)), so recompute at most once per STATS_TTL and never
-/// block a request behind a recompute.
+/// scans (O(corpus)), so recompute at most once per STATS_TTL. The snapshot
+/// sits behind a cheap std mutex; `refresh` is a tokio mutex used as a
+/// one-recompute-at-a-time permit. Holding the permit across the recompute
+/// makes cancellation safe for free: axum drops the handler future when the
+/// client disconnects, the permit releases, and the next request refreshes —
+/// where a bool flag would stay set and freeze /stats on the stale snapshot
+/// forever.
 #[derive(Default)]
-pub struct StatsCache(std::sync::Mutex<StatsCacheState>);
-
-#[derive(Default)]
-struct StatsCacheState {
-    snapshot: Option<(std::time::Instant, Arc<serde_json::Value>)>,
-    refreshing: bool,
+pub struct StatsCache {
+    snapshot: std::sync::Mutex<Option<(std::time::Instant, Arc<serde_json::Value>)>>,
+    refresh: tokio::sync::Mutex<()>,
 }
 
 const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Clears `refreshing` on drop. axum drops the handler future when the client
-/// disconnects, and without this a cancelled mid-recompute request wedges the
-/// flag: every later request then serves the stale snapshot forever.
-struct RefreshGuard(Arc<StatsCache>);
-
-impl Drop for RefreshGuard {
-    fn drop(&mut self) {
-        self.0.0.lock().expect("stats cache poisoned").refreshing = false;
-    }
-}
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -267,16 +258,32 @@ async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
 }
 
 async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
+    let snapshot =
+        |cache: &StatsCache| cache.snapshot.lock().expect("stats cache poisoned").clone();
+    if let Some((at, v)) = snapshot(&api.stats_cache)
+        && at.elapsed() < STATS_TTL
     {
-        let mut cache = api.stats_cache.0.lock().expect("stats cache poisoned");
-        if let Some((at, snap)) = &cache.snapshot
-            && (at.elapsed() < STATS_TTL || cache.refreshing)
-        {
-            return axum::Json(snap.clone()).into_response();
-        }
-        cache.refreshing = true;
+        return axum::Json(v).into_response();
     }
-    let _guard = RefreshGuard(api.stats_cache.clone());
+
+    // One recompute at a time. While another request holds the permit, serve
+    // the stale snapshot; if there is none yet (first request after boot),
+    // wait out the in-flight refresh and serve its result — or recompute
+    // ourselves if it was cancelled before producing one.
+    let _permit = match api.stats_cache.refresh.try_lock() {
+        Ok(p) => p,
+        Err(_) => {
+            if let Some((_, v)) = snapshot(&api.stats_cache) {
+                return axum::Json(v).into_response();
+            }
+            let p = api.stats_cache.refresh.lock().await;
+            if let Some((_, v)) = snapshot(&api.stats_cache) {
+                return axum::Json(v).into_response();
+            }
+            p
+        }
+    };
+
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
@@ -285,11 +292,13 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
         }
     })
     .await;
-    let mut cache = api.stats_cache.0.lock().expect("stats cache poisoned");
     match computed {
         Ok(v) => {
             let v = Arc::new(v);
-            cache.snapshot = Some((std::time::Instant::now(), v.clone()));
+            *api.stats_cache
+                .snapshot
+                .lock()
+                .expect("stats cache poisoned") = Some((std::time::Instant::now(), v.clone()));
             axum::Json(v).into_response()
         }
         Err(e) => {
@@ -328,15 +337,20 @@ fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn refresh_guard_clears_the_flag_on_drop() {
-        let cache = std::sync::Arc::new(super::StatsCache::default());
-        cache.0.lock().unwrap().refreshing = true;
-        let api_like = cache.clone();
+    #[tokio::test]
+    async fn cancelled_refresh_releases_the_permit() {
+        let cache = super::StatsCache::default();
         {
-            let _guard = super::RefreshGuard(api_like);
-        } // simulates the handler future being dropped mid-recompute
-        assert!(!cache.0.lock().unwrap().refreshing);
+            let _permit = cache.refresh.try_lock().expect("first refresh");
+            assert!(
+                cache.refresh.try_lock().is_err(),
+                "a second request serves stale while one refreshes"
+            );
+        } // dropped here, as when axum cancels the handler mid-recompute
+        assert!(
+            cache.refresh.try_lock().is_ok(),
+            "cancellation releases the permit so /stats can refresh again"
+        );
     }
 
     #[test]
