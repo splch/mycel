@@ -65,11 +65,11 @@ same-host-different-port fixtures would collapse into one host row and
 serialize on the one-in-flight-per-host rule.
 
 **Fixture content rules** (hard-won, from CLAUDE.md): pages must have
-genuinely distinct text — the simhash near-dup gate correctly eats
-near-identical filler and the pages silently never index. Generate prose
-per page (seeded PRNG over a word list is fine if pairwise Jaccard stays
-low). Link structure: each host links to all peers, so the full host set is
-discoverable from a single seed.
+genuinely distinct text — byte-identical filler is exact-duped (sha256)
+and the pages silently never index. Generate prose per page (seeded PRNG
+over a word list is fine if pairwise Jaccard stays low). Link structure:
+each host links to all peers, so the full host set is discoverable from a
+single seed.
 
 **Config for this stage** (bench-only):
 
@@ -100,10 +100,13 @@ counters flush every 60 s and at shutdown, so rates computed from
 | time-to-idle | crawl exit time vs frontier drain |
 | scale points | 10/50/200 hosts × 100/1000 pages each |
 
-**Variants:** one fixture returning robots 5xx (host must stall an hour —
-assert it); one returning 429 then 200 (assert `crawl_delay_ms` doubles and
-stays sticky); one serving near-duplicate pages (assert the near-dup gate
-rate). These are correctness assertions *inside* the benchmark run.
+**Variants:** one fixture returning robots 5xx (host must stall an hour,
+and after `block_after_failures` consecutive dead-robots cycles it must be
+blocked — assert both); one returning 429 then 200 (assert
+`crawl_delay_ms` doubles and stays sticky); one serving near-duplicate
+pages (assert they all index and collapse at serve time via the
+`collapsed` response field). These are correctness assertions *inside* the
+benchmark run.
 
 ## 3. Stage 2 — WARC store and ingest
 
@@ -118,7 +121,7 @@ same layout Common Crawl publishes and what `mycel ingest` expects.
 
 1. `mycel ingest bench/corpora/<name>/warc/` — record wall time, then
    `status --json` for `docs_stored`, `docs_skipped` by reason
-   (`noindex`/`empty`/`lang`/exact-dup/near-dup). Docs/sec is the headline.
+   (`noindex`/`empty`/`lang`/`dup-exact`). Docs/sec is the headline.
 2. **Crash-recovery benchmark:** restart ingest on a corpus 10× larger,
    `kill -9` the process mid-batch, restart, re-ingest. Assert: the open
    shard is truncated back to `shards.bytes` (no torn tail), doc counts
