@@ -181,12 +181,21 @@ pub fn parse_record(buf: &[u8]) -> Result<Record> {
 // ---------------------------------------------------------------- reading --
 
 /// Read the single gzip member at (offset, len), the docs-table access path,
-/// identical in shape to a Common Crawl ranged fetch.
+/// identical in shape to a Common Crawl ranged fetch. Production readers go
+/// through `read_member_from` with a reused handle; this is the tests'
+/// convenience wrapper.
+#[cfg(test)]
 pub fn read_member_at(path: &Path, offset: u64, len: u64) -> Result<Record> {
     let mut f = File::open(path)?;
+    read_member_from(&mut f, offset, len)
+}
+
+/// `read_member_at` through a caller-held handle: sequential readers (indexer
+/// sweep, full rebuild) open each shard once instead of once per record.
+pub fn read_member_from(f: &mut File, offset: u64, len: u64) -> Result<Record> {
     f.seek(SeekFrom::Start(offset))?;
     let mut member = vec![0u8; len as usize];
-    std::io::Read::read_exact(&mut f, &mut member)?;
+    std::io::Read::read_exact(f, &mut member)?;
     decode_member(&member)
 }
 
@@ -322,16 +331,24 @@ impl ShardFile {
         Ok(f)
     }
 
-    /// Append one gzip member and fsync. Returns (offset, len). The caller
-    /// advances the durable watermark (shards.bytes) only after this returns,
-    /// so a crash can never leave the watermark past synced data.
+    /// Append one gzip member (NOT fsynced). Returns (offset, len). The
+    /// caller must `flush()` before advancing the durable watermark
+    /// (shards.bytes), so a crash can never leave the watermark past synced
+    /// data. The db-writer flushes once per batch, not per member.
     pub fn append_member(&mut self, member: &[u8]) -> Result<(u64, u64)> {
         let offset = self.end;
         self.file.write_all(member)?;
-        self.file.sync_data()?;
         self.end += member.len() as u64;
         self.records += 1;
         Ok((offset, member.len() as u64))
+    }
+
+    /// Fsync everything appended so far. The watermark protocol's ordering
+    /// requirement: this must succeed before the shards.bytes transaction
+    /// commits, not before each individual append.
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
     }
 
     /// Whole-file blake3 (streamed), the shard's identity once sealed.

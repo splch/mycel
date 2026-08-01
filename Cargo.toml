@@ -41,3 +41,6 @@ tempfile = "3"
 
 [profile.release]
 strip = true
+# CPU-bound binary (gzip, sha256, extraction): cross-crate inlining is worth
+# the extra release-build time.
+lto = "thin"

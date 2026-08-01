@@ -3,7 +3,21 @@
 //! the crawl hot path and the indexer's cold (reconciliation/reindex) path.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use url::Url;
+
+/// Selectors are parsed once per process, not once per page (extraction is
+/// the crawl/bootstrap hot path).
+static META_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("meta[name][content]").expect("static selector"));
+static A_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("a[href]").expect("static selector"));
+static TITLE_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("title").expect("static selector"));
+static BODY_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("body").expect("static selector"));
+static SKIP_SEL: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("script, style, noscript").expect("static selector"));
 
 const MAX_LINKS_PER_PAGE: usize = 2000;
 /// Below this many characters of text a page leans on its title; with no
@@ -71,8 +85,7 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
 
     let mut noindex = false;
     let mut nofollow = false;
-    let meta_sel = scraper::Selector::parse("meta[name][content]").expect("static selector");
-    for m in doc.select(&meta_sel) {
+    for m in doc.select(&META_SEL) {
         let name = m.value().attr("name").unwrap_or_default();
         if name.eq_ignore_ascii_case("robots") {
             let content = m
@@ -87,9 +100,8 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
 
     let mut links = Vec::new();
     if !nofollow {
-        let a_sel = scraper::Selector::parse("a[href]").expect("static selector");
         let mut seen = HashSet::new();
-        for a in doc.select(&a_sel) {
+        for a in doc.select(&A_SEL) {
             if links.len() >= MAX_LINKS_PER_PAGE {
                 break;
             }
@@ -179,17 +191,14 @@ pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
 /// non-text nodes; script/style contents are text nodes, so filter by parent).
 fn fallback_extract(html: &str) -> (String, String) {
     let doc = scraper::Html::parse_document(html);
-    let title = scraper::Selector::parse("title")
-        .ok()
-        .and_then(|s| doc.select(&s).next())
+    let title = doc
+        .select(&TITLE_SEL)
+        .next()
         .map(|t| squash_ws(&t.text().collect::<String>()))
         .unwrap_or_default();
     let mut out = String::new();
-    if let Ok(body_sel) = scraper::Selector::parse("body")
-        && let Some(body) = doc.select(&body_sel).next()
-    {
-        let skip = scraper::Selector::parse("script, style, noscript").expect("static selector");
-        let skipped: HashSet<_> = body.select(&skip).flat_map(|n| n.text()).collect();
+    if let Some(body) = doc.select(&BODY_SEL).next() {
+        let skipped: HashSet<_> = body.select(&SKIP_SEL).flat_map(|n| n.text()).collect();
         for t in body.text() {
             if !skipped.contains(t) {
                 out.push_str(t);

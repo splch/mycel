@@ -167,6 +167,13 @@ struct Indexer {
     /// doc_ids added/marked-skipped since the last completed mark round;
     /// keeps the periodic sweep from double-processing in-flight rows.
     in_flight: HashSet<i64>,
+    /// The shard handle the sweep is currently reading (rows arrive ordered
+    /// by shard_id, offset, so one open() per shard instead of per record).
+    cur_shard: Option<(String, std::fs::File)>,
+    /// True while a reconciliation sweep is running: in_flight must not be
+    /// cleared on commit (the writer applies marks later, and a cleared set
+    /// would let the next sweep batch re-select and reprocess those docs).
+    sweeping: bool,
     pending_marks: Vec<(i64, i64, Option<&'static str>)>,
     dirty_ops: usize,
     last_commit: Instant,
@@ -184,6 +191,8 @@ impl Indexer {
             writer,
             fields: f,
             in_flight: HashSet::new(),
+            cur_shard: None,
+            sweeping: false,
             pending_marks: Vec::new(),
             dirty_ops: 0,
             last_commit: Instant::now(),
@@ -279,7 +288,13 @@ impl Indexer {
                 if !marks.is_empty() {
                     self.dbh.mark_docs_blocking(marks);
                 }
-                self.in_flight.clear();
+                // Cleared only outside sweeps: the db-writer applies marks
+                // after this commit, and clearing mid-sweep would let the
+                // next sweep batch re-select docs whose marks are still in
+                // flight. The first commit after the sweep ends clears it.
+                if !self.sweeping {
+                    self.in_flight.clear();
+                }
                 self.dirty_ops = 0;
                 self.last_commit = Instant::now();
             }
@@ -297,14 +312,24 @@ impl Indexer {
 
     /// Reconciliation: cold-path (re-)extraction of docs left `indexed = 0`:
     /// crash recovery, `ingest` registrations, and `reindex --missing`.
+    /// Bounded to the docs pending when the sweep starts: docs arriving
+    /// mid-sweep already travel the hot path (their Add is queued), so
+    /// chasing them here would double-process and, under a live ingest,
+    /// never terminate.
     fn sweep(&mut self) {
         self.last_sweep = Instant::now();
+        let max_id: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM docs", [], |r| r.get(0))
+            .unwrap_or(0);
+        self.sweeping = true;
         let mut total = 0usize;
         loop {
-            let batch = match self.load_pending_batch() {
+            let batch = match self.load_pending_batch(max_id) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("sweep query failed: {e}");
+                    self.sweeping = false;
                     return;
                 }
             };
@@ -317,31 +342,38 @@ impl Indexer {
             }
             self.commit_and_mark();
         }
+        self.sweeping = false;
         if total > 0 {
             tracing::info!("reconciled {total} pending docs");
         }
     }
 
     #[allow(clippy::type_complexity)]
-    fn load_pending_batch(&self) -> Result<Vec<(i64, String, String, f64, i64, String, i64, i64)>> {
+    fn load_pending_batch(
+        &self,
+        max_id: i64,
+    ) -> Result<Vec<(i64, String, String, f64, i64, String, i64, i64)>> {
         let in_flight: Vec<i64> = self.in_flight.iter().copied().collect();
         let mut stmt = self.conn.prepare_cached(
             "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
              FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
-             WHERE d.indexed = 0 ORDER BY d.shard_id, d.offset LIMIT ?1",
+             WHERE d.indexed = 0 AND d.id <= ?2 ORDER BY d.shard_id, d.offset LIMIT ?1",
         )?;
-        let rows = stmt.query_map([SWEEP_BATCH as i64 + in_flight.len() as i64], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![SWEEP_BATCH as i64 + in_flight.len() as i64, max_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
             let row: (i64, String, String, f64, i64, String, i64, i64) = row?;
@@ -354,8 +386,18 @@ impl Indexer {
 
     fn reindex_row(&mut self, row: (i64, String, String, f64, i64, String, i64, i64)) {
         let (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) = row;
-        let path = self.cfg.warc_dir.join(&shard_name);
-        let rec = match warc::read_member_at(&path, offset as u64, len as u64) {
+        if !matches!(&self.cur_shard, Some((n, _)) if *n == shard_name) {
+            match std::fs::File::open(self.cfg.warc_dir.join(&shard_name)) {
+                Ok(f) => self.cur_shard = Some((shard_name.clone(), f)),
+                Err(e) => {
+                    tracing::warn!("cannot open shard for {url}: {e}");
+                    self.mark(doc_id, 2, Some("error"));
+                    return;
+                }
+            }
+        }
+        let f = &mut self.cur_shard.as_mut().expect("shard handle").1;
+        let rec = match warc::read_member_from(f, offset as u64, len as u64) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("cannot read WARC member for {url}: {e}");
@@ -422,6 +464,9 @@ pub fn rebuild(
     let mut seen_sha: HashSet<Vec<u8>> = HashSet::new();
     let mut marks: Vec<(i64, i64, Option<&'static str>)> = Vec::new();
     let (mut n_indexed, mut n_skipped) = (0u64, 0u64);
+    // Rows arrive ordered by shard_id, offset: keep the current shard open
+    // instead of one open() per doc.
+    let mut cur_shard: Option<(String, std::fs::File)> = None;
 
     #[allow(clippy::type_complexity)]
     let rows: Vec<(i64, String, String, f64, i64, String, i64, i64)> = {
@@ -448,10 +493,17 @@ pub fn rebuild(
 
     for (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) in rows {
         let mut mark = |m: (i64, i64, Option<&'static str>)| marks.push(m);
-        let verdict: std::result::Result<(), &'static str> = (|| {
-            let rec =
-                warc::read_member_at(&cfg.warc_dir.join(&shard_name), offset as u64, len as u64)
-                    .map_err(|_| "error")?;
+        let opened: std::result::Result<(), &'static str> = (|| {
+            if !matches!(&cur_shard, Some((n, _)) if *n == shard_name) {
+                let f = std::fs::File::open(cfg.warc_dir.join(&shard_name)).map_err(|_| "error")?;
+                cur_shard = Some((shard_name.clone(), f));
+            }
+            Ok(())
+        })();
+        let verdict: std::result::Result<(), &'static str> = opened.and_then(|()| {
+            let shard_file = &mut cur_shard.as_mut().expect("shard handle").1;
+            let rec = warc::read_member_from(shard_file, offset as u64, len as u64)
+                .map_err(|_| "error")?;
             let (_status, head, payload) = rec.http_parts().ok_or("error")?;
             let content_type = header_value(head, "content-type");
             let html = extract::decode_html(payload, content_type.as_deref());
@@ -478,7 +530,7 @@ pub fn rebuild(
                 ))
                 .map_err(|_| "error")?;
             Ok(())
-        })();
+        });
         match verdict {
             Ok(()) => {
                 n_indexed += 1;

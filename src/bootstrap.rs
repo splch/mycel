@@ -174,18 +174,18 @@ pub async fn ingest_paths(dbh: &Db, paths: &[PathBuf]) -> Result<(u64, u64)> {
     let (mut seen, mut ingested) = (0u64, 0u64);
     for file in files {
         tracing::info!("ingesting {}", file.display());
-        // Boundaries + parsed records in one pass; raw member bytes re-read by
-        // range so the stored bytes are exactly the original member.
-        let items: Vec<(u64, u64, warc::Record)> =
-            warc::MemberIter::open(&file)?.collect::<Result<_>>()?;
-        for (offset, len, rec) in items {
+        // Stream members (a shard can be gigabytes decompressed: never
+        // collect it); raw member bytes are re-read by range through ONE
+        // reused handle so the stored bytes are exactly the original member.
+        let mut raw_reader = std::fs::File::open(&file)?;
+        for item in warc::MemberIter::open(&file)? {
+            let (offset, len, rec) = item?;
             seen += 1;
             let mut raw = vec![0u8; len as usize];
             {
                 use std::io::{Seek, SeekFrom};
-                let mut f = std::fs::File::open(&file)?;
-                f.seek(SeekFrom::Start(offset))?;
-                f.read_exact(&mut raw)?;
+                raw_reader.seek(SeekFrom::Start(offset))?;
+                raw_reader.read_exact(&mut raw)?;
             }
             if let Some(ir) = prepare_ingest(&rec, raw) {
                 ingested += 1;

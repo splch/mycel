@@ -224,10 +224,10 @@ async fn fetch_shard(
 
 /// Register every response record of a synced shard: docs rows point INTO the
 /// remote shard file (no re-copy); the shared dedup gates absorb overlap.
+/// Streamed: a shard can be gigabytes decompressed, so it is never collected.
 async fn ingest_shard_file(deps: &NetDeps, shard_db_id: i64, path: &Path) -> Result<()> {
-    let items: Vec<(u64, u64, warc::Record)> =
-        warc::MemberIter::open(path)?.collect::<Result<_>>()?;
-    for (offset, len, rec) in items {
+    for item in warc::MemberIter::open(path)? {
+        let (offset, len, rec) = item?;
         if let Some(mut ir) = bootstrap::prepare_ingest(&rec, Vec::new()) {
             ir.location = db::IngestLocation::Stored {
                 shard_id: shard_db_id,

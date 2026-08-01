@@ -6,10 +6,11 @@
 //! Commands are drain-batched into one transaction: few large sequential WAL
 //! writes instead of thousands of tiny commits.
 //!
-//! Durability ordering (the watermark protocol): WARC members are appended and
-//! fsynced *inside* batch handling; the same transaction that inserts the docs
-//! rows advances shards.bytes. On boot the open shard is truncated back to
-//! shards.bytes, so a torn tail is unobservable and orphans are impossible.
+//! Durability ordering (the watermark protocol): WARC members are appended
+//! inside batch handling and the open shard is fsynced once per dirty batch;
+//! the same transaction that inserts the docs rows then advances shards.bytes.
+//! On boot the open shard is truncated back to shards.bytes, so a torn tail is
+//! unobservable and orphans are impossible.
 
 use crate::index::{IndexDoc, IndexMsg};
 use crate::{Result, warc};
@@ -724,6 +725,7 @@ fn create_shard(conn: &Connection, init: &WarcInit) -> Result<(i64, warc::ShardF
     let mut shard = warc::ShardFile::create(init.dir.join(&name))?;
     let info = warc::gzip_member(&warc::build_warcinfo(now(), &init.contact));
     shard.append_member(&info)?;
+    shard.flush()?; // durable before the INSERT below publishes its watermark
     conn.execute(
         "INSERT INTO shards (name, state, source, origin_node, bytes, records, created_at)
          VALUES (?1, 0, 'crawl', ?2, ?3, 1, ?4)",
@@ -934,7 +936,21 @@ impl Writer {
                 }
             }
             // Advance the durable watermark for everything appended this batch.
+            // One fsync per batch (not per member): the invariant only requires
+            // the shard bytes to be durable before shards.bytes commits.
             if self.warc.dirty {
+                if let Err(e) = self.warc.shard.flush() {
+                    // Never let docs rows commit past unsynced shard bytes:
+                    // boot truncation would cut the members they point at.
+                    // Roll the whole batch back; pending oneshot replies fail
+                    // closed (empty/default) as their senders drop.
+                    tracing::error!("shard fsync failed; batch rolled back: {e}");
+                    drop(tx);
+                    if stop {
+                        break;
+                    }
+                    continue;
+                }
                 if let Err(e) = tx.execute(
                     "UPDATE shards SET bytes = ?1, records = ?2 WHERE id = ?3",
                     params![

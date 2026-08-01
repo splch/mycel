@@ -223,7 +223,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 - Records: one `warcinfo` per file, then `response` records (full HTTP status line + headers + body). Bodies stored transfer-decoded; header block drops `Content-Encoding`, rewrites `Content-Length`; oversize bodies kept with `WARC-Truncated: length`.
 - `WARC-Record-ID: <urn:mycel:{hex32(sha256(url‖fetched_at_nanos‖counter))}>`; `WARC-Payload-Digest: sha256:<hex>`. Dates: hand-rolled strict ISO-8601 subset (Hinnant civil-date algorithms, ~50 LoC).
 - Rotation: one open shard, append-only; at `shard_mb` → fsync, whole-file blake3, mark sealed, open next. Sealed shards are immutable; they are the sync catalog entries.
-- **Watermark crash protocol**: append + fsync record, then the same db-writer batch that inserts `docs` rows advances `shards.bytes`. On boot, truncate open shard to `shards.bytes`. Torn tails are unobservable; post-watermark records simply get recrawled. Orphans impossible.
+- **Watermark crash protocol**: append records, fsync the open shard once per batch, then the same db-writer batch that inserts `docs` rows advances `shards.bytes`. On boot, truncate open shard to `shards.bytes`. Torn tails are unobservable; post-watermark records simply get recrawled. Orphans impossible.
 - Random access: `docs(shard_id, offset, len)` → seek, gunzip member, parse; the same shape as CC ranged fetches, so ingest of CC-derived files reuses every reader line.
 
 ## 6. Crawler
