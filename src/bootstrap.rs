@@ -163,7 +163,7 @@ pub async fn ingest_paths(dbh: &Db, paths: &[PathBuf]) -> Result<(u64, u64)> {
     for file in files {
         tracing::info!("ingesting {}", file.display());
         // Stream members (a shard can be gigabytes decompressed: never
-        // collect it); raw member bytes are re-read by range through ONE
+        // collect it); raw member bytes are re-read by range through one
         // reused handle so the stored bytes are exactly the original member.
         let mut raw_reader = std::fs::File::open(&file)?;
         for item in warc::MemberIter::open(&file)? {

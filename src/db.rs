@@ -936,8 +936,8 @@ impl Writer {
                 }
             }
             // Advance the durable watermark for everything appended this batch.
-            // One fsync per batch (not per member): the invariant only requires
-            // the shard bytes to be durable before shards.bytes commits.
+            // One fsync per batch, not per member: the invariant needs the
+            // shard bytes durable before shards.bytes commits.
             if self.warc.dirty {
                 if let Err(e) = self.warc.shard.flush() {
                     // Never let docs rows commit past unsynced shard bytes:
@@ -1280,8 +1280,8 @@ fn store_doc(
     Ok(())
 }
 
-/// One counter increment (kept as a fn, not a closure, so `counters` can be
-/// reborrowed by store_doc within the same match arm).
+/// Counter increment as a fn (not a closure) so `counters` can be
+/// reborrowed by store_doc in the same match arm.
 fn bump(counters: &mut HashMap<&'static str, i64>, name: &'static str, delta: i64) {
     *counters.entry(name).or_insert(0) += delta;
 }
@@ -1668,9 +1668,8 @@ fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
 }
 
 /// The gauges behind `mycel status`, /stats, and the admin page: one home
-/// for the SQL so the three consumers cannot drift apart. Leniency matches
-/// the old /stats behavior: a failed count reads -1 rather than failing the
-/// whole snapshot.
+/// for the SQL so the three consumers cannot drift apart. A failed count
+/// reads -1 (the /stats rule) rather than failing the whole snapshot.
 pub struct StatusCounts {
     pub hosts_active: i64,
     pub hosts_candidate: i64,

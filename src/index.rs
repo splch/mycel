@@ -294,9 +294,8 @@ impl Indexer {
                     self.dbh.mark_docs_blocking(marks);
                 }
                 // Cleared only outside sweeps: the db-writer applies marks
-                // after this commit, and clearing mid-sweep would let the
-                // next sweep batch re-select docs whose marks are still in
-                // flight. The first commit after the sweep ends clears it.
+                // after this commit, so clearing mid-sweep would let the
+                // next batch re-select docs whose marks are still in flight.
                 if !self.sweeping {
                     self.in_flight.clear();
                 }

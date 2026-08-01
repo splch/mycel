@@ -346,8 +346,7 @@ impl ShardFile {
 
     /// Append one gzip member (NOT fsynced). Returns (offset, len). The
     /// caller must `flush()` before advancing the durable watermark
-    /// (shards.bytes), so a crash can never leave the watermark past synced
-    /// data. The db-writer flushes once per batch, not per member.
+    /// (shards.bytes) — the db-writer flushes once per dirty batch.
     pub fn append_member(&mut self, member: &[u8]) -> Result<(u64, u64)> {
         let offset = self.end;
         self.file.write_all(member)?;

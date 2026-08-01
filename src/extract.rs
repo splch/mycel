@@ -2,9 +2,9 @@
 //! main-content extraction, language id, and simhash. One pipeline shared by
 //! the crawl hot path and the indexer's cold (reconciliation/reindex) path.
 //!
-//! `analyze` does everything over a SINGLE DOM parse (dom_query), then hands
-//! the document to Readability (which mutates and consumes it). The rare
-//! thin-page fallback re-parses, as before.
+//! `analyze` does everything over one DOM parse (dom_query), then hands the
+//! document to Readability (which mutates and consumes it); only the rare
+//! thin-page fallback re-parses.
 
 use std::collections::HashSet;
 use url::Url;
@@ -37,8 +37,8 @@ pub struct Analysis {
     pub extract: Option<Extracted>,
 }
 
-/// The full pipeline over one DOM parse. None = the URL itself is unusable
-/// (callers treat it as a bad-record error, as before).
+/// The full pipeline over one DOM parse. None = unusable URL (callers map it
+/// to a bad-record error).
 pub fn analyze(final_url: &str, html: &str) -> Option<Analysis> {
     let base = Url::parse(final_url).ok()?;
     let doc = dom_query::Document::from(html);
@@ -86,8 +86,8 @@ fn sniff_meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
 }
 
 /// Parse the page for links and robots meta, over an already-parsed document.
-/// `final_url` is the URL the content was actually served from
-/// (post-redirect), the base for relatives.
+/// `final_url` is the URL the content was served from (post-redirect), the
+/// base for relatives.
 fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document) -> PageMeta {
     let mut noindex = false;
     let mut nofollow = false;
@@ -147,9 +147,8 @@ pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     full_from_doc(final_url, html, dom_query::Document::from(html))
 }
 
-/// Readability first (it mutates and consumes the document), scraper-style
-/// fallback (title tag + body text sans script/style) when it yields too
-/// little. None = no usable title and not enough text. Thin-but-titled
+/// Readability first (it mutates and consumes the document), plain fallback
+/// (title tag + body text sans script/style) when it yields too little. None = no usable title and not enough text. Thin-but-titled
 /// pages index; BM25 scores them down.
 fn full_from_doc(final_url: &str, html: &str, doc: dom_query::Document) -> Option<Extracted> {
     let (mut title, mut text) = if html.len() > READABILITY_MAX_BYTES {
