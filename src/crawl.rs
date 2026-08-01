@@ -19,6 +19,22 @@ const SITEMAP_COMPRESSED_CAP: usize = 10 * 1024 * 1024;
 const SITEMAP_DECOMPRESSED_CAP: u64 = 50 * 1024 * 1024;
 const MAX_REDIRECT_HOPS: u32 = 5;
 const UA_TOKEN: &str = "mycel";
+/// Mercator's adaptive politeness: after a fetch that took T, the host's next
+/// turn comes at least FACTOR·T later, so a struggling server is hit less
+/// without any per-host configuration.
+const LATENCY_DELAY_FACTOR: i64 = 10;
+/// Robots cache lifetime when validators (ETag/Last-Modified) are on file:
+/// the RFC 9309 maximum of 24h, since a conditional re-fetch is cheap and
+/// corrects staleness. Without validators the configured TTL applies.
+const ROBOTS_VALIDATED_TTL_SECS: u64 = 86_400;
+
+fn robots_ttl(cfg: &CrawlCfg, has_validators: bool) -> u64 {
+    if has_validators {
+        cfg.robots_ttl_secs.max(ROBOTS_VALIDATED_TTL_SECS)
+    } else {
+        cfg.robots_ttl_secs
+    }
+}
 
 pub struct CrawlerOpts {
     /// `crawl` exits when nothing is claimable and nothing is in flight;
@@ -142,9 +158,11 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
     let now = db::now();
 
     // Stale robots? This host turn goes to robots.txt; the URL is refunded.
-    let stale = job
-        .robots_fetched_at
-        .is_none_or(|t| now - t > st.cfg.robots_ttl_secs as i64);
+    let ttl = robots_ttl(
+        &st.cfg,
+        job.robots_etag.is_some() || job.robots_last_modified.is_some(),
+    );
+    let stale = job.robots_fetched_at.is_none_or(|t| now - t > ttl as i64);
     if stale {
         let (result, sitemaps) = fetch_robots(&st, &job).await;
         st.db
@@ -202,12 +220,13 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
         return;
     }
 
+    let (outcome, sticky, fetch_dur) = do_fetch(&st, &job, robot.as_ref()).await;
     let delay_ms = effective_delay_ms(
         &st.cfg,
         robot.as_ref().and_then(|r| r.delay),
         job.crawl_delay_ms,
+        fetch_dur,
     );
-    let (outcome, sticky) = do_fetch(&st, &job, robot.as_ref()).await;
     let host_fault = match &outcome {
         Outcome::RetryAt { reason, .. } | Outcome::PermanentFail { reason } => {
             is_host_fault_reason(reason)
@@ -231,15 +250,23 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
 }
 
 /// Politeness: the largest of the config floor, robots crawl-delay (capped at
-/// 30 s; a larger ask is treated as "very slowly", not "never"), and the
-/// host's sticky 429-doubled delay.
-fn effective_delay_ms(cfg: &CrawlCfg, robots_delay_s: Option<f32>, host_delay_ms: i64) -> i64 {
+/// 30 s; a larger ask is treated as "very slowly", not "never"), the host's
+/// sticky 429-doubled delay, and 10× the last fetch's duration (Mercator's
+/// adaptive rule, itself capped by max_delay_ms).
+fn effective_delay_ms(
+    cfg: &CrawlCfg,
+    robots_delay_s: Option<f32>,
+    host_delay_ms: i64,
+    fetch: Duration,
+) -> i64 {
     let robots_ms = robots_delay_s
         .map(|s| (f64::from(s).clamp(0.0, 30.0) * 1000.0) as i64)
         .unwrap_or(0);
+    let latency_ms = (fetch.as_millis() as i64 * LATENCY_DELAY_FACTOR).min(cfg.max_delay_ms as i64);
     (cfg.default_delay_ms as i64)
         .max(robots_ms)
         .max(host_delay_ms)
+        .max(latency_ms)
 }
 
 /// Does this failure indict the host? Transport failures and 5xx (incl. 503)
@@ -283,11 +310,28 @@ async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, Str
         }
         Err(_) => format!("https://{}/robots.txt", job.host),
     };
-    match get_following_redirects(&st.client, &url).await {
+    match get_following_redirects(
+        &st.client,
+        &url,
+        job.robots_etag.as_deref(),
+        job.robots_last_modified.as_deref(),
+    )
+    .await
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             match status {
                 200..=299 => {
+                    let etag = resp
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let last_modified = resp
+                        .headers()
+                        .get(reqwest::header::LAST_MODIFIED)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let (body, _) = match read_body_capped(resp, ROBOTS_CAP).await {
                         Ok(b) => b,
                         Err(_) => {
@@ -312,8 +356,19 @@ async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, Str
                                 .collect()
                         })
                         .unwrap_or_default();
-                    (RobotsResult::Fetched { status, body: text }, sitemaps)
+                    (
+                        RobotsResult::Fetched {
+                            status,
+                            body: text,
+                            etag,
+                            last_modified,
+                        },
+                        sitemaps,
+                    )
                 }
+                // Conditional re-fetch came back unchanged: keep the cached
+                // rules (and validators), refresh only the timestamp.
+                304 => (RobotsResult::NotModified, vec![]),
                 400..=499 => (RobotsResult::AllowAll { status }, vec![]),
                 _ => (
                     RobotsResult::Unavailable {
@@ -331,11 +386,27 @@ async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, Str
 }
 
 /// GET following up to 5 redirects blindly, used only for robots.txt, where
-/// RFC 9309 says to follow them (cross-host included).
-async fn get_following_redirects(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
+/// RFC 9309 says to follow them (cross-host included). Conditional-re-fetch
+/// validators apply to the first hop only: after a redirect the resource may
+/// differ, so later hops are unconditional.
+async fn get_following_redirects(
+    client: &reqwest::Client,
+    url: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<reqwest::Response> {
     let mut cur = url.to_string();
-    for _ in 0..=MAX_REDIRECT_HOPS {
-        let resp = client.get(&cur).send().await?;
+    for hop in 0..=MAX_REDIRECT_HOPS {
+        let mut req = client.get(&cur);
+        if hop == 0 {
+            if let Some(e) = etag {
+                req = req.header(reqwest::header::IF_NONE_MATCH, e);
+            }
+            if let Some(lm) = last_modified {
+                req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+            }
+        }
+        let resp = req.send().await?;
         if !resp.status().is_redirection() {
             return Ok(resp);
         }
@@ -365,9 +436,19 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<(Ve
     Ok((buf, false))
 }
 
-/// The main fetch pipeline for one claimed URL. Returns (outcome, sticky 429
-/// delay to persist).
-async fn do_fetch(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Option<i64>) {
+/// The main fetch pipeline for one claimed URL: measures wall time for the
+/// latency-adaptive politeness gate, then delegates. Returns (outcome,
+/// sticky 429 delay to persist, fetch duration).
+async fn do_fetch(
+    st: &Shared,
+    job: &Job,
+    robot: Option<&Robot>,
+) -> (Outcome, Option<i64>, Duration) {
+    let started = Instant::now();
+    let (outcome, sticky) = do_fetch_inner(st, job, robot).await;
+    (outcome, sticky, started.elapsed())
+}
+async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outcome, Option<i64>) {
     let now = db::now();
     let mut cur = job.url.clone();
     let mut hops = 0u32;
@@ -701,18 +782,27 @@ fn parse_sitemap_outcome(host: &str, body: Vec<u8>) -> Outcome {
     };
     let parsed = crate::sitemap::parse(&xml);
     // Same-host only: sitemaps.org scope rule, and our politeness boundary.
-    let keep = |urls: Vec<String>| -> Vec<(String, String)> {
+    let keep = |urls: Vec<(String, Option<i64>)>| -> Vec<(String, String, Option<i64>)> {
         urls.into_iter()
-            .filter_map(|u| {
+            .filter_map(|(u, lastmod)| {
                 let n = urlnorm::normalize(&u)?;
                 let h = urlnorm::host_of(&n)?;
-                (h == host).then_some((n, h))
+                (h == host).then_some((n, h, lastmod))
             })
             .collect()
     };
+    let children = parsed
+        .children
+        .into_iter()
+        .filter_map(|u| {
+            let n = urlnorm::normalize(&u)?;
+            let h = urlnorm::host_of(&n)?;
+            (h == host).then_some((n, h))
+        })
+        .collect();
     Outcome::Sitemap {
         pages: keep(parsed.pages),
-        children: keep(parsed.children),
+        children,
     }
 }
 
@@ -731,12 +821,39 @@ mod tests {
     #[test]
     fn effective_delay_takes_the_max() {
         let c = cfg();
-        assert_eq!(effective_delay_ms(&c, None, 0), 1000);
-        assert_eq!(effective_delay_ms(&c, Some(2.5), 0), 2500);
+        let fast = Duration::ZERO;
+        assert_eq!(effective_delay_ms(&c, None, 0, fast), 1000);
+        assert_eq!(effective_delay_ms(&c, Some(2.5), 0, fast), 2500);
         // robots crawl-delay capped at 30s
-        assert_eq!(effective_delay_ms(&c, Some(9999.0), 0), 30_000);
+        assert_eq!(effective_delay_ms(&c, Some(9999.0), 0, fast), 30_000);
         // sticky host delay wins when larger
-        assert_eq!(effective_delay_ms(&c, Some(2.0), 60_000), 60_000);
+        assert_eq!(effective_delay_ms(&c, Some(2.0), 60_000, fast), 60_000);
+        // latency-adaptive: 10× the fetch duration, capped at max_delay_ms
+        assert_eq!(
+            effective_delay_ms(&c, None, 0, Duration::from_millis(500)),
+            5_000
+        );
+        assert_eq!(
+            effective_delay_ms(&c, None, 60_000, Duration::from_millis(500)),
+            60_000
+        );
+        assert_eq!(
+            effective_delay_ms(&c, None, 0, Duration::from_secs(600)),
+            3_600_000
+        );
+    }
+
+    #[test]
+    fn robots_ttl_extends_with_validators() {
+        let c = cfg(); // robots_ttl_secs defaults to 3600
+        assert_eq!(robots_ttl(&c, false), 3600);
+        assert_eq!(robots_ttl(&c, true), ROBOTS_VALIDATED_TTL_SECS);
+        // an even longer configured TTL is kept
+        let c2 = CrawlCfg {
+            robots_ttl_secs: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(robots_ttl(&c2, true), 200_000);
     }
 
     #[test]
@@ -798,7 +915,7 @@ mod tests {
         };
         assert_eq!(
             pages,
-            vec![("http://a.com/x".to_string(), "a.com".to_string())]
+            vec![("http://a.com/x".to_string(), "a.com".to_string(), None)]
         );
     }
 

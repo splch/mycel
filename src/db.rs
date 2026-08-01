@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const DDL_V1: &str = r#"
 CREATE TABLE hosts (
@@ -151,6 +151,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 3)?;
     }
+    if version < 4 {
+        // v4: conditional robots.txt re-fetch (RFC 9309's 24h cache ceiling
+        // becomes cheap to honor). NULL when the server sends no validators.
+        conn.execute_batch(
+            "ALTER TABLE hosts ADD COLUMN robots_etag TEXT;
+             ALTER TABLE hosts ADD COLUMN robots_last_modified TEXT;",
+        )?;
+        conn.pragma_update(None, "user_version", 4)?;
+    }
     Ok(())
 }
 
@@ -199,15 +208,24 @@ pub struct Job {
     pub depth: i64,
     pub robots_body: Option<String>,
     pub robots_fetched_at: Option<i64>,
+    pub robots_etag: Option<String>,
+    pub robots_last_modified: Option<String>,
     pub crawl_delay_ms: i64,
     pub prior_sha: Option<Vec<u8>>,
 }
 
 pub enum RobotsResult {
-    /// 2xx: cache the (truncated) body.
-    Fetched { status: u16, body: String },
+    /// 2xx: cache the (truncated) body and its conditional-re-fetch validators.
+    Fetched {
+        status: u16,
+        body: String,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
     /// 4xx: unrestricted; cache an empty allow-all body.
     AllowAll { status: u16 },
+    /// 304: cached rules unchanged; refresh the timestamp, keep body+validators.
+    NotModified,
     /// 5xx / network error: complete disallow; host stalls, retried hourly.
     Unavailable { status: Option<u16> },
 }
@@ -241,7 +259,7 @@ pub enum Outcome {
     /// Body sha unchanged since last fetch: touch fetched_at only, no WARC write.
     Unchanged,
     Sitemap {
-        pages: Vec<(String, String)>,
+        pages: Vec<(String, String, Option<i64>)>,
         children: Vec<(String, String)>,
     },
     CrossRedirect {
@@ -982,7 +1000,8 @@ impl Writer {
 
 const CLAIM_SQL: &str = "
 SELECT h.id, h.host, f.id, f.url, f.kind, f.attempts, f.depth,
-       h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256
+       h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256,
+       h.robots_etag, h.robots_last_modified
 FROM hosts h
 JOIN frontier f ON f.id = (
    SELECT f2.id FROM frontier f2
@@ -1010,6 +1029,8 @@ fn claim(tx: &Transaction, now: i64, batch: usize) -> Result<Vec<Job>> {
                 robots_fetched_at: r.get(8)?,
                 crawl_delay_ms: r.get(9)?,
                 prior_sha: r.get(10)?,
+                robots_etag: r.get(11)?,
+                robots_last_modified: r.get(12)?,
             })
         })?;
         for row in rows {
@@ -1030,10 +1051,43 @@ fn claim(tx: &Transaction, now: i64, batch: usize) -> Result<Vec<Job>> {
 
 fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     let now = m.now_ms / 1000;
-    let (body, status): (Option<&str>, Option<i64>) = match &m.result {
-        RobotsResult::Fetched { status, body } => (Some(body.as_str()), Some(*status as i64)),
-        RobotsResult::AllowAll { status } => (Some(""), Some(*status as i64)),
-        RobotsResult::Unavailable { status } => (None, status.map(|s| s as i64)),
+    if matches!(m.result, RobotsResult::NotModified) {
+        // 304: cached rules still valid. Refresh the timestamp, keep the
+        // body and validators; a 304 proves the host answered, so the
+        // failure count resets. The claimed URL's attempt is refunded below.
+        tx.prepare_cached(
+            "UPDATE hosts SET robots_fetched_at = ?1, next_fetch_at = ?2, in_flight = 0,
+                              consecutive_failures = 0
+             WHERE id = ?3",
+        )?
+        .execute(params![now, gate_at(m.now_ms, m.delay_ms), m.host_id])?;
+        tx.prepare_cached(
+            "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
+             WHERE id = ?1",
+        )?
+        .execute([m.frontier_id])?;
+        return Ok(());
+    }
+    let (body, status, etag, last_modified): (
+        Option<&str>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = match &m.result {
+        RobotsResult::Fetched {
+            status,
+            body,
+            etag,
+            last_modified,
+        } => (
+            Some(body.as_str()),
+            Some(*status as i64),
+            etag.clone(),
+            last_modified.clone(),
+        ),
+        RobotsResult::AllowAll { status } => (Some(""), Some(*status as i64), None, None),
+        RobotsResult::Unavailable { status } => (None, status.map(|s| s as i64), None, None),
+        RobotsResult::NotModified => unreachable!("handled above"),
     };
     // 5xx/unreachable robots = complete disallow: stall the host for an hour.
     let gate = if body.is_none() {
@@ -1048,6 +1102,7 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     tx.prepare_cached(
         "UPDATE hosts SET robots_body = ?1, robots_status = ?2, robots_fetched_at = ?3,
                           next_fetch_at = ?4, in_flight = 0,
+                          robots_etag = ?8, robots_last_modified = ?9,
                           consecutive_failures = CASE WHEN ?6 THEN consecutive_failures + 1
                                                       ELSE 0 END,
                           state = CASE WHEN ?6 AND state = 1
@@ -1056,7 +1111,15 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
          WHERE id = ?5",
     )?
     .execute(params![
-        body, status, now, gate, m.host_id, fault, threshold
+        body,
+        status,
+        now,
+        gate,
+        m.host_id,
+        fault,
+        threshold,
+        etag,
+        last_modified
     ])?;
     if fault {
         warn_if_blocked(tx, m.host_id, threshold)?;
@@ -1068,7 +1131,7 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     )?
     .execute([m.frontier_id])?;
     for (url, host) in &m.sitemaps {
-        enqueue(tx, cfg, now, None, url, host, 1, 0)?;
+        enqueue(tx, cfg, now, None, url, host, 1, 0, 0)?;
     }
     Ok(())
 }
@@ -1167,7 +1230,7 @@ fn handle_ingest(
         simhash
     ])?;
     for (url, host, anchor) in &r.links {
-        enqueue(tx, cfg, r.fetched_at, Some(host_id), url, host, 0, 1)?;
+        enqueue(tx, cfg, r.fetched_at, Some(host_id), url, host, 0, 1, 0)?;
         record_anchor(tx, &r.url, url, anchor)?;
     }
     if indexed == 0
@@ -1282,7 +1345,7 @@ fn handle_complete(
                 })));
             }
             for (url, host, anchor) in &p.links {
-                enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1)?;
+                enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1, 0)?;
                 record_anchor(tx, &p.final_url, url, anchor)?;
             }
             // Fresh content: the recrawl interval drops back to the base.
@@ -1308,18 +1371,22 @@ fn handle_complete(
             bump("fetch_ok", 1);
         }
         Outcome::Sitemap { pages, children } => {
-            for (url, host) in pages {
-                enqueue(tx, cfg, now, None, url, host, 0, c.depth + 1)?;
+            for (url, host, lastmod) in pages {
+                // lastmod seeds first-fetch priority within the host: recently
+                // modified first (the claim key sorts ascending; negative is
+                // always due, and retries/recrawls overwrite it later).
+                let due = lastmod.map(|t| -t).unwrap_or(0);
+                enqueue(tx, cfg, now, None, url, host, 0, c.depth + 1, due)?;
             }
             for (url, host) in children {
-                enqueue(tx, cfg, now, None, url, host, 1, c.depth + 1)?;
+                enqueue(tx, cfg, now, None, url, host, 1, c.depth + 1, 0)?;
             }
             requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, None)?;
             bump("fetch_ok", 1);
         }
         Outcome::CrossRedirect { target } => {
             if let Some((url, host)) = target {
-                enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1)?;
+                enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1, 0)?;
             }
             let reason = match target {
                 Some((u, _)) => format!("redirect:{u}"),
@@ -1464,6 +1531,8 @@ pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> R
 
 /// Record a candidate host + webgraph edge, and enqueue the URL if its host is
 /// active and under caps. The single admission point for every discovered URL.
+/// `due` seeds next_attempt_at on a fresh row (0 = immediately due; negative
+/// values sort earlier — the sitemap lastmod hint).
 #[allow(clippy::too_many_arguments)]
 fn enqueue(
     tx: &Transaction,
@@ -1474,6 +1543,7 @@ fn enqueue(
     host: &str,
     kind: i64,
     depth: i64,
+    due: i64,
 ) -> Result<()> {
     tx.prepare_cached("INSERT OR IGNORE INTO hosts (host, state, added_at) VALUES (?1, 0, ?2)")?
         .execute(params![host, now])?;
@@ -1494,9 +1564,9 @@ fn enqueue(
             .prepare_cached(
                 "INSERT OR IGNORE INTO frontier
                    (host_id, url, kind, state, next_attempt_at, attempts, depth, discovered_at)
-                 VALUES (?1, ?2, ?3, 0, 0, 0, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, 0, ?6, 0, ?4, ?5)",
             )?
-            .execute(params![host_id, url, kind, depth, now])?;
+            .execute(params![host_id, url, kind, depth, now, due])?;
         if inserted > 0 {
             tx.prepare_cached("UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1")?
                 .execute([host_id])?;
@@ -1944,6 +2014,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn robots_not_modified_keeps_rules_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+
+        let t = now();
+        // First fetch: rules + validators cached.
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.robots_done(RobotsMsg {
+            host_id: job.host_id,
+            frontier_id: job.frontier_id,
+            result: RobotsResult::Fetched {
+                status: 200,
+                body: "user-agent: *\ndisallow: /admin\n".into(),
+                etag: Some("\"v1\"".into()),
+                last_modified: None,
+            },
+            sitemaps: vec![],
+            delay_ms: 1000,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+
+        // The conditional re-fetch comes back 304: body and validators kept,
+        // timestamp refreshed, attempt refunded again.
+        let job = db.claim(t + 100, 1).await.pop().unwrap();
+        assert_eq!(job.robots_etag.as_deref(), Some("\"v1\""));
+        db.robots_done(RobotsMsg {
+            host_id: job.host_id,
+            frontier_id: job.frontier_id,
+            result: RobotsResult::NotModified,
+            sitemaps: vec![],
+            delay_ms: 1000,
+            now_ms: (t + 100) * 1000,
+        })
+        .await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let (body, fetched_at, etag): (Option<String>, i64, Option<String>) = conn
+            .query_row(
+                "SELECT robots_body, robots_fetched_at, robots_etag FROM hosts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body.as_deref(), Some("user-agent: *\ndisallow: /admin\n"));
+        assert_eq!(fetched_at, t + 100);
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        let attempts: i64 = conn
+            .query_row("SELECT attempts FROM frontier", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0, "both robots turns refunded the claim");
+    }
+
+    #[tokio::test]
+    async fn sitemap_lastmod_seeds_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('example.com', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let host_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frontier (host_id, url, kind, discovered_at)
+             VALUES (?1, 'http://example.com/sitemap.xml', 1, 0)",
+            [host_id],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+
+        let t = now();
+        let (recent, old) = (t - 1_000, t - 1_000_000);
+        let job = db.claim(t, 1).await.pop().unwrap();
+        assert_eq!(job.kind, 1);
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Sitemap {
+                pages: vec![
+                    (
+                        "http://example.com/recent".into(),
+                        "example.com".into(),
+                        Some(recent),
+                    ),
+                    (
+                        "http://example.com/old".into(),
+                        "example.com".into(),
+                        Some(old),
+                    ),
+                    (
+                        "http://example.com/plain".into(),
+                        "example.com".into(),
+                        None,
+                    ),
+                ],
+                children: vec![],
+            },
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let due_of = |url: &str| -> i64 {
+            conn.query_row(
+                "SELECT next_attempt_at FROM frontier WHERE url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(due_of("http://example.com/recent"), -recent);
+        assert_eq!(due_of("http://example.com/old"), -old);
+        assert_eq!(due_of("http://example.com/plain"), 0);
+        // Claim order: recently modified first, plain (unhinted) last.
+        assert!(due_of("http://example.com/recent") < due_of("http://example.com/old"));
+        assert!(due_of("http://example.com/old") < due_of("http://example.com/plain"));
+    }
+
+    #[tokio::test]
     async fn robots_unavailable_trips_breaker() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("t.sqlite");
@@ -2059,13 +2271,18 @@ mod tests {
             .unwrap();
         assert_eq!((url.as_str(), streak), ("http://example.com/", 0));
 
-        // v3's anchor_text table exists and is queryable.
+        // v3's anchor_text table and v4's robots validators exist.
         conn.execute(
             "INSERT INTO anchor_text (url, text) VALUES ('http://example.com/', 'a link')",
             [],
         )
         .unwrap();
         assert_eq!(anchors_for(&conn, "http://example.com/").unwrap(), "a link");
+        conn.execute(
+            "UPDATE hosts SET robots_etag = '\"e1\"' WHERE host = 'example.com'",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

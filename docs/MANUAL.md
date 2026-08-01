@@ -219,7 +219,7 @@ process start; nothing reloads live.
 | `concurrency` | `64` | Global cap on in-flight HTTP requests (still at most one per host). Must be > 0. |
 | `default_delay_ms` | `1000` | Per-host politeness floor between requests. |
 | `max_delay_ms` | `3600000` | Ceiling for the sticky per-host delay that doubles on every 429. |
-| `robots_ttl_secs` | `3600` | How long a cached robots.txt is trusted before refetch. |
+| `robots_ttl_secs` | `3600` | How long a cached robots.txt is trusted before refetch; extends to 24 h (the RFC 9309 max) once the server has sent ETag/Last-Modified validators, since re-fetches are then conditional. |
 | `timeout_secs` | `30` | Whole-request timeout (connect timeout is a fixed 10 s). |
 | `max_body_bytes` | `2097152` | Page body cap. Larger bodies are truncated at the cap and stored with `WARC-Truncated: length`. |
 | `recrawl_days` | `14` | Base revisit interval for successfully fetched URLs (pages and sitemaps). Pages double their interval per consecutive unchanged fetch, capped at ×16. |
@@ -652,8 +652,13 @@ due time. The politeness delay after *every* completed request (success or
 failure) is:
 
 ```
-delay = max(default_delay_ms, robots crawl-delay (capped at 30 s), sticky per-host delay)
+delay = max(default_delay_ms, robots crawl-delay (capped at 30 s),
+            sticky per-host delay, 10 × the last fetch's duration)
 ```
+
+The last term is Mercator's adaptive rule: a slow or struggling server is
+hit less often automatically, without any per-host configuration (capped by
+`max_delay_ms`).
 
 A robots `Crawl-delay` above 30 s is honored as 30 s ("very slowly", not
 "never"). Delays use ceiling arithmetic, so a configured delay can never
@@ -662,7 +667,10 @@ round down to zero.
 **robots.txt.** Fetched (following up to 5 redirects, cross-host allowed)
 when the cache is older than `robots_ttl_secs`; the robots fetch consumes the
 host's politeness turn and the page that triggered it is requeued without
-penalty. Outcomes:
+penalty. When the server sends `ETag`/`Last-Modified` validators they are
+cached too, the cache lifetime extends to 24 hours (the RFC 9309 maximum),
+and re-fetches are conditional — a `304 Not Modified` keeps the cached rules
+and just refreshes the timestamp. Outcomes:
 
 - 2xx: body cached (up to 512 KiB) and enforced.
 - 4xx: treated as allow-all (cached as such).
@@ -729,7 +737,9 @@ collapsed; query strings kept byte-for-byte except the tracking parameters
 are supported (10 MiB compressed download cap, 50 MiB decompressed cap);
 at most 50 000 `<loc>` entries are read per file; only same-host locations
 are kept. `<sitemapindex>` children are enqueued as further sitemap jobs
-(bounded by the same depth cap as pages). Sitemaps are re-fetched every
+(bounded by the same depth cap as pages). A `<lastmod>` on a `<url>` seeds
+its first-fetch priority within the host: recently modified pages are
+fetched first (it does not affect retries or recrawls). Sitemaps are re-fetched every
 `recrawl_days` and are not archived to WARC.
 
 **Extraction and indexing.** HTML is decoded (header charset, then BOM,

@@ -211,6 +211,8 @@ returns A after reindex.
 
 ## Phase 6 — Politeness refinements (optional, low risk)
 
+**Status: shipped 2026-08-01** (schema v4; all three items).
+
 **Best-practice basis.** Mercator's production tuning; RFC 9309's 24h cache
 ceiling; Google's latency-driven capacity loop.
 

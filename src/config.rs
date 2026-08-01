@@ -15,6 +15,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # default_delay_ms = 1000  # per-host politeness floor
 # max_delay_ms = 3600000   # cap for sticky 429 doubling
 # robots_ttl_secs = 3600
+#                            # cached-robots lifetime; extends to 24h (the RFC
+#                            # 9309 max) once ETag/Last-Modified validators are
+#                            # on file, since re-fetches are then conditional
 # timeout_secs = 30
 # max_body_bytes = 2097152
 # recrawl_days = 14
