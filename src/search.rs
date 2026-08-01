@@ -83,16 +83,18 @@ impl Searcher {
         let index = searcher.index();
 
         let w = self.weight;
-        let run = |conjunctive: bool| -> Result<(usize, Vec<Hit>, usize)> {
-            let mut parser =
-                QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
-            if conjunctive {
-                parser.set_conjunction_by_default();
-            }
-            parser.set_field_boost(self.fields.title, 2.0);
-            let text_query: Option<Box<dyn Query>> =
-                (!text.is_empty()).then(|| parser.parse_query_lenient(&text).0);
-
+        let build_text = |conjunctive: bool| -> Option<Box<dyn Query>> {
+            (!text.is_empty()).then(|| {
+                let mut parser =
+                    QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
+                if conjunctive {
+                    parser.set_conjunction_by_default();
+                }
+                parser.set_field_boost(self.fields.title, 2.0);
+                parser.parse_query_lenient(&text).0
+            })
+        };
+        let run = |text_query: Option<Box<dyn Query>>| -> Result<(usize, Vec<Hit>, usize)> {
             // The generator collects its terms from the query without
             // retaining a borrow, so build it before the query moves into
             // the boolean composition. One parse per pass, reused everywhere.
@@ -219,7 +221,14 @@ impl Searcher {
         // nothing, retry disjunctive and let BM25 rank partial matches — the
         // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
         // weakAnd). site: filters are explicit intent and never relax.
-        let (total, hits, collapsed) = run(true)?;
+        //
+        // (A trimmed-conjunction middle pass — drop highest-DF terms per the
+        // ES conditional MSM spec — was benchmarked on TREC-COVID and
+        // REJECTED: nDCG@10 0.420 vs 0.439 without it. Subset conjunction
+        // isn't Lucene MSM: the dropped terms also leave the scoring, and
+        // when content terms are missing the kept-subset match is arbitrary.
+        // See docs/BENCHMARKING.md.)
+        let (total, hits, collapsed) = run(build_text(true))?;
         // A lone term behaves identically under both semantics; only
         // multi-term queries can benefit from the fallback pass.
         if total > 0 || text.split_whitespace().nth(1).is_none() {
@@ -230,7 +239,7 @@ impl Searcher {
                 collapsed,
             });
         }
-        let (total, hits, collapsed) = run(false)?;
+        let (total, hits, collapsed) = run(build_text(false))?;
         Ok(Outcome {
             total,
             hits,

@@ -286,3 +286,28 @@ benchmarking ever forces a design change.
 - No live-web latency claims (unreproducible; politeness floors dominate).
 - No click-derived or interleaving evaluation (no users; Baidu-ULTR's
   offline/online gap is the standing warning against proxy metrics).
+
+## 10. Calibrated results (BEIR TREC-COVID, 2026-07-31)
+
+Frozen corpus: 171,332 docs as synthetic WARC, real `ingest` + `reindex`
+(164,841 indexed after the gate changes; 6,491 skipped ~all `lang`), 50
+topics, `rank.weight = 0`, trec_eval-compatible scoring. Anchors: Anserini
+flat BM25 nDCG@10 0.5947; BEIR-paper BM25 0.656.
+
+| condition | nDCG@10 | P@10 | notes |
+|---|---|---|---|
+| strict AND (pre-fallback) | 0.112 | 0.118 | 35/50 topics zero-hit; conjunction ceiling measured independently: 14/50 answerable |
+| + disjunctive fallback | 0.464 | 0.496 | 0/50 zero-hit; answerable-topic scores unchanged |
+| + near-dup serve-collapse & title-only indexing | 0.439 | 0.468 | judged-relevant unfindable 29.3% → 0.77%; dip = collapse hiding dup-judged versions + 33% more distractors |
+| + trimmed-conjunction MSM pass | **0.420 — REJECTED** | 0.442 | 3 topics diverted from disjunctive; all 3 got worse (0.369/0.124/0.691 → 0.220/0/0) |
+
+The MSM rejection deserves the explanation it earned: a trimmed
+conjunction (drop the drop_count highest-DF terms, keep the rest
+conjunctive, per the ES `2<-25% 9<-3` spec) is NOT Lucene's
+minimum-should-match. True MSM keeps the dropped terms as optional
+should-clauses that still score; the approximation removes them from
+scoring entirely (Algolia removeWords semantics). When AND fails because
+mid-DF *content* terms are missing — the common case on verbose topics —
+the kept-subset conjunction matches an arbitrary small doc set, and the
+plain disjunction it preempted ranked relevant docs top. Without native
+MSM in tantivy 0.26, the two-pass AND → OR ladder stands.
