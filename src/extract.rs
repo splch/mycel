@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use url::Url;
 
 const MAX_LINKS_PER_PAGE: usize = 2000;
-/// Below this many characters of extracted text a page leans on its title;
-/// with no usable title either, it is indexed as 'empty'.
+/// Below this many characters of text a page leans on its title; with no
+/// usable title either, it is indexed as 'empty'.
 const MIN_TEXT_CHARS: usize = 100;
 
 pub struct PageMeta {
@@ -119,10 +119,9 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
 const READABILITY_MAX_BYTES: usize = 512 * 1024;
 
 /// Main-content extraction: dom_smoothie Readability first, scraper fallback
-/// (title tag + whole-body text). None = neither a usable title nor enough
-/// text to be worth indexing. Thin-but-titled pages (paywalled, JS shells,
-/// metadata-only records) ARE indexed: engines rank title/anchor-only pages
-/// rather than dropping them; BM25 scores the thin content down.
+/// (title tag + whole-body text). None = no usable title and not enough text.
+/// Thin-but-titled pages (paywalled, JS shells) ARE indexed: engines rank
+/// title-only pages rather than dropping them; BM25 scores them down.
 pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     let (mut title, mut text) = if html.len() > READABILITY_MAX_BYTES {
         (String::new(), String::new())
@@ -135,24 +134,35 @@ pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
             None => (String::new(), String::new()),
         }
     };
-    if text.chars().count() < MIN_TEXT_CHARS {
+    let mut text_len = text.chars().count();
+    if text_len < MIN_TEXT_CHARS {
         let (t2, x2) = fallback_extract(html);
-        if x2.chars().count() > text.chars().count() {
+        let x2_len = x2.chars().count();
+        if x2_len > text_len {
             text = x2;
+            text_len = x2_len;
         }
         if title.is_empty() {
             title = t2;
         }
     }
-    if text.chars().count() < MIN_TEXT_CHARS && title.is_empty() {
+    if text_len < MIN_TEXT_CHARS && title.is_empty() {
         return None;
     }
     if title.is_empty() {
         title = text.chars().take(80).collect();
     }
-    // Language id and simhash over whatever content exists (a thin page may
-    // have only its title).
-    let content = if text.is_empty() { &title } else { &text };
+    // Language id and simhash over whatever content exists; a thin page
+    // folds its title in. A bare "Subscribe" body is identical across every
+    // paywalled page — hashing it alone would falsely collapse them all as
+    // near-duplicates at serve time (and one word detects no language).
+    let combined;
+    let content = if text_len < MIN_TEXT_CHARS {
+        combined = format!("{title} {text}");
+        &combined
+    } else {
+        &text
+    };
     let lang = lang_code(whichlang::detect_language(content));
     let simhash = simhash64(content);
     Some(Extracted {
@@ -327,6 +337,24 @@ mod tests {
         )
         .expect("title-only pages index; BM25 scores them down");
         assert!(ex.title.contains("mycorrhizal"));
+        assert_eq!(ex.lang, "en");
+    }
+
+    #[test]
+    fn thin_pages_hash_title_and_body() {
+        // Same boilerplate body, different titles: the simhashes must differ,
+        // or every paywalled page would collapse into one hit at serve time.
+        let a = full(
+            "http://e.com/a",
+            "<html><head><title>Mycorrhizal networks in old-growth forest</title></head><body>Subscribe</body></html>",
+        )
+        .unwrap();
+        let b = full(
+            "http://e.com/b",
+            "<html><head><title>Database transaction isolation levels</title></head><body>Subscribe</body></html>",
+        )
+        .unwrap();
+        assert_ne!(a.simhash, b.simhash);
     }
 
     #[test]
