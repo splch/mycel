@@ -299,12 +299,30 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
                 Some((std::time::Instant::now(), v.clone()));
             with_age(v, std::time::Duration::ZERO).into_response()
         }
-        Ok(None) => serve_stale_or_error(cached, "another refresh holds the stats connection"),
+        // A concurrent request may have completed a refresh while we
+        // abstained/failed: serve the freshest snapshot available, not the
+        // one cloned before our attempt.
+        Ok(None) => serve_stale_or_error(
+            freshest(&api, cached),
+            "another refresh holds the stats connection",
+        ),
         Err(e) => {
             tracing::error!("stats computation panicked: {e}");
-            serve_stale_or_error(cached, "stats computation panicked")
+            serve_stale_or_error(freshest(&api, cached), "stats computation panicked")
         }
     }
+}
+
+fn freshest(
+    api: &Api,
+    fallback: Option<(std::time::Instant, Arc<serde_json::Value>)>,
+) -> Option<(std::time::Instant, Arc<serde_json::Value>)> {
+    api.stats_cache
+        .0
+        .lock()
+        .expect("stats cache poisoned")
+        .clone()
+        .or(fallback)
 }
 
 fn with_age(v: Arc<serde_json::Value>, age: std::time::Duration) -> axum::Json<serde_json::Value> {

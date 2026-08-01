@@ -83,7 +83,7 @@ impl Fanout {
     /// skipped outright.
     pub async fn search_peers(self: &Arc<Self>, query: &str, limit: usize) -> Vec<Vec<Hit>> {
         let mut handles = Vec::new();
-        for peer in self.peers.clone() {
+        for peer in &self.peers {
             if self
                 .breakers
                 .lock()
@@ -94,6 +94,7 @@ impl Fanout {
                 tracing::debug!("peer {} skipped (circuit open)", peer.id);
                 continue;
             }
+            let peer = peer.clone();
             let this = self.clone();
             let q = query.to_string();
             handles.push(tokio::spawn(async move {
