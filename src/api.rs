@@ -80,10 +80,15 @@ struct SearchParams {
     page: Option<usize>,
     federated: Option<u8>,
     collapse: Option<u8>,
+    diversity: Option<u8>,
 }
 
 fn want_collapse(p: &SearchParams) -> bool {
     p.collapse.map(|v| v != 0).unwrap_or(true)
+}
+
+fn want_diversity(p: &SearchParams) -> bool {
+    p.diversity.map(|v| v != 0).unwrap_or(true)
 }
 
 async fn run_search(
@@ -92,6 +97,7 @@ async fn run_search(
     page: usize,
     federated: Option<u8>,
     collapse: bool,
+    diversity: bool,
 ) -> std::result::Result<search::Outcome, String> {
     let searcher = api.searcher.clone();
     let page_size = api.page_size;
@@ -107,8 +113,9 @@ async fn run_search(
         && let Some(fed) = &api.fed
     {
         let local_q = q.clone();
-        let local =
-            tokio::task::spawn_blocking(move || searcher.search(&local_q, 0, page_size, collapse));
+        let local = tokio::task::spawn_blocking(move || {
+            searcher.search(&local_q, 0, page_size, collapse, diversity)
+        });
         let peer_lists = fed.fanout.search_peers(&q, page_size).await;
         let out = local
             .await
@@ -122,7 +129,7 @@ async fn run_search(
             ..out
         });
     }
-    tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size, collapse))
+    tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size, collapse, diversity))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -133,18 +140,20 @@ async fn api_search(
     Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
     let collapse = want_collapse(&p);
+    let diversity = want_diversity(&p);
     let q = p.q.unwrap_or_default();
     let page = p.page.unwrap_or(0);
     if q.trim().is_empty() {
         return axum::Json(serde_json::json!({
-            "query": q, "page": page, "total": 0, "hits": [], "relaxed": false, "collapsed": 0
+            "query": q, "page": page, "total": 0, "hits": [], "relaxed": false,
+            "collapsed": 0, "host_capped": 0
         }))
         .into_response();
     }
-    match run_search(&api, q.clone(), page, p.federated, collapse).await {
+    match run_search(&api, q.clone(), page, p.federated, collapse, diversity).await {
         Ok(out) => axum::Json(serde_json::json!({
             "query": q, "page": page, "total": out.total, "hits": out.hits,
-            "relaxed": out.relaxed, "collapsed": out.collapsed
+            "relaxed": out.relaxed, "collapsed": out.collapsed, "host_capped": out.host_capped
         }))
         .into_response(),
         Err(e) => {
@@ -156,17 +165,33 @@ async fn api_search(
 
 async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl IntoResponse {
     let collapse = want_collapse(&p);
+    let diversity = want_diversity(&p);
     let q = p.q.unwrap_or_default();
     let page = p.page.unwrap_or(0);
     let mut results = String::new();
     if !q.trim().is_empty() {
-        match run_search(&api, q.clone(), page, p.federated, collapse).await {
+        match run_search(&api, q.clone(), page, p.federated, collapse, diversity).await {
             Ok(out) => {
                 let qe = crate::urlencode(&q);
                 let mut note = out.note();
+                let cx = if p.collapse == Some(0) {
+                    "&collapse=0"
+                } else {
+                    ""
+                };
+                let dx = if p.diversity == Some(0) {
+                    "&diversity=0"
+                } else {
+                    ""
+                };
                 if out.collapsed > 0 && collapse {
                     note.push_str(&format!(
-                        " · <a href=\"/?q={qe}&collapse=0\">show similar</a>"
+                        " · <a href=\"/?q={qe}&collapse=0{dx}\">show similar</a>"
+                    ));
+                }
+                if out.host_capped > 0 && diversity {
+                    note.push_str(&format!(
+                        " · <a href=\"/?q={qe}&diversity=0{cx}\">show all sites</a>"
                     ));
                 }
                 results.push_str(&format!(
@@ -191,20 +216,15 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
                             .replace("</b>", "</mark>"),
                     ));
                 }
-                let cx = if p.collapse == Some(0) {
-                    "&collapse=0"
-                } else {
-                    ""
-                };
                 if page > 0 {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}{cx}\">← prev</a> ",
+                        "<a href=\"/?q={qe}&page={}{cx}{dx}\">← prev</a> ",
                         page - 1
                     ));
                 }
                 if (page + 1) * api.page_size < out.total {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}{cx}\">next →</a>",
+                        "<a href=\"/?q={qe}&page={}{cx}{dx}\">next →</a>",
                         page + 1
                     ));
                 }

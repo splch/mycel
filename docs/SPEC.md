@@ -388,7 +388,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2).
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`).
 
 ## Verification (end-to-end, after M5)
 

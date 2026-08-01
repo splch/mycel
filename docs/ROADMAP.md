@@ -94,6 +94,10 @@ changing page staying at the base interval.
 
 ## Phase 3 — Host diversity at serve time
 
+**Status: shipped 2026-08-01** (`host_diversity_caps_per_page` unit test;
+goldens untouched — their corpus has distinct hosts; the qrels harness runs
+with diversity off by design, since IR evals score the raw ranking).
+
 **Best-practice basis.** Google's site-diversity system (generally ≤2 listings
 per site in top results). Mycel already collapses near-dups at serve time;
 the same pass can cap per-host repetition. With small corpora, one

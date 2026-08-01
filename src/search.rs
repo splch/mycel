@@ -17,6 +17,9 @@ use tantivy::{IndexReader, TantivyDocument, Term};
 const MAX_QUERY_CHARS: usize = 512;
 const MAX_PAGE: usize = 20;
 const SNIPPET_CHARS: usize = 200;
+/// Max hits per host on a result page (Google's site-diversity rule of
+/// thumb); extras are counted in Outcome::host_capped, never unindexed.
+const HOST_DIVERSITY_CAP: usize = 2;
 
 pub struct Searcher {
     reader: IndexReader,
@@ -47,6 +50,9 @@ pub struct Outcome {
     /// Hits hidden from this page as near-duplicates (simhash Hamming <=
     /// NEAR_DUP_RADIUS) of a better-ranked hit. Nothing leaves the index.
     pub collapsed: usize,
+    /// Hits hidden from this page because their host already has
+    /// HOST_DIVERSITY_CAP visible hits. Presentational only, like collapsed.
+    pub host_capped: usize,
 }
 
 impl Outcome {
@@ -59,6 +65,9 @@ impl Outcome {
         }
         if self.collapsed > 0 {
             s.push_str(&format!(" · {} similar omitted", self.collapsed));
+        }
+        if self.host_capped > 0 {
+            s.push_str(&format!(" · {} more from the same sites", self.host_capped));
         }
         s
     }
@@ -81,13 +90,15 @@ impl Searcher {
     }
 
     /// One page of results; see Outcome for the fields. `collapse` toggles
-    /// near-duplicate collapsing (the "show similar" escape hatch).
+    /// near-duplicate collapsing (the "show similar" escape hatch) and
+    /// `diversity` the per-host cap (the "show all sites" escape hatch).
     pub fn search(
         &self,
         raw: &str,
         page: usize,
         page_size: usize,
         collapse: bool,
+        diversity: bool,
     ) -> Result<Outcome> {
         let raw: String = raw.chars().take(MAX_QUERY_CHARS).collect();
         let page = page.min(MAX_PAGE);
@@ -164,14 +175,17 @@ impl Searcher {
 
             let mut kept: Vec<u64> = Vec::new();
             let mut collapsed = 0usize;
+            let mut host_capped = 0usize;
+            let mut host_counts: HashMap<String, usize> = HashMap::new();
             let mut sim_cols: HashMap<u32, Option<tantivy::fastfield::Column<u64>>> =
                 HashMap::new();
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
                 // Near-dup collapse: hide hits within the simhash radius of a
-                // better-ranked hit on this page (column cached per segment).
-                if collapse
-                    && let Some(sim) = sim_cols
+                // better-ranked visible hit on this page (column cached per
+                // segment).
+                let sim = if collapse {
+                    sim_cols
                         .entry(addr.segment_ord)
                         .or_insert_with(|| {
                             searcher
@@ -182,15 +196,16 @@ impl Searcher {
                         })
                         .as_ref()
                         .and_then(|c| c.first(addr.doc_id))
-                {
-                    if kept
+                } else {
+                    None
+                };
+                if let Some(sim) = sim
+                    && kept
                         .iter()
                         .any(|k| (k ^ sim).count_ones() <= NEAR_DUP_RADIUS)
-                    {
-                        collapsed += 1;
-                        continue;
-                    }
-                    kept.push(sim);
+                {
+                    collapsed += 1;
+                    continue;
                 }
                 let doc: TantivyDocument = searcher.doc(addr)?;
                 let text_of = |f: tantivy::schema::Field| {
@@ -199,6 +214,21 @@ impl Searcher {
                         .unwrap_or_default()
                         .to_string()
                 };
+                let host = text_of(self.fields.host);
+                // Host diversity: at most CAP hits per host per page. Extras
+                // are counted, and being hidden never suppresses a later hit
+                // as a near-duplicate.
+                if diversity {
+                    let n = host_counts.entry(host.clone()).or_insert(0);
+                    if *n >= HOST_DIVERSITY_CAP {
+                        host_capped += 1;
+                        continue;
+                    }
+                    *n += 1;
+                }
+                if let Some(sim) = sim {
+                    kept.push(sim);
+                }
                 let snippet = snippet_gen
                     .as_ref()
                     .map(|g| g.snippet_from_doc(&doc).to_html())
@@ -215,7 +245,7 @@ impl Searcher {
                     });
                 hits.push(Hit {
                     url: text_of(self.fields.url),
-                    host: text_of(self.fields.host),
+                    host,
                     title: text_of(self.fields.title),
                     snippet,
                     score,
@@ -231,6 +261,7 @@ impl Searcher {
                 hits,
                 relaxed: false,
                 collapsed,
+                host_capped,
             })
         };
 
@@ -334,7 +365,7 @@ mod tests {
 
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
-        let out = s.search("mycelium networks", 0, 10, true).unwrap();
+        let out = s.search("mycelium networks", 0, 10, true, true).unwrap();
         assert!(!out.relaxed);
         assert_eq!(out.total, 2);
         // c.com has the longer body (slightly lower BM25) but the centrality
@@ -350,12 +381,12 @@ mod tests {
 
         // zero-results fallback: no doc has both terms, so the disjunctive
         // pass returns the partial matches
-        let out = s.search("mycelium pasta", 0, 10, true).unwrap();
+        let out = s.search("mycelium pasta", 0, 10, true, true).unwrap();
         assert!(out.relaxed);
         assert_eq!(out.total, 3);
 
         // site: filter
-        let out = s.search("mycelium site:a.com", 0, 10, true).unwrap();
+        let out = s.search("mycelium site:a.com", 0, 10, true, true).unwrap();
         assert!(!out.relaxed);
         assert_eq!(out.total, 1);
         assert_eq!(out.hits[0].host, "a.com");
@@ -387,28 +418,30 @@ mod tests {
         s.reader.reload().unwrap();
 
         // no doc has all three terms: AND misses, OR ranks the 2-term doc first
-        let out = s.search("alpha beta gamma", 0, 10, true).unwrap();
+        let out = s.search("alpha beta gamma", 0, 10, true, true).unwrap();
         assert!(out.relaxed);
         assert_eq!(out.total, 2);
         assert_eq!(out.hits[0].url, "http://a.com/1");
 
         // single term: nothing to relax
-        let out = s.search("alpha", 0, 10, true).unwrap();
+        let out = s.search("alpha", 0, 10, true, true).unwrap();
         assert_eq!(out.total, 1);
         assert!(!out.relaxed);
 
         // conjunctive hit: no fallback
-        let out = s.search("alpha beta", 0, 10, true).unwrap();
+        let out = s.search("alpha beta", 0, 10, true, true).unwrap();
         assert_eq!(out.total, 1);
         assert!(!out.relaxed);
 
         // site: stays mandatory even when the text relaxes
-        let out = s.search("alpha beta site:b.com", 0, 10, true).unwrap();
+        let out = s
+            .search("alpha beta site:b.com", 0, 10, true, true)
+            .unwrap();
         assert_eq!(out.total, 0);
         assert!(out.relaxed);
 
         // nothing matches under either semantics
-        let out = s.search("delta epsilon", 0, 10, true).unwrap();
+        let out = s.search("delta epsilon", 0, 10, true, true).unwrap();
         assert_eq!(out.total, 0);
         assert!(out.relaxed);
     }
@@ -442,7 +475,7 @@ mod tests {
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
         let out = s
-            .search("shared reporting investigation", 0, 10, true)
+            .search("shared reporting investigation", 0, 10, true, true)
             .unwrap();
         // total counts matches before collapsing; the syndicated twin is
         // hidden, the near-miss (bakery vs cathedral) is NOT within radius
@@ -453,12 +486,63 @@ mod tests {
 
         // "show similar": collapse off -> every copy visible, nothing hidden
         let out = s
-            .search("shared reporting investigation", 0, 10, false)
+            .search("shared reporting investigation", 0, 10, false, true)
             .unwrap();
         assert_eq!(out.total, 3);
         assert_eq!(out.hits.len(), 3);
         assert_eq!(out.collapsed, 0);
     }
+    #[test]
+    fn host_diversity_caps_per_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        let mut w: tantivy::IndexWriter = index.writer(64 * 1024 * 1024).unwrap();
+        // 4 matching docs on one host, 2 on a second, 1 on a third; distinct
+        // paddings keep the near-dup collapse out of the way.
+        let docs = [
+            ("http://a.com/1", "a.com", "falcon"),
+            ("http://a.com/2", "a.com", "tundra"),
+            ("http://a.com/3", "a.com", "marble"),
+            ("http://a.com/4", "a.com", "zipper"),
+            ("http://b.com/1", "b.com", "candle"),
+            ("http://b.com/2", "b.com", "rocket"),
+            ("http://c.com/1", "c.com", "willow"),
+        ];
+        for (url, host, pad) in docs {
+            let body = format!("shared reporting investigation {pad} {pad} details follow here");
+            w.add_document(doc!(
+                f.url => url, f.host => host, f.title => "Report",
+                f.body => body.as_str(),
+                f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+                f.simhash => crate::extract::simhash64(&body),
+            ))
+            .unwrap();
+        }
+        w.commit().unwrap();
+        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        s.reader.reload().unwrap();
+
+        let out = s
+            .search("shared reporting investigation", 0, 10, true, true)
+            .unwrap();
+        assert_eq!(out.total, 7, "total counts matches before capping");
+        assert_eq!(out.hits.len(), 5, "2 + 2 + 1 visible");
+        assert_eq!(out.host_capped, 2);
+        let per_host = |host: &str| out.hits.iter().filter(|h| h.host == host).count();
+        assert_eq!(per_host("a.com"), 2);
+        assert_eq!(per_host("b.com"), 2);
+        assert_eq!(per_host("c.com"), 1);
+        assert!(out.note().contains("2 more from the same sites"));
+
+        // Escape hatch: diversity=0 shows everything, caps nothing.
+        let out = s
+            .search("shared reporting investigation", 0, 10, true, false)
+            .unwrap();
+        assert_eq!(out.hits.len(), 7);
+        assert_eq!(out.host_capped, 0);
+    }
+
     /// Deterministic corpus + queries; top-3 URLs snapshotted in
     /// tests/golden/queries.toml. Regenerate with UPDATE_GOLDENS=1 after an
     /// intentional ranking change and review the diff.
@@ -576,7 +660,7 @@ mod tests {
         let mut rendered =
             String::from("# generated by golden_queries; UPDATE_GOLDENS=1 to refresh\n");
         for q in queries {
-            let out = s.search(q, 0, 3, true).unwrap();
+            let out = s.search(q, 0, 3, true, true).unwrap();
             rendered.push_str(&format!(
                 "\n[[case]]\nquery = {q:?}\ntotal = {}\ntop = [",
                 out.total
@@ -897,7 +981,12 @@ mod tests {
             for url in case.grades.keys() {
                 assert!(corpus_urls.contains(url), "graded URL not in corpus: {url}");
             }
-            let out = s.search(&case.query, 0, 10, true).unwrap();
+            // Ranking eval, not presentation policy: near-dup collapse is
+            // harmless here (distinct bodies), but the per-host cap would
+            // hide graded docs on multi-doc hosts, so diversity is off
+            // (standard IR evals score the raw ranking). The cap has its
+            // own unit test below.
+            let out = s.search(&case.query, 0, 10, true, false).unwrap();
             let actual = dcg(out
                 .hits
                 .iter()

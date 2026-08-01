@@ -365,7 +365,7 @@ The daemon: crawler + indexer + HTTP API + federation server + shard sync,
 until Ctrl-C. Unlike `crawl` it keeps waiting when the frontier is idle and
 picks up recrawls as they come due.
 
-### `mycel search <query> [--json] [--federated]`
+### `mycel search <query> [--json] [--federated] [--no-diversity]`
 
 One-shot query. All non-flag arguments are joined into the query string
 (quote phrases at the shell: `mycel search '"exact phrase"'`).
@@ -378,6 +378,9 @@ One-shot query. All non-flag arguments are joined into the query string
   fan-out needs the node's live network endpoint). Fails with
   `federated search needs the daemon; start 'mycel run' first` when the
   daemon is down.
+- `--no-diversity`: show every hit from every host (default caps each host
+  at two hits per page and reports the remainder as "more from the same
+  sites").
 
 ### `mycel status [--json]`
 
@@ -500,7 +503,7 @@ reverse-proxied service. All responses are JSON except `/` and `/admin`.
 Server-rendered HTML search UI with pagination. Accepts the same `q`,
 `page`, and `federated` parameters as the API.
 
-### `GET /api/search?q=<query>[&page=N][&federated=0|1][&collapse=0|1]`
+### `GET /api/search?q=<query>[&page=N][&federated=0|1][&collapse=0|1][&diversity=0|1]`
 
 ```json
 {
@@ -525,6 +528,8 @@ Server-rendered HTML search UI with pagination. Accepts the same `q`,
 - `relaxed` is true when the all-terms query matched nothing and the hits are partial matches from the any-terms retry. `site:` filters stay mandatory under the fallback.
 - `collapsed` counts hits hidden from this page as near-duplicates (simhash Hamming ≤ 3) of a better-ranked hit. Collapsing is presentational only; `total` is the exact match count **before** collapsing.
 - `collapse` defaults to 1. `collapse=0` returns the full page with nothing hidden — the "show similar" escape hatch the web UI links next to the omitted count.
+- `host_capped` counts hits hidden from this page because their host already had two visible hits (site diversity). Presentational only, like `collapsed`; `total` counts matches before both.
+- `diversity` defaults to 1. `diversity=0` lifts the per-host cap — the "show all sites" escape hatch the web UI links next to the capped count.
 - `page` defaults to 0.
 - `federated` defaults to the config (`federation.fanout` when federation is
   enabled, otherwise off). `federated=1` forces fan-out, `federated=0` forces

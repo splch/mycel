@@ -236,7 +236,8 @@ async fn query_stream(
     let limit = usize::from(req.limit).clamp(1, proto::MAX_RESULTS_PER_PEER);
     let searcher = state.searcher.clone();
     let q = req.query.clone();
-    let reply = match tokio::task::spawn_blocking(move || searcher.search(&q, 0, limit, true)).await
+    let reply = match tokio::task::spawn_blocking(move || searcher.search(&q, 0, limit, true, true))
+        .await
     {
         Ok(Ok(out)) => Reply::Ok(proto::QueryOk {
             hits: out

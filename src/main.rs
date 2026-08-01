@@ -30,7 +30,7 @@ Commands:
   id                         print this node's endpoint id (paste into peers' configs)
   run                        daemon: crawler + indexer + API + sync
   crawl [--limit N]          crawl + index only
-  search <q> [--json] [--federated]
+  search <q> [--json] [--federated] [--no-diversity]
                              one-shot query
   bootstrap --hosts F [--records F]
                              seed centrality + activate hosts; fetch Common Crawl records
@@ -582,6 +582,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
 fn cmd_search(rest: &[String]) -> Result<()> {
     let json = rest.iter().any(|a| a == "--json");
     let federated = rest.iter().any(|a| a == "--federated");
+    let diversity = !rest.iter().any(|a| a == "--no-diversity");
     let q: Vec<&str> = rest
         .iter()
         .filter(|a| !a.starts_with("--"))
@@ -599,9 +600,10 @@ fn cmd_search(rest: &[String]) -> Result<()> {
             .build()?;
         return rt.block_on(async move {
             let url = format!(
-                "http://{}/api/search?federated=1&q={}",
+                "http://{}/api/search?federated=1&q={}{}",
                 cfg.api.bind,
-                urlencode(&q)
+                urlencode(&q),
+                if diversity { "" } else { "&diversity=0" }
             );
             let resp = reqwest::get(&url)
                 .await
@@ -626,13 +628,14 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         });
     }
     let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
-    let out = searcher.search(&q, 0, cfg.api.page_size, true)?;
+    let out = searcher.search(&q, 0, cfg.api.page_size, true, diversity)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "query": q, "total": out.total, "hits": out.hits,
-                "relaxed": out.relaxed, "collapsed": out.collapsed
+                "relaxed": out.relaxed, "collapsed": out.collapsed,
+                "host_capped": out.host_capped
             }))?
         );
     } else if out.hits.is_empty() {
