@@ -61,6 +61,19 @@ impl Record {
     }
 }
 
+/// Pull one header value out of a raw HTTP head block (case-insensitive).
+pub fn http_header_value(head: &[u8], name: &str) -> Option<String> {
+    for line in head.split(|&b| b == b'\n') {
+        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    None
+}
+
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }

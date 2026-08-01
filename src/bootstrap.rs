@@ -122,7 +122,9 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
     if !(200..300).contains(&status) {
         return None;
     }
-    let content_type = header_value_str(head, "content-type").unwrap_or_default();
+    let content_type = warc::http_header_value(head, "content-type")
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
     if !content_type.is_empty()
         && !content_type.contains("text/html")
         && !content_type.contains("application/xhtml+xml")
@@ -144,18 +146,6 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
         extract: analysis.extract,
         links: analysis.meta.links,
     })
-}
-
-fn header_value_str(head: &[u8], name: &str) -> Option<String> {
-    for line in head.split(|&b| b == b'\n') {
-        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case(name)
-        {
-            return Some(v.trim().to_ascii_lowercase());
-        }
-    }
-    None
 }
 
 /// `mycel ingest`: stream local .warc/.warc.gz files through the pipeline.

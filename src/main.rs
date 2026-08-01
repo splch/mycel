@@ -755,45 +755,34 @@ fn cmd_status(rest: &[String]) -> Result<()> {
     let json = rest.iter().any(|a| a == "--json");
     let (_cfg, data) = load_env()?;
     let conn = db::open(&data.join("mycel.sqlite"))?;
-
-    let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
-    let hosts_active = count("SELECT count(*) FROM hosts WHERE state = 1")?;
-    let hosts_candidate = count("SELECT count(*) FROM hosts WHERE state = 0")?;
-    let queued = count("SELECT count(*) FROM frontier WHERE state = 0")?;
-    let in_flight = count("SELECT count(*) FROM frontier WHERE state = 1")?;
-    let failed = count("SELECT count(*) FROM frontier WHERE state = 2")?;
-    let docs = count("SELECT count(*) FROM docs")?;
-    let docs_pending = count("SELECT count(*) FROM docs WHERE indexed = 0")?;
-    let docs_indexed = count("SELECT count(*) FROM docs WHERE indexed = 1")?;
-    let shards = count("SELECT count(*) FROM shards")?;
-    let warc_bytes = count("SELECT COALESCE(sum(bytes), 0) FROM shards")?;
-    let edges = count("SELECT count(*) FROM links")?;
-
-    let mut counters = std::collections::BTreeMap::new();
-    let mut stmt = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'ctr_%'")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (k, v) = row?;
-        counters.insert(k, v);
-    }
+    let s = db::status_counts(&conn);
 
     if json {
         let obj = serde_json::json!({
-            "hosts": { "active": hosts_active, "candidate": hosts_candidate },
-            "frontier": { "queued": queued, "in_flight": in_flight, "failed_permanent": failed },
-            "docs": { "total": docs, "pending": docs_pending, "indexed": docs_indexed },
-            "webgraph_edges": edges,
-            "shards": { "count": shards, "warc_bytes": warc_bytes },
-            "counters": counters,
+            "hosts": { "active": s.hosts_active, "candidate": s.hosts_candidate },
+            "frontier": { "queued": s.queued, "in_flight": s.in_flight, "failed_permanent": s.failed },
+            "docs": { "total": s.docs_total, "pending": s.docs_pending, "indexed": s.docs_indexed },
+            "webgraph_edges": s.edges,
+            "shards": { "count": s.shards, "warc_bytes": s.warc_bytes },
+            "counters": s.counters,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
-        println!("hosts     active {hosts_active}, candidate {hosts_candidate}");
-        println!("frontier  queued {queued}, in-flight {in_flight}, failed {failed}");
-        println!("docs      {docs} total, {docs_pending} pending, {docs_indexed} indexed");
-        println!("webgraph  {edges} host edges");
-        println!("warc      {shards} shards, {warc_bytes} bytes");
-        for (k, v) in counters {
+        println!(
+            "hosts     active {}, candidate {}",
+            s.hosts_active, s.hosts_candidate
+        );
+        println!(
+            "frontier  queued {}, in-flight {}, failed {}",
+            s.queued, s.in_flight, s.failed
+        );
+        println!(
+            "docs      {} total, {} pending, {} indexed",
+            s.docs_total, s.docs_pending, s.docs_indexed
+        );
+        println!("webgraph  {} host edges", s.edges);
+        println!("warc      {} shards, {} bytes", s.shards, s.warc_bytes);
+        for (k, v) in s.counters {
             println!("{:9} {v}", k.trim_start_matches("ctr_"));
         }
     }

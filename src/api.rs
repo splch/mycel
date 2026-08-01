@@ -373,28 +373,22 @@ fn serve_stale_or_error(cached: Option<Snapshot>, why: &'static str) -> axum::re
 }
 
 fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value {
-    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    let s = db::status_counts(conn);
     serde_json::json!({
-        "hosts": {
-            "active": count("SELECT count(*) FROM hosts WHERE state = 1"),
-            "candidate": count("SELECT count(*) FROM hosts WHERE state = 0"),
-        },
+        "hosts": { "active": s.hosts_active, "candidate": s.hosts_candidate },
         "frontier": {
-            "queued": count("SELECT count(*) FROM frontier WHERE state = 0"),
-            "in_flight": count("SELECT count(*) FROM frontier WHERE state = 1"),
-            "failed_permanent": count("SELECT count(*) FROM frontier WHERE state = 2"),
+            "queued": s.queued,
+            "in_flight": s.in_flight,
+            "failed_permanent": s.failed,
         },
         "docs": {
-            "total": count("SELECT count(*) FROM docs"),
-            "pending": count("SELECT count(*) FROM docs WHERE indexed = 0"),
-            "indexed": count("SELECT count(*) FROM docs WHERE indexed = 1"),
-            "skipped": count("SELECT count(*) FROM docs WHERE indexed = 2"),
+            "total": s.docs_total,
+            "pending": s.docs_pending,
+            "indexed": s.docs_indexed,
+            "skipped": s.docs_skipped,
         },
-        "webgraph_edges": count("SELECT count(*) FROM links"),
-        "shards": {
-            "count": count("SELECT count(*) FROM shards"),
-            "warc_bytes": count("SELECT COALESCE(sum(bytes),0) FROM shards"),
-        },
+        "webgraph_edges": s.edges,
+        "shards": { "count": s.shards, "warc_bytes": s.warc_bytes },
         "index_docs": index_docs,
     })
 }

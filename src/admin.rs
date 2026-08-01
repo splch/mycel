@@ -133,6 +133,22 @@ fn redirect_err(e: &str) -> Response {
     Redirect::to(&format!("/admin?err={}", crate::urlencode(e))).into_response()
 }
 
+/// Claim the single job slot and run `work` on it; the page redirects at
+/// once and the result appears on refresh.
+fn spawn_job<F>(api: &Arc<Api>, kind: &'static str, started: &'static str, work: F) -> Response
+where
+    F: std::future::Future<Output = Result<String>> + Send + 'static,
+{
+    if let Err(e) = api.admin.start_job(kind) {
+        return redirect_err(&e);
+    }
+    let admin = api.admin.clone();
+    tokio::spawn(async move {
+        admin.finish_job(work.await.map_err(|e| e.to_string()));
+    });
+    redirect_msg(started)
+}
+
 // ---------------------------------------------------------------- handlers --
 
 #[derive(Deserialize)]
@@ -226,34 +242,27 @@ pub async fn rank_job(
     if let Some(deny) = api.admin.deny(&headers, &f.t) {
         return deny;
     }
-    if let Err(e) = api.admin.start_job("rank") {
-        return redirect_err(&e);
-    }
     let admin = api.admin.clone();
     let force = f.force.is_some();
-    tokio::spawn(async move {
+    spawn_job(&api, "rank", "rank started", async move {
         let db_path = admin.data_dir.join("mycel.sqlite");
         let exact_max = admin.cfg.rank.exact_bfs_max_hosts;
-        let res = tokio::task::spawn_blocking(move || -> Result<rank::RankOutcome> {
+        let o = tokio::task::spawn_blocking(move || -> Result<rank::RankOutcome> {
             let mut conn = db::open(&db_path)?;
             rank::run(&mut conn, exact_max, force)
         })
-        .await;
-        admin.finish_job(match res {
-            Ok(Ok(o)) => Ok(format!(
-                "ranked {} hosts ({}); new values apply to docs on recrawl or `mycel reindex`",
-                o.hosts_ranked,
-                if o.exact {
-                    "exact BFS"
-                } else {
-                    "HyperBall approx"
-                }
-            )),
-            Ok(Err(e)) => Err(e.to_string()),
-            Err(e) => Err(format!("rank task panicked: {e}")),
-        });
-    });
-    redirect_msg("rank started")
+        .await
+        .map_err(|e| format!("rank task panicked: {e}"))??;
+        Ok(format!(
+            "ranked {} hosts ({}); new values apply to docs on recrawl or `mycel reindex`",
+            o.hosts_ranked,
+            if o.exact {
+                "exact BFS"
+            } else {
+                "HyperBall approx"
+            }
+        ))
+    })
 }
 
 #[derive(Deserialize)]
@@ -282,21 +291,12 @@ pub async fn ingest_job(
     if paths.is_empty() {
         return redirect_err("no paths given; one .warc/.warc.gz file or directory per line");
     }
-    if let Err(e) = api.admin.start_job("ingest") {
-        return redirect_err(&e);
-    }
     let (dbh, admin) = (api.db.clone(), api.admin.clone());
-    tokio::spawn(async move {
-        let res = bootstrap::ingest_paths(&dbh, &paths).await;
-        admin.finish_job(match res {
-            Ok((seen, ingested)) => {
-                let _ = admin.index_tx.send(IndexMsg::Sweep);
-                Ok(format!("ingest: {ingested}/{seen} records ingested"))
-            }
-            Err(e) => Err(e.to_string()),
-        });
-    });
-    redirect_msg("ingest started")
+    spawn_job(&api, "ingest", "ingest started", async move {
+        let (seen, ingested) = bootstrap::ingest_paths(&dbh, &paths).await?;
+        let _ = admin.index_tx.send(IndexMsg::Sweep);
+        Ok(format!("ingest: {ingested}/{seen} records ingested"))
+    })
 }
 
 #[derive(Deserialize)]
@@ -320,12 +320,12 @@ pub async fn bootstrap_job(
     if hosts.is_none() && records.is_none() {
         return redirect_err("give a hosts.csv and/or records.csv path on this machine");
     }
-    if let Err(e) = api.admin.start_job("bootstrap") {
-        return redirect_err(&e);
-    }
     let (dbh, admin) = (api.db.clone(), api.admin.clone());
-    tokio::spawn(async move {
-        let res: Result<String> = async {
+    spawn_job(
+        &api,
+        "bootstrap",
+        "bootstrap started (progress logs on stderr)",
+        async move {
             let mut out = Vec::new();
             if let Some(h) = hosts {
                 let db_path = admin.data_dir.join("mycel.sqlite");
@@ -356,11 +356,8 @@ pub async fn bootstrap_job(
                 out.push(format!("{done} records ingested, {failed} failed"));
             }
             Ok(out.join("; "))
-        }
-        .await;
-        admin.finish_job(res.map_err(|e| e.to_string()));
-    });
-    redirect_msg("bootstrap started (progress logs on stderr)")
+        },
+    )
 }
 
 /// = `mycel peers check`, through the daemon's live endpoint.
@@ -481,23 +478,17 @@ async fn render(
     // Same gauges as `mycel status` and /stats.
     let status = {
         let conn = api.stats_conn.lock().await;
-        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+        let s = db::status_counts(&conn);
         let meta = |key: &str| -> Option<String> {
             conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
                 .ok()
         };
-        let counters = {
-            let mut out = Vec::new();
-            if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'ctr_%'")
-                && let Ok(rows) =
-                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            {
-                for (k, v) in rows.flatten() {
-                    out.push(format!("{} {v}", k.trim_start_matches("ctr_")));
-                }
-            }
-            out.join(", ")
-        };
+        let counters = s
+            .counters
+            .iter()
+            .map(|(k, v)| format!("{} {v}", k.trim_start_matches("ctr_")))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "<dl><dt>hosts<dd>active {}, candidate {}\
              <dt>frontier<dd>queued {}, in-flight {}, failed {}\
@@ -508,18 +499,18 @@ async fn render(
              <dt>counters<dd>{}\
              <dt>last rank<dd>{}</dl>\
              <p><small>counters flush every 60 s; <a href=/admin>refresh</a></small>",
-            count("SELECT count(*) FROM hosts WHERE state = 1"),
-            count("SELECT count(*) FROM hosts WHERE state = 0"),
-            count("SELECT count(*) FROM frontier WHERE state = 0"),
-            count("SELECT count(*) FROM frontier WHERE state = 1"),
-            count("SELECT count(*) FROM frontier WHERE state = 2"),
-            count("SELECT count(*) FROM docs"),
-            count("SELECT count(*) FROM docs WHERE indexed = 0"),
-            count("SELECT count(*) FROM docs WHERE indexed = 1"),
-            count("SELECT count(*) FROM docs WHERE indexed = 2"),
-            count("SELECT count(*) FROM links"),
-            count("SELECT count(*) FROM shards"),
-            count("SELECT COALESCE(sum(bytes), 0) FROM shards"),
+            s.hosts_active,
+            s.hosts_candidate,
+            s.queued,
+            s.in_flight,
+            s.failed,
+            s.docs_total,
+            s.docs_pending,
+            s.docs_indexed,
+            s.docs_skipped,
+            s.edges,
+            s.shards,
+            s.warc_bytes,
             api.searcher.num_docs(),
             html_escape(&counters),
             meta("last_rank_at")

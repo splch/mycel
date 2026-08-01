@@ -1152,9 +1152,141 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     Ok(())
 }
 
-/// Bootstrap/ingest path: append the member verbatim, register the doc (newest
-/// WARC-Date wins), harvest links into the webgraph/frontier, forward to the
-/// indexer. Skips identical re-ingests entirely (no duplicate WARC copy).
+/// One fetched/ingested page's worth of state to persist: everything the
+/// crawl Stored outcome and the bootstrap/ingest path share.
+struct StoreDoc<'a> {
+    url: &'a str,
+    host_id: i64,
+    shard_id: i64,
+    offset: i64,
+    len: i64,
+    http_status: u16,
+    fetched_at: i64,
+    payload_len: u64,
+    sha256: &'a [u8; 32],
+    noindex: bool,
+    extract: &'a Option<crate::extract::Extracted>,
+    links: &'a [(String, String, String)],
+    link_depth: i64,
+    /// Ingest: an existing newer docs row wins (WARC-Date ordering). Crawl:
+    /// this fetch is by definition the newest, so overwrite unconditionally.
+    guard_fetched_at: bool,
+}
+
+/// Upsert the docs row, harvest links into webgraph/frontier/anchors, forward
+/// index-eligible docs to the indexer, bump storage counters.
+fn store_doc(
+    tx: &Transaction,
+    cfg: &DbCfg,
+    counters: &mut HashMap<&'static str, i64>,
+    index_tx: Option<&std::sync::mpsc::Sender<IndexMsg>>,
+    d: &StoreDoc,
+) -> Result<()> {
+    // Index-eligibility gates that need no tantivy state; dedup gates
+    // (sha/simhash) live in the indexer.
+    let (indexed, skip): (i64, Option<&str>) = if d.noindex {
+        (2, Some("noindex"))
+    } else {
+        match d.extract {
+            None => (2, Some("empty")),
+            Some(ex) if !cfg.languages.iter().any(|l| l == ex.lang) => (2, Some("lang")),
+            Some(_) => (0, None),
+        }
+    };
+    let (title, lang, simhash) = match d.extract {
+        Some(ex) => (
+            Some(ex.title.as_str()),
+            Some(ex.lang),
+            Some(ex.simhash as i64),
+        ),
+        None => (None, None, None),
+    };
+    let sql = if d.guard_fetched_at {
+        "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                           fetched_at, indexed, skip_reason, title, lang, simhash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(url) DO UPDATE SET
+           host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
+           len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
+           fetched_at=excluded.fetched_at, indexed=excluded.indexed,
+           skip_reason=excluded.skip_reason, simhash=excluded.simhash,
+           lang=excluded.lang, title=excluded.title
+         WHERE excluded.fetched_at >= docs.fetched_at"
+    } else {
+        "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                           fetched_at, indexed, skip_reason, title, lang, simhash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         ON CONFLICT(url) DO UPDATE SET
+           host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
+           len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
+           fetched_at=excluded.fetched_at, indexed=excluded.indexed,
+           skip_reason=excluded.skip_reason, simhash=excluded.simhash,
+           lang=excluded.lang, title=excluded.title"
+    };
+    tx.prepare_cached(sql)?.execute(params![
+        d.url,
+        d.host_id,
+        d.shard_id,
+        d.offset,
+        d.len,
+        &d.sha256[..],
+        d.http_status as i64,
+        d.fetched_at,
+        indexed,
+        skip,
+        title,
+        lang,
+        simhash
+    ])?;
+    for (url, host, anchor) in d.links {
+        enqueue(
+            tx,
+            cfg,
+            d.fetched_at,
+            Some(d.host_id),
+            url,
+            host,
+            0,
+            d.link_depth,
+            0,
+        )?;
+        record_anchor(tx, d.url, url, anchor)?;
+    }
+    if indexed == 0
+        && let (Some(itx), Some(ex)) = (index_tx, d.extract)
+    {
+        let doc_id: i64 = tx
+            .prepare_cached("SELECT id FROM docs WHERE url = ?1")?
+            .query_row([d.url], |row| row.get(0))?;
+        let (host, centrality): (String, f64) = tx
+            .prepare_cached("SELECT host, centrality FROM hosts WHERE id = ?1")?
+            .query_row([d.host_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let _ = itx.send(IndexMsg::Add(Box::new(IndexDoc {
+            doc_id,
+            url: d.url.to_string(),
+            host,
+            title: ex.title.clone(),
+            body: ex.text.clone(),
+            lang: ex.lang.to_string(),
+            fetched_at: d.fetched_at,
+            centrality,
+            simhash: ex.simhash,
+            sha256: d.sha256.to_vec(),
+            anchors: anchors_for(tx, d.url)?,
+        })));
+    }
+    *counters.entry("docs_stored").or_insert(0) += 1;
+    *counters.entry("bytes_fetched").or_insert(0) += d.payload_len as i64;
+    Ok(())
+}
+
+/// One counter increment (kept as a fn, not a closure, so `counters` can be
+/// reborrowed by store_doc within the same match arm).
+fn bump(counters: &mut HashMap<&'static str, i64>, name: &'static str, delta: i64) {
+    *counters.entry(name).or_insert(0) += delta;
+}
+
+/// Bootstrap/ingest path: dedup prechecks + host row, then `store_doc`.
 fn handle_ingest(
     tx: &Transaction,
     ws: &mut WarcState,
@@ -1201,80 +1333,28 @@ fn handle_ingest(
         } => (*shard_id, *offset, *len),
     };
 
-    let (indexed, skip): (i64, Option<&str>) = if r.noindex {
-        (2, Some("noindex"))
-    } else {
-        match &r.extract {
-            None => (2, Some("empty")),
-            Some(ex) if !cfg.languages.iter().any(|l| l == ex.lang) => (2, Some("lang")),
-            Some(_) => (0, None),
-        }
-    };
-    let (title, lang, simhash) = match &r.extract {
-        Some(ex) => (
-            Some(ex.title.as_str()),
-            Some(ex.lang),
-            Some(ex.simhash as i64),
-        ),
-        None => (None, None, None),
-    };
-    tx.prepare_cached(
-        "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
-                           fetched_at, indexed, skip_reason, title, lang, simhash)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-         ON CONFLICT(url) DO UPDATE SET
-           host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
-           len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
-           fetched_at=excluded.fetched_at, indexed=excluded.indexed,
-           skip_reason=excluded.skip_reason, simhash=excluded.simhash,
-           lang=excluded.lang, title=excluded.title
-         WHERE excluded.fetched_at >= docs.fetched_at",
-    )?
-    .execute(params![
-        r.url,
-        host_id,
-        shard_id,
-        offset,
-        len,
-        &r.sha256[..],
-        r.http_status as i64,
-        r.fetched_at,
-        indexed,
-        skip,
-        title,
-        lang,
-        simhash
-    ])?;
-    for (url, host, anchor) in &r.links {
-        enqueue(tx, cfg, r.fetched_at, Some(host_id), url, host, 0, 1, 0)?;
-        record_anchor(tx, &r.url, url, anchor)?;
-    }
-    if indexed == 0
-        && let (Some(itx), Some(ex)) = (index_tx, &r.extract)
-    {
-        let doc_id: i64 = tx
-            .prepare_cached("SELECT id FROM docs WHERE url = ?1")?
-            .query_row([&r.url], |row| row.get(0))?;
-        let centrality: f64 = tx
-            .prepare_cached("SELECT centrality FROM hosts WHERE id = ?1")?
-            .query_row([host_id], |row| row.get(0))?;
-        let _ = itx.send(IndexMsg::Add(Box::new(IndexDoc {
-            doc_id,
-            url: r.url.clone(),
-            host: r.host.clone(),
-            title: ex.title.clone(),
-            body: ex.text.clone(),
-            lang: ex.lang.to_string(),
+    store_doc(
+        tx,
+        cfg,
+        counters,
+        index_tx,
+        &StoreDoc {
+            url: &r.url,
+            host_id,
+            shard_id,
+            offset,
+            len,
+            http_status: r.http_status,
             fetched_at: r.fetched_at,
-            centrality,
-            simhash: ex.simhash,
-            sha256: r.sha256.to_vec(),
-            anchors: anchors_for(tx, &r.url)?,
-        })));
-    }
-    *counters.entry("docs_stored").or_insert(0) += 1;
-    *counters.entry("bytes_fetched").or_insert(0) += r.payload_len as i64;
-    Ok(())
+            payload_len: r.payload_len,
+            sha256: &r.sha256,
+            noindex: r.noindex,
+            extract: &r.extract,
+            links: &r.links,
+            link_depth: 1,
+            guard_fetched_at: true,
+        },
+    )
 }
 
 fn handle_complete(
@@ -1286,89 +1366,36 @@ fn handle_complete(
     c: &Completion,
 ) -> Result<()> {
     let now = c.now_ms / 1000;
-    let mut bump = |name: &'static str, delta: i64| *counters.entry(name).or_insert(0) += delta;
     let mut success = true;
     match &c.outcome {
         Outcome::Stored(p) => {
             let (offset, len) = ws.shard.append_member(&p.member)?;
             ws.dirty = true;
-            // Index-eligibility gates that need no tantivy state; dedup gates
-            // (sha/simhash) live in the indexer.
-            let (indexed, skip): (i64, Option<&str>) = if p.noindex {
-                (2, Some("noindex"))
-            } else {
-                match &p.extract {
-                    None => (2, Some("empty")),
-                    Some(ex) if !cfg.languages.iter().any(|l| l == ex.lang) => (2, Some("lang")),
-                    Some(_) => (0, None),
-                }
-            };
-            let (title, lang, simhash) = match &p.extract {
-                Some(ex) => (
-                    Some(ex.title.as_str()),
-                    Some(ex.lang),
-                    Some(ex.simhash as i64),
-                ),
-                None => (None, None, None),
-            };
-            tx.prepare_cached(
-                "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
-                                   fetched_at, indexed, skip_reason, title, lang, simhash)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-                 ON CONFLICT(url) DO UPDATE SET
-                   host_id=excluded.host_id, shard_id=excluded.shard_id, offset=excluded.offset,
-                   len=excluded.len, sha256=excluded.sha256, http_status=excluded.http_status,
-                   fetched_at=excluded.fetched_at, indexed=excluded.indexed,
-                   skip_reason=excluded.skip_reason, simhash=excluded.simhash,
-                   lang=excluded.lang, title=excluded.title",
-            )?
-            .execute(params![
-                p.final_url,
-                c.host_id,
-                ws.shard_db_id,
-                offset as i64,
-                len as i64,
-                &p.sha256[..],
-                p.http_status as i64,
-                now,
-                indexed,
-                skip,
-                title,
-                lang,
-                simhash
-            ])?;
-            if indexed == 0
-                && let (Some(itx), Some(ex)) = (index_tx, &p.extract)
-            {
-                let doc_id: i64 = tx
-                    .prepare_cached("SELECT id FROM docs WHERE url = ?1")?
-                    .query_row([&p.final_url], |r| r.get(0))?;
-                let (host, centrality): (String, f64) = tx
-                    .prepare_cached("SELECT host, centrality FROM hosts WHERE id = ?1")?
-                    .query_row([c.host_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                let _ = itx.send(IndexMsg::Add(Box::new(IndexDoc {
-                    doc_id,
-                    url: p.final_url.clone(),
-                    host,
-                    title: ex.title.clone(),
-                    body: ex.text.clone(),
-                    lang: ex.lang.to_string(),
+            store_doc(
+                tx,
+                cfg,
+                counters,
+                index_tx,
+                &StoreDoc {
+                    url: &p.final_url,
+                    host_id: c.host_id,
+                    shard_id: ws.shard_db_id,
+                    offset: offset as i64,
+                    len: len as i64,
+                    http_status: p.http_status,
                     fetched_at: now,
-                    centrality,
-                    simhash: ex.simhash,
-                    sha256: p.sha256.to_vec(),
-                    anchors: anchors_for(tx, &p.final_url)?,
-                })));
-            }
-            for (url, host, anchor) in &p.links {
-                enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1, 0)?;
-                record_anchor(tx, &p.final_url, url, anchor)?;
-            }
+                    payload_len: p.payload_len,
+                    sha256: &p.sha256,
+                    noindex: p.noindex,
+                    extract: &p.extract,
+                    links: &p.links,
+                    link_depth: c.depth + 1,
+                    guard_fetched_at: false,
+                },
+            )?;
             // Fresh content: the recrawl interval drops back to the base.
             requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, Some(0))?;
-            bump("fetch_ok", 1);
-            bump("docs_stored", 1);
-            bump("bytes_fetched", p.payload_len as i64);
+            bump(counters, "fetch_ok", 1);
         }
         Outcome::Unchanged => {
             tx.prepare_cached("UPDATE docs SET fetched_at = ?1 WHERE url = ?2")?
@@ -1384,7 +1411,7 @@ fn handle_complete(
                 true,
                 Some(streak),
             )?;
-            bump("fetch_ok", 1);
+            bump(counters, "fetch_ok", 1);
         }
         Outcome::Sitemap { pages, children } => {
             for (url, host, lastmod) in pages {
@@ -1398,7 +1425,7 @@ fn handle_complete(
                 enqueue(tx, cfg, now, None, url, host, 1, c.depth + 1, 0)?;
             }
             requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, None)?;
-            bump("fetch_ok", 1);
+            bump(counters, "fetch_ok", 1);
         }
         Outcome::CrossRedirect { target } => {
             if let Some((url, host)) = target {
@@ -1409,7 +1436,7 @@ fn handle_complete(
                 None => "redirect:invalid-target".into(),
             };
             fail_permanent(tx, c.frontier_id, &reason)?;
-            bump("fetch_ok", 1);
+            bump(counters, "fetch_ok", 1);
         }
         Outcome::Denied => {
             fail_permanent(tx, c.frontier_id, "robots")?;
@@ -1429,7 +1456,7 @@ fn handle_complete(
             tx.prepare_cached("UPDATE docs SET indexed = 2, skip_reason = 'error' WHERE url = ?1")?
                 .execute([&c.url])?;
             success = false;
-            bump("fetch_err", 1);
+            bump(counters, "fetch_err", 1);
         }
         Outcome::RetryAt { at, reason } => {
             tx.prepare_cached(
@@ -1439,6 +1466,7 @@ fn handle_complete(
             .execute(params![at, reason, c.frontier_id])?;
             success = false;
             bump(
+                counters,
                 if c.sticky_delay_ms.is_some() {
                     "fetch_429"
                 } else {
@@ -1637,6 +1665,54 @@ fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
         tracing::warn!("lease sweep requeued {n} stuck rows");
     }
     Ok(())
+}
+
+/// The gauges behind `mycel status`, /stats, and the admin page: one home
+/// for the SQL so the three consumers cannot drift apart. Leniency matches
+/// the old /stats behavior: a failed count reads -1 rather than failing the
+/// whole snapshot.
+pub struct StatusCounts {
+    pub hosts_active: i64,
+    pub hosts_candidate: i64,
+    pub queued: i64,
+    pub in_flight: i64,
+    pub failed: i64,
+    pub docs_total: i64,
+    pub docs_pending: i64,
+    pub docs_indexed: i64,
+    pub docs_skipped: i64,
+    pub edges: i64,
+    pub shards: i64,
+    pub warc_bytes: i64,
+    pub counters: std::collections::BTreeMap<String, String>,
+}
+
+pub fn status_counts(conn: &Connection) -> StatusCounts {
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    let mut counters = std::collections::BTreeMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'ctr_%'")
+        && let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    {
+        for (k, v) in rows.flatten() {
+            counters.insert(k, v);
+        }
+    }
+    StatusCounts {
+        hosts_active: count("SELECT count(*) FROM hosts WHERE state = 1"),
+        hosts_candidate: count("SELECT count(*) FROM hosts WHERE state = 0"),
+        queued: count("SELECT count(*) FROM frontier WHERE state = 0"),
+        in_flight: count("SELECT count(*) FROM frontier WHERE state = 1"),
+        failed: count("SELECT count(*) FROM frontier WHERE state = 2"),
+        docs_total: count("SELECT count(*) FROM docs"),
+        docs_pending: count("SELECT count(*) FROM docs WHERE indexed = 0"),
+        docs_indexed: count("SELECT count(*) FROM docs WHERE indexed = 1"),
+        docs_skipped: count("SELECT count(*) FROM docs WHERE indexed = 2"),
+        edges: count("SELECT count(*) FROM links"),
+        shards: count("SELECT count(*) FROM shards"),
+        warc_bytes: count("SELECT COALESCE(sum(bytes), 0) FROM shards"),
+        counters,
+    }
 }
 
 fn flush_counters(tx: &Transaction, counters: &HashMap<&'static str, i64>) -> Result<()> {

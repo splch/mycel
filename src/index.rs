@@ -100,6 +100,21 @@ pub fn fields(schema: &Schema) -> Fields {
     }
 }
 
+/// The one tantivy document shape (hot path and full rebuild).
+fn tantivy_doc(f: &Fields, d: &IndexDoc) -> tantivy::TantivyDocument {
+    doc!(
+        f.url => d.url.clone(),
+        f.host => d.host.clone(),
+        f.title => d.title.clone(),
+        f.body => d.body.clone(),
+        f.anchors => d.anchors.clone(),
+        f.lang => d.lang.clone(),
+        f.fetched_at => d.fetched_at.max(0) as u64,
+        f.centrality => d.centrality,
+        f.simhash => d.simhash,
+    )
+}
+
 /// Marker in the old-schema diagnostic below (stringly on purpose: tantivy's
 /// error carries no structured kind); `reindex` keys on `is_old_schema_err`.
 const OLD_SCHEMA_MARKER: &str = "schema changed";
@@ -248,17 +263,7 @@ impl Indexer {
         }
         self.writer
             .delete_term(Term::from_field_text(self.fields.url, &d.url));
-        let res = self.writer.add_document(doc!(
-            self.fields.url => d.url,
-            self.fields.host => d.host,
-            self.fields.title => d.title,
-            self.fields.body => d.body,
-            self.fields.anchors => d.anchors,
-            self.fields.lang => d.lang,
-            self.fields.fetched_at => d.fetched_at.max(0) as u64,
-            self.fields.centrality => d.centrality,
-            self.fields.simhash => d.simhash,
-        ));
+        let res = self.writer.add_document(tantivy_doc(&self.fields, &d));
         match res {
             Ok(_) => {
                 self.in_flight.insert(d.doc_id);
@@ -409,7 +414,7 @@ impl Indexer {
             self.mark(doc_id, 2, Some("error"));
             return;
         };
-        let content_type = header_value(head, "content-type");
+        let content_type = warc::http_header_value(head, "content-type");
         let html = extract::decode_html(payload, content_type.as_deref());
         let Some(ex) = extract::full(&url, &html) else {
             self.mark(doc_id, 2, Some("empty"));
@@ -505,7 +510,7 @@ pub fn rebuild(
             let rec = warc::read_member_from(shard_file, offset as u64, len as u64)
                 .map_err(|_| "error")?;
             let (_status, head, payload) = rec.http_parts().ok_or("error")?;
-            let content_type = header_value(head, "content-type");
+            let content_type = warc::http_header_value(head, "content-type");
             let html = extract::decode_html(payload, content_type.as_deref());
             let a = extract::analyze(&url, &html).ok_or("error")?;
             if a.meta.noindex {
@@ -518,16 +523,24 @@ pub fn rebuild(
             let anchors = db::anchors_for(conn, &url).map_err(|_| "error")?;
             use sha2::Digest;
             let sha = sha2::Sha256::digest(payload).to_vec();
-            if !seen_sha.insert(sha) {
+            if !seen_sha.insert(sha.clone()) {
                 return Err("dup-exact");
             }
+            let idoc = IndexDoc {
+                doc_id,
+                url: url.clone(),
+                host: host.clone(),
+                title: ex.title.clone(),
+                body: ex.text.clone(),
+                lang: ex.lang.to_string(),
+                fetched_at,
+                centrality,
+                simhash: ex.simhash,
+                sha256: sha,
+                anchors,
+            };
             writer
-                .add_document(doc!(
-                    f.url => url.clone(), f.host => host.clone(), f.title => ex.title.clone(),
-                    f.body => ex.text.clone(), f.anchors => anchors, f.lang => ex.lang,
-                    f.fetched_at => fetched_at.max(0) as u64, f.centrality => centrality,
-                    f.simhash => ex.simhash,
-                ))
+                .add_document(tantivy_doc(&f, &idoc))
                 .map_err(|_| "error")?;
             Ok(())
         });
@@ -557,19 +570,6 @@ pub fn rebuild(
     Ok((n_indexed, n_skipped))
 }
 
-/// Pull one header value out of a raw HTTP head block (case-insensitive).
-fn header_value(head: &[u8], name: &str) -> Option<String> {
-    for line in head.split(|&b| b == b'\n') {
-        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case(name)
-        {
-            return Some(v.trim().to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,9 +586,9 @@ mod tests {
     fn header_value_scan() {
         let head = b"HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\nx: y";
         assert_eq!(
-            header_value(head, "Content-Type").as_deref(),
+            warc::http_header_value(head, "Content-Type").as_deref(),
             Some("text/html; charset=utf-8")
         );
-        assert_eq!(header_value(head, "missing"), None);
+        assert_eq!(warc::http_header_value(head, "missing"), None);
     }
 }
