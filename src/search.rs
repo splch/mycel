@@ -168,9 +168,8 @@ impl Searcher {
                 HashMap::new();
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
-                // Serve-time near-dup collapse: hide hits within the simhash
-                // radius of a better-ranked hit on this page. Docs without a
-                // simhash never collapse; the column resolves once per segment.
+                // Near-dup collapse: hide hits within the simhash radius of a
+                // better-ranked hit on this page (column cached per segment).
                 if collapse
                     && let Some(sim) = sim_cols
                         .entry(addr.segment_ord)
@@ -205,8 +204,7 @@ impl Searcher {
                     .map(|g| g.snippet_from_doc(&doc).to_html())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| {
-                        // The body string is materialized only on this path
-                        // (the generator usually wins).
+                        // Body fetched only on this path; the generator usually wins.
                         let body = text_of(self.fields.body);
                         let mut it = body.chars();
                         let mut s: String = it.by_ref().take(SNIPPET_CHARS).collect();
@@ -236,12 +234,9 @@ impl Searcher {
             })
         };
 
-        // Conjunctive first (precision); on zero hits, retry disjunctive and
-        // let BM25 rank partial matches — the standard zero-results fallback
-        // (Lucene MSM, Algolia `allOptional`, Vespa weakAnd). site: filters
-        // never relax. (A trimmed-conjunction middle pass was benchmarked on
-        // TREC-COVID and REJECTED: nDCG@10 0.420 vs 0.439; see
-        // docs/BENCHMARKING.md.)
+        // Conjunctive first; on zero hits, retry disjunctive and let BM25
+        // rank partial matches. site: never relaxes. (A trimmed middle pass
+        // was rejected on TREC-COVID: docs/BENCHMARKING.md §10.)
         let mut out = run(build_text(true))?;
         // A lone term behaves identically under both semantics; skip the
         // fallback unless the query has several terms.

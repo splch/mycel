@@ -299,8 +299,8 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
     {
         return with_age(v, at.elapsed()).into_response();
     }
-    // try_lock, never block: if another (possibly wedged) refresh holds the
-    // connection, serve what we have instead of piling up behind it.
+    // try_lock, never block: if another refresh holds the connection,
+    // serve what we have.
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {

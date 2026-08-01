@@ -95,9 +95,8 @@ pub fn is_old_schema_err(e: &crate::Error) -> bool {
     e.to_string().contains(OLD_SCHEMA_MARKER)
 }
 
-/// Open the index at `dir`, creating it with our schema on first use. An
-/// old-schema index is not an error to paper over: say how to rebuild (the
-/// index is disposable; WARC + the catalog are the source of truth).
+/// Open the index at `dir`, creating it with our schema on first use.
+/// Old-schema indexes get a guided `mycel reindex` error.
 pub fn open_or_create(dir: &Path) -> Result<Index> {
     let mmap = tantivy::directory::MmapDirectory::open(dir)?;
     Index::open_or_create(mmap, schema()).map_err(|e| {

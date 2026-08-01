@@ -10,10 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-peer circuit breaker (resilience4j / Envoy outlier-ejection style):
-/// BREAKER_TRIP consecutive failures open it; while open the peer is skipped
-/// outright; the first query after the cooldown is the half-open probe.
-/// Cooldown doubles per consecutive trip, capped.
+/// Per-peer circuit breaker: BREAKER_TRIP consecutive failures open it and
+/// the peer is skipped; the first query after the cooldown is the half-open
+/// probe. Cooldown doubles per trip, capped.
 const BREAKER_TRIP: u32 = 5;
 const BREAKER_BASE_COOLDOWN: Duration = Duration::from_secs(30);
 const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(3600);

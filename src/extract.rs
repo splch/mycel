@@ -120,8 +120,7 @@ const READABILITY_MAX_BYTES: usize = 512 * 1024;
 
 /// Main-content extraction: dom_smoothie Readability first, scraper fallback
 /// (title tag + whole-body text). None = no usable title and not enough text.
-/// Thin-but-titled pages (paywalled, JS shells) ARE indexed: engines rank
-/// title-only pages rather than dropping them; BM25 scores them down.
+/// Thin-but-titled pages index; BM25 scores them down.
 pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     let (mut title, mut text) = if html.len() > READABILITY_MAX_BYTES {
         (String::new(), String::new())
