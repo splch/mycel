@@ -40,7 +40,7 @@ impl StatsCache {
     }
 }
 
-const STATS_TTL: Duration = Duration::from_secs(5);
+const STATS_TTL: Duration = Duration::from_secs(60);
 const STATS_MAX_STALE: Duration = Duration::from_secs(600);
 
 /// Federation context for the API: fan-out + peer checks.

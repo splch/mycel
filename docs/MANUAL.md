@@ -607,7 +607,7 @@ Gauges for monitoring:
 `index_docs` counts live documents in the tantivy reader; `docs.*` counts
 catalog rows. A field reads `-1` if its query failed. Every response
 carries `snapshot_age_secs`: the gauges are full-table scans, so they are
-served from a snapshot refreshed at most every 5 s, stale-while-revalidate
+served from a snapshot refreshed at most every 60 s, stale-while-revalidate
 style. If a refresh cannot run (or a previous one wedges), the last
 snapshot is served with its age — up to 10 minutes old, after which the
 endpoint answers 503 `stats degraded` rather than silently passing off old

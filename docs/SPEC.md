@@ -358,7 +358,7 @@ No parquet/duckdb/aws crates in the binary: subset selection is external, docume
 | Crash anywhere | watermark truncation + in_flight reset + reconciliation ⇒ worst case a few pages recrawled |
 | Backup | `sqlite3 .backup` + rsync `warc/`; the index is never backed up |
 
-Logging: tracing (fmt+env-filter); info = startup summary, 60s crawl summary, warns; per-fetch at debug. Counters in writer thread → meta every 60s (fetch ok/err/429, bytes, indexed, dup/lang skips, queries); `/stats` adds gauges (queue depths, hosts by state, shards, WARC bytes, index docs, last_rank_at) served as a bounded-staleness snapshot (5s TTL revalidate without lock-waiting, `snapshot_age_secs` on every response, 503 `stats degraded` past 10min).
+Logging: tracing (fmt+env-filter); info = startup summary, 60s crawl summary, warns; per-fetch at debug. Counters in writer thread → meta every 60s (fetch ok/err/429, bytes, indexed, dup/lang skips, queries); `/stats` adds gauges (queue depths, hosts by state, shards, WARC bytes, index docs, last_rank_at) served as a bounded-staleness snapshot (60s TTL revalidate without lock-waiting, `snapshot_age_secs` on every response, 503 `stats degraded` past 10min).
 
 ## 14. Testing & acceptance bar
 
