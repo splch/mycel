@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DDL_V1: &str = r#"
 CREATE TABLE hosts (
@@ -139,6 +139,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 2)?;
     }
+    if version < 3 {
+        // v3: inbound anchor text (a ranking signal). Append-only; deduped
+        // and concatenated at read time by anchors_for.
+        conn.execute_batch(
+            "CREATE TABLE anchor_text (
+               url  TEXT NOT NULL,               -- normalized link target
+               text TEXT NOT NULL                -- squashed anchor text, <=80 chars
+             );
+             CREATE INDEX anchor_text_url ON anchor_text (url);",
+        )?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
     Ok(())
 }
 
@@ -218,8 +230,8 @@ pub struct StoredPage {
     pub payload_len: u64,
     pub sha256: [u8; 32],
     pub noindex: bool,
-    /// (normalized url, host), deduped and capped by the extractor.
-    pub links: Vec<(String, String)>,
+    /// (normalized url, host, anchor text), deduped and capped by the extractor.
+    pub links: Vec<(String, String, String)>,
     /// Readability output; None means too little text ('empty').
     pub extract: Option<crate::extract::Extracted>,
 }
@@ -288,7 +300,7 @@ pub struct IngestRecord {
     pub fetched_at: i64,
     pub noindex: bool,
     pub extract: Option<crate::extract::Extracted>,
-    pub links: Vec<(String, String)>,
+    pub links: Vec<(String, String, String)>,
 }
 
 enum Cmd {
@@ -1154,8 +1166,9 @@ fn handle_ingest(
         lang,
         simhash
     ])?;
-    for (url, host) in &r.links {
+    for (url, host, anchor) in &r.links {
         enqueue(tx, cfg, r.fetched_at, Some(host_id), url, host, 0, 1)?;
+        record_anchor(tx, &r.url, url, anchor)?;
     }
     if indexed == 0
         && let (Some(itx), Some(ex)) = (index_tx, &r.extract)
@@ -1177,6 +1190,7 @@ fn handle_ingest(
             centrality,
             simhash: ex.simhash,
             sha256: r.sha256.to_vec(),
+            anchors: anchors_for(tx, &r.url)?,
         })));
     }
     *counters.entry("docs_stored").or_insert(0) += 1;
@@ -1264,10 +1278,12 @@ fn handle_complete(
                     centrality,
                     simhash: ex.simhash,
                     sha256: p.sha256.to_vec(),
+                    anchors: anchors_for(tx, &p.final_url)?,
                 })));
             }
-            for (url, host) in &p.links {
+            for (url, host, anchor) in &p.links {
                 enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1)?;
+                record_anchor(tx, &p.final_url, url, anchor)?;
             }
             // Fresh content: the recrawl interval drops back to the base.
             requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, Some(0))?;
@@ -1489,6 +1505,35 @@ fn enqueue(
     Ok(())
 }
 
+/// Append inbound anchor text for a link target. Append-only (deduped and
+/// capped at read time in anchors_for); self-links carry no signal.
+fn record_anchor(tx: &Transaction, page_url: &str, target: &str, anchor: &str) -> Result<()> {
+    if anchor.is_empty() || target == page_url {
+        return Ok(());
+    }
+    tx.prepare_cached("INSERT INTO anchor_text (url, text) VALUES (?1, ?2)")?
+        .execute(params![target, anchor])?;
+    Ok(())
+}
+
+/// A URL's inbound anchor texts, deduped and concatenated for indexing (the
+/// table is append-only, so dedup happens here). Caps bound a spammed
+/// target's field size. Applied at index time like centrality: fresh anchors
+/// reach the index on the target's recrawl or a `reindex`.
+pub fn anchors_for(conn: &Connection, url: &str) -> Result<String> {
+    let mut stmt =
+        conn.prepare_cached("SELECT DISTINCT text FROM anchor_text WHERE url = ?1 LIMIT 64")?;
+    let rows = stmt.query_map([url], |r| r.get::<_, String>(0))?;
+    let mut out = String::new();
+    for t in rows.flatten() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&t);
+    }
+    Ok(out.chars().take(1024).collect())
+}
+
 /// Belt-and-suspenders against lost fetch tasks: rows claimed >15 min ago go
 /// back to queued, and any host stuck in_flight with no claimed row is freed.
 fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
@@ -1666,8 +1711,23 @@ mod tests {
                     simhash: 42,
                 }),
                 links: vec![
-                    ("http://example.com/about".into(), "example.com".into()),
-                    ("http://other.org/".into(), "other.org".into()),
+                    (
+                        "http://example.com/about".into(),
+                        "example.com".into(),
+                        "about us".into(),
+                    ),
+                    (
+                        "http://other.org/".into(),
+                        "other.org".into(),
+                        "other site".into(),
+                    ),
+                    // Self-link: enqueued like any same-host URL, but its
+                    // anchor is not recorded (no self-describing signal).
+                    (
+                        "http://example.com/".into(),
+                        "example.com".into(),
+                        "home".into(),
+                    ),
                 ],
             }),
             next_delay_ms: 1000,
@@ -1716,6 +1776,17 @@ mod tests {
             .query_row("SELECT count(*) FROM links", [], |r| r.get(0))
             .unwrap();
         assert_eq!(edges, 1);
+
+        // Anchor text recorded for both targets, none for the self-link.
+        assert_eq!(
+            anchors_for(&conn, "http://example.com/about").unwrap(),
+            "about us"
+        );
+        assert_eq!(
+            anchors_for(&conn, "http://other.org/").unwrap(),
+            "other site"
+        );
+        assert_eq!(anchors_for(&conn, "http://example.com/").unwrap(), "");
 
         // Watermark equals the physical file size; record is readable back.
         let (name, bytes): (String, i64) = conn
@@ -1987,6 +2058,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!((url.as_str(), streak), ("http://example.com/", 0));
+
+        // v3's anchor_text table exists and is queryable.
+        conn.execute(
+            "INSERT INTO anchor_text (url, text) VALUES ('http://example.com/', 'a link')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(anchors_for(&conn, "http://example.com/").unwrap(), "a link");
+    }
+
+    #[test]
+    fn anchors_for_dedups_and_concatenates() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        for text in ["rust book", "the rust book", "rust book"] {
+            conn.execute(
+                "INSERT INTO anchor_text (url, text) VALUES ('http://a.com/', ?1)",
+                [text],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO anchor_text (url, text) VALUES ('http://b.com/', 'unrelated')",
+            [],
+        )
+        .unwrap();
+        let got = anchors_for(&conn, "http://a.com/").unwrap();
+        assert!(got.contains("rust book"));
+        assert!(got.contains("the rust book"));
+        assert_eq!(got.matches("rust book").count(), 2, "deduped at read time");
+        assert!(!got.contains("unrelated"));
     }
 
     #[tokio::test]

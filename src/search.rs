@@ -133,12 +133,17 @@ impl Searcher {
         let now = self.now;
         let build_text = |conjunctive: bool| -> Option<Box<dyn Query>> {
             (!text.is_empty()).then(|| {
-                let mut parser =
-                    QueryParser::for_index(index, vec![self.fields.title, self.fields.body]);
+                let mut parser = QueryParser::for_index(
+                    index,
+                    vec![self.fields.title, self.fields.body, self.fields.anchors],
+                );
                 if conjunctive {
                     parser.set_conjunction_by_default();
                 }
                 parser.set_field_boost(self.fields.title, 2.0);
+                // Inbound anchor text: a strong relevance hint, but someone
+                // else's words — below the page's own title.
+                parser.set_field_boost(self.fields.anchors, 1.5);
                 parser.parse_query_lenient(&text).0
             })
         };
@@ -526,6 +531,37 @@ mod tests {
         assert_eq!(out.hits.len(), 3);
         assert_eq!(out.collapsed, 0);
     }
+    #[test]
+    fn anchor_text_retrieves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        let mut w: tantivy::IndexWriter = index.writer(64 * 1024 * 1024).unwrap();
+        // The target never says "xylophone" itself; two inbound anchors do.
+        w.add_document(doc!(
+            f.url => "http://a.com/zebras", f.host => "a.com", f.title => "Zebra profiles",
+            f.body => "stripes herds savanna grazing patterns and migration notes",
+            f.anchors => "xylophone enthusiasts zebra xylophone fans",
+            f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+        ))
+        .unwrap();
+        // The linking page says "xylophone" nowhere either (its anchor text
+        // belongs to the target), so it must NOT match.
+        w.add_document(doc!(
+            f.url => "http://b.com/blog", f.host => "b.com", f.title => "My blog",
+            f.body => "musings about music and animals and other weekend topics",
+            f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+        ))
+        .unwrap();
+        w.commit().unwrap();
+
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
+        s.reader.reload().unwrap();
+        let out = s.search("xylophone", 0, 10, true, true).unwrap();
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits[0].url, "http://a.com/zebras");
+    }
+
     #[test]
     fn host_diversity_caps_per_page() {
         let dir = tempfile::tempdir().unwrap();

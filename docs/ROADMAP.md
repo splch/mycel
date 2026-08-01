@@ -166,6 +166,12 @@ reorders a mixed-age result set; default config is unchanged.
 
 ## Phase 5 — Anchor text as a ranking field
 
+**Status: shipped 2026-08-01** (schema v3). Gate result: qrels NDCG@10
+1.000 → 1.000, golden queries byte-identical (neither corpus populates the
+anchors field, so scores are unchanged); no BEIR re-run triggered.
+Mechanism proven by `anchor_text_retrieves_target` and the real-binary
+acceptance below.
+
 **Best-practice basis.** Anchor text is one of the oldest and strongest
 signals (the original Google paper; confirmed present in the 2024 leak), and
 it is *the* way pages with thin self-descriptions (PDFs, landing pages,

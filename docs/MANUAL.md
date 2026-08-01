@@ -185,6 +185,13 @@ boosts BM25 at query time. Seeded from Common Crawl's `hcrank10` by
 document at index time, so new ranks apply to a document when it is recrawled
 or at the next `reindex`.
 
+**Anchor text.** The words other pages use when linking to a page — how the
+web describes it, and often the only description thin pages (landing pages,
+paywalled stubs) get. Anchors are recorded from every crawled and ingested
+page (`rel=nofollow` and self-links excluded) and indexed into the target's
+document at index time with the same staleness model as centrality: fresh
+anchors apply on the target's recrawl or at the next `reindex`.
+
 **Identity.** `identity.key` holds the node's secret key. Its public half is
 the *endpoint id* (64 hex chars, printed by `mycel id`), which is both the
 node's address on the federation network and the name peers put in their
@@ -479,7 +486,8 @@ The parser is lenient: unparsable fragments degrade rather than erroring.
 There is no fuzzy matching.
 
 **Ranking.** `score = bm25 × (1 + weight × centrality)` where `bm25` scores
-title (boosted 2×) and body, `centrality` is the host's percentile rank in
+title (boosted 2×), body, and inbound anchor text (boosted 1.5×),
+`centrality` is the host's percentile rank in
 [0, 1], and `weight` is `rank.weight` (default 0.3). Between two pages with
 equal text relevance, the one on the better-linked host wins. Scores are
 meaningful only within one node; federated results are never re-sorted
@@ -704,7 +712,8 @@ with a `max_body_bytes` cap; over-limit bodies are truncated, flagged
 storage; WARC stores decoded bodies.
 
 **Link discovery.** Up to 2000 `<a href>` links per page, resolved against
-the final URL, normalized, deduplicated. `rel=nofollow` links are skipped;
+the final URL, normalized, deduplicated, with their anchor text (≤ 80
+characters) recorded for indexing into the link target. `rel=nofollow` links are skipped;
 a `<meta name=robots content=nofollow>` suppresses link extraction entirely;
 `noindex` stores the page in WARC but keeps it out of the index. Off-host
 link targets create candidate host rows and webgraph edges but are never

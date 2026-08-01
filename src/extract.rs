@@ -11,9 +11,10 @@ const MAX_LINKS_PER_PAGE: usize = 2000;
 const MIN_TEXT_CHARS: usize = 100;
 
 pub struct PageMeta {
-    /// Normalized absolute link targets with their host key, deduped, capped.
+    /// (normalized absolute link target, host key, squashed anchor text
+    /// capped at 80 chars), deduped by target, capped at MAX_LINKS_PER_PAGE.
     /// Empty when the page declares nofollow.
-    pub links: Vec<(String, String)>,
+    pub links: Vec<(String, String, String)>,
     pub noindex: bool,
 }
 
@@ -107,7 +108,9 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
                 continue;
             };
             if seen.insert(norm.clone()) {
-                links.push((norm, host));
+                let text = squash_ws(&a.text().collect::<String>());
+                let anchor: String = text.chars().take(80).collect();
+                links.push((norm, host, anchor));
             }
         }
     }
@@ -264,7 +267,7 @@ mod tests {
         </body></html>"#;
         let m = links_and_meta(&base(), html);
         assert!(!m.noindex);
-        let urls: Vec<&str> = m.links.iter().map(|(u, _)| u.as_str()).collect();
+        let urls: Vec<&str> = m.links.iter().map(|(u, _, _)| u.as_str()).collect();
         assert_eq!(
             urls,
             vec![
@@ -274,6 +277,21 @@ mod tests {
             ]
         );
         assert_eq!(m.links[2].1, "other.org");
+        // Anchor text rides along, squashed; rel=nofollow contributes nothing.
+        let anchors: Vec<&str> = m.links.iter().map(|(_, _, a)| a.as_str()).collect();
+        assert_eq!(anchors, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn anchor_text_is_squashed_and_capped() {
+        let long = "x".repeat(200);
+        let html = format!("<html><body><a href='/big'>multi\n   word {long}</a></body></html>");
+        let m = links_and_meta(&base(), &html);
+        assert_eq!(m.links.len(), 1);
+        let anchor = &m.links[0].2;
+        assert_eq!(anchor.chars().count(), 80);
+        assert!(anchor.starts_with("multi word "));
+        assert!(!anchor.contains("  "), "whitespace squashed");
     }
 
     #[test]

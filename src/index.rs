@@ -40,6 +40,9 @@ pub struct IndexDoc {
     pub centrality: f64,
     pub simhash: u64,
     pub sha256: Vec<u8>,
+    /// Inbound anchor text (concatenated at index time; same accepted
+    /// staleness as centrality — fresh anchors apply on recrawl/reindex).
+    pub anchors: String,
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +51,7 @@ pub struct Fields {
     pub host: tantivy::schema::Field,
     pub title: tantivy::schema::Field,
     pub body: tantivy::schema::Field,
+    pub anchors: tantivy::schema::Field,
     pub lang: tantivy::schema::Field,
     pub fetched_at: tantivy::schema::Field,
     pub centrality: tantivy::schema::Field,
@@ -65,6 +69,15 @@ pub fn schema() -> Schema {
     b.add_text_field("host", STRING | STORED);
     b.add_text_field("title", text.clone());
     b.add_text_field("body", text);
+    // Inbound anchor text: indexed for scoring, not stored (never snippeted).
+    b.add_text_field(
+        "anchors",
+        TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("en_stem")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        ),
+    );
     b.add_text_field("lang", STRING | STORED);
     b.add_u64_field("fetched_at", STORED | FAST);
     b.add_f64_field("centrality", FAST);
@@ -79,6 +92,7 @@ pub fn fields(schema: &Schema) -> Fields {
         host: f("host"),
         title: f("title"),
         body: f("body"),
+        anchors: f("anchors"),
         lang: f("lang"),
         fetched_at: f("fetched_at"),
         centrality: f("centrality"),
@@ -230,6 +244,7 @@ impl Indexer {
             self.fields.host => d.host,
             self.fields.title => d.title,
             self.fields.body => d.body,
+            self.fields.anchors => d.anchors,
             self.fields.lang => d.lang,
             self.fields.fetched_at => d.fetched_at.max(0) as u64,
             self.fields.centrality => d.centrality,
@@ -362,6 +377,14 @@ impl Indexer {
             self.mark(doc_id, 2, Some("lang"));
             return;
         }
+        let anchors = match db::anchors_for(&self.conn, &url) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("anchor lookup failed for {url}: {e}");
+                self.mark(doc_id, 2, Some("error"));
+                return;
+            }
+        };
         // Persist extraction results alongside the pending state.
         self.dbh
             .update_doc_extract_blocking(doc_id, ex.title.clone(), ex.lang, ex.simhash as i64);
@@ -378,6 +401,7 @@ impl Indexer {
             centrality,
             simhash: ex.simhash,
             sha256: sha,
+            anchors,
         });
     }
 }
@@ -439,6 +463,7 @@ pub fn rebuild(
             if !cfg.languages.iter().any(|l| l == ex.lang) {
                 return Err("lang");
             }
+            let anchors = db::anchors_for(conn, &url).map_err(|_| "error")?;
             use sha2::Digest;
             let sha = sha2::Sha256::digest(payload).to_vec();
             if !seen_sha.insert(sha) {
@@ -447,7 +472,7 @@ pub fn rebuild(
             writer
                 .add_document(doc!(
                     f.url => url.clone(), f.host => host.clone(), f.title => ex.title.clone(),
-                    f.body => ex.text.clone(), f.lang => ex.lang,
+                    f.body => ex.text.clone(), f.anchors => anchors, f.lang => ex.lang,
                     f.fetched_at => fetched_at.max(0) as u64, f.centrality => centrality,
                     f.simhash => ex.simhash,
                 ))
