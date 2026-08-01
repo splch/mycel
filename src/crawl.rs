@@ -161,7 +161,8 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
     }
 
     let Some(robots_body) = job.robots_body.as_deref() else {
-        // Fresh but unavailable (5xx): complete disallow until the hourly retry.
+        // Fresh but unavailable (5xx): complete disallow until the hourly
+        // retry. Not host_fault: handle_robots already counted this episode.
         st.db
             .complete(Completion {
                 frontier_id: job.frontier_id,
@@ -174,7 +175,7 @@ async fn fetch_task(st: Arc<Shared>, job: Job) {
                 },
                 next_delay_ms: 3_600_000,
                 sticky_delay_ms: None,
-                host_fault: true,
+                host_fault: false,
                 now_ms: db::now_ms(),
             })
             .await;
@@ -241,13 +242,12 @@ fn effective_delay_ms(cfg: &CrawlCfg, robots_delay_s: Option<f32>, host_delay_ms
         .max(host_delay_ms)
 }
 
-/// Does this failure indict the host? Transport failures and 5xx (incl. 503
-/// and robots-unavailable stalls) mean a sick host; 4xx, content-type rejects,
-/// redirect outcomes and 429 (the host is alive and asking us to slow down)
-/// are the host answering fine and never count toward the circuit breaker.
+/// Does this failure indict the host? Transport failures and 5xx (incl. 503)
+/// mean a sick host; 4xx, content-type rejects, redirects and 429 are the
+/// host answering fine and never count. (Robots-unavailable is a host fault
+/// too, but counted where it happens: handle_robots.)
 fn is_host_fault_reason(reason: &str) -> bool {
-    reason == "robots-unavailable"
-        || reason.starts_with("timeout")
+    reason.starts_with("timeout")
         || reason.starts_with("network")
         || reason.starts_with("body")
         || reason
@@ -749,7 +749,6 @@ mod tests {
             "body: eof",
             "http-500",
             "http-503",
-            "robots-unavailable",
         ] {
             assert!(is_host_fault_reason(fault), "{fault}");
         }
@@ -760,6 +759,8 @@ mod tests {
             "content-type:application/pdf",
             "robots",
             "robots-redirect",
+            // counted in handle_robots, not here (double count otherwise)
+            "robots-unavailable",
             "redirect-loop",
             "sitemap-gunzip",
         ] {
