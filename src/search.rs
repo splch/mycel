@@ -25,7 +25,13 @@ pub struct Searcher {
     reader: IndexReader,
     fields: Fields,
     weight: f64,
+    freshness_weight: f64,
+    /// "Now" for freshness age, in unix seconds; injectable for determinism.
+    now: i64,
 }
+
+/// Time constant of the freshness multiplier: e-fold decay per this many days.
+const FRESHNESS_TAU_DAYS: f64 = 90.0;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
@@ -74,7 +80,17 @@ impl Outcome {
 }
 
 impl Searcher {
-    pub fn open(index_dir: &Path, weight: f64) -> Result<Self> {
+    pub fn open(index_dir: &Path, weight: f64, freshness_weight: f64) -> Result<Self> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_secs() as i64;
+        Self::open_at(index_dir, weight, freshness_weight, now)
+    }
+
+    /// Like `open`, but with an explicit "now": freshness scoring must be
+    /// reproducible in tests (and identical across replicas of one index).
+    pub fn open_at(index_dir: &Path, weight: f64, freshness_weight: f64, now: i64) -> Result<Self> {
         let index = crate::index::open_or_create(index_dir)?;
         let f = fields(&index.schema());
         let reader = index.reader()?;
@@ -82,6 +98,8 @@ impl Searcher {
             reader,
             fields: f,
             weight,
+            freshness_weight,
+            now,
         })
     }
 
@@ -111,6 +129,8 @@ impl Searcher {
         let index = searcher.index();
 
         let w = self.weight;
+        let fw = self.freshness_weight;
+        let now = self.now;
         let build_text = |conjunctive: bool| -> Option<Box<dyn Query>> {
             (!text.is_empty()).then(|| {
                 let mut parser =
@@ -165,10 +185,24 @@ impl Searcher {
             let collector = TopDocs::with_limit(page_size.max(1))
                 .and_offset(page * page_size)
                 .tweak_score(move |segment: &tantivy::SegmentReader| {
-                    let col = segment.fast_fields().f64("centrality").ok();
-                    move |doc: tantivy::DocId, score: tantivy::Score| match &col {
-                        Some(c) => score * (1.0 + w * c.first(doc).unwrap_or(0.0)) as f32,
-                        None => score,
+                    let cent = segment.fast_fields().f64("centrality").ok();
+                    // Read only when the boost is on: fw = 0 skips the column
+                    // and the math entirely, keeping scoring byte-identical.
+                    let fetched = (fw > 0.0)
+                        .then(|| segment.fast_fields().u64("fetched_at").ok())
+                        .flatten();
+                    move |doc: tantivy::DocId, score: tantivy::Score| {
+                        let c = cent.as_ref().and_then(|c| c.first(doc)).unwrap_or(0.0);
+                        let mut s = score * (1.0 + w * c) as f32;
+                        // Freshness: ×(1 + fw·e^(−age_days/τ)); a brand-new
+                        // doc gets ×(1+fw), decaying toward ×1 with age.
+                        if let Some(col) = &fetched
+                            && let Some(t) = col.first(doc)
+                        {
+                            let age_days = (now - t as i64).max(0) as f64 / 86_400.0;
+                            s *= (1.0 + fw * (-age_days / FRESHNESS_TAU_DAYS).exp()) as f32;
+                        }
+                        s
                     }
                 });
             let (top, total) = searcher.search(&query, &(collector, Count))?;
@@ -363,7 +397,7 @@ mod tests {
         );
         w.commit().unwrap();
 
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
         let out = s.search("mycelium networks", 0, 10, true, true).unwrap();
         assert!(!out.relaxed);
@@ -414,7 +448,7 @@ mod tests {
         add("http://b.com/1", "b.com", "Gamma", "only gamma here");
         w.commit().unwrap();
 
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
 
         // no doc has all three terms: AND misses, OR ranks the 2-term doc first
@@ -472,7 +506,7 @@ mod tests {
         );
         w.commit().unwrap();
 
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
         let out = s
             .search("shared reporting investigation", 0, 10, true, true)
@@ -520,7 +554,7 @@ mod tests {
             .unwrap();
         }
         w.commit().unwrap();
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
 
         let out = s
@@ -541,6 +575,49 @@ mod tests {
             .unwrap();
         assert_eq!(out.hits.len(), 7);
         assert_eq!(out.host_capped, 0);
+    }
+
+    #[test]
+    fn freshness_boost_prefers_recent_with_fixed_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        // Single-threaded writer: deterministic tie order at equal scores.
+        let w: tantivy::IndexWriter = index.writer_with_num_threads(1, 64 * 1024 * 1024).unwrap();
+        let body = "harbor tide tables and lantern schedules for the winter crossing";
+        let base = 1_700_000_000u64;
+        // Identical text; only fetched_at differs (old: base, fresh: +300d).
+        for (url, fetched_at) in [
+            ("http://a.com/old", base),
+            ("http://b.com/new", base + 300 * 86_400),
+        ] {
+            w.add_document(doc!(
+                f.url => url, f.host => "x.com", f.title => "Tide tables", f.body => body,
+                f.lang => "en", f.fetched_at => fetched_at, f.centrality => 0.0,
+            ))
+            .unwrap();
+        }
+        let mut w = w;
+        w.commit().unwrap();
+        let now = (base + 301 * 86_400) as i64; // one day after the fresh doc
+
+        // fw = 0: scores identical, insertion order wins; freshness is inert.
+        let s = Searcher::open_at(dir.path(), 0.3, 0.0, now).unwrap();
+        s.reader.reload().unwrap();
+        let out = s.search("harbor tide", 0, 10, true, true).unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert!(
+            (out.hits[0].score - out.hits[1].score).abs() < 1e-6,
+            "fw = 0 must leave scoring byte-identical"
+        );
+        assert_eq!(out.hits[0].url, "http://a.com/old");
+
+        // fw > 0: the day-old doc beats the 301-day-old doc on equal BM25.
+        let s = Searcher::open_at(dir.path(), 0.3, 0.5, now).unwrap();
+        s.reader.reload().unwrap();
+        let out = s.search("harbor tide", 0, 10, true, true).unwrap();
+        assert_eq!(out.hits[0].url, "http://b.com/new");
+        assert!(out.hits[0].score > out.hits[1].score);
     }
 
     /// Deterministic corpus + queries; top-3 URLs snapshotted in
@@ -644,7 +721,7 @@ mod tests {
         let mut w = w;
         w.commit().unwrap();
 
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
         let queries = [
             "rust ownership",
@@ -969,7 +1046,7 @@ mod tests {
         let mut w = w;
         w.commit().unwrap();
 
-        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        let s = Searcher::open(dir.path(), 0.3, 0.0).unwrap();
         s.reader.reload().unwrap();
 
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/qrels.toml");

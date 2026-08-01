@@ -234,6 +234,7 @@ process start; nothing reloads live.
 | key | default | meaning |
 |---|---|---|
 | `weight` | `0.3` | `w` in `score = bm25 × (1 + w × centrality)`. `0` disables the boost at query time. |
+| `freshness_weight` | `0.0` | `fw` in `score × (1 + fw × e^(−age_days/90))`, age from the document's `fetched_at`. `0` disables (default); enable only after measuring on your own corpus — a flat recency boost helps news-like queries and hurts evergreen ones. |
 | `exact_bfs_max_hosts` | `20000` | `mycel rank` uses exact all-sources BFS up to this many hosts in the webgraph, and the HyperBall approximation (~13 % relative error) above it. |
 
 ### `[warc]`

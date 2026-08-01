@@ -287,7 +287,7 @@ Indexer thread: consumes in-memory channel from crawl (already-extracted text, n
 
 ## 9. Ranking
 
-`score = bm25 × (1 + 0.3 × centrality)`, centrality ∈ [0,1] percentile-normalized.
+`score = bm25 × (1 + 0.3 × centrality)`, centrality ∈ [0,1] percentile-normalized. An optional freshness multiplier `× (1 + fw·e^(−age_days/90))` (age from `fetched_at`, already a FAST field) is available via `rank.freshness_weight` and defaults to 0 (off; the query-time code then skips the column and the math entirely, keeping scoring byte-identical).
 
 - Query: extract `site:host` tokens (→ host TermQuery AND'd in), rest → `QueryParser` on [title×2.0, body], conjunction-by-default, fuzzy off, `parse_query_lenient`. Zero conjunctive matches → disjunctive retry where BM25 ranks partial matches (the Lucene/Algolia `allOptional`/Vespa weakAnd pattern; response marked `relaxed`, `site:` stays mandatory). Evidence: TREC-COVID conjunction ceiling, docs/BENCHMARKING.md (2026-07). `TopDocs::with_limit(...).and_offset(...)` + `tweak_score` reading centrality fast field + Count. Caps: query 512 chars, page ≤20. SnippetGenerator on body (~200 chars, escaped). Search in `spawn_blocking`.
 - Centrality baked at index time (docs pick up new ranks on recrawl/reindex: accepted staleness; per-segment ord→boost map is the designated upgrade if it annoys).
@@ -388,7 +388,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`).
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0).
 
 ## Verification (end-to-end, after M5)
 

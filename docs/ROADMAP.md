@@ -126,6 +126,16 @@ mixed hosts, the note appears, and `?diversity=0` restores the full list.
 
 ## Phase 4 — Freshness-aware scoring (default off, benchmark-gated)
 
+**Status: shipped 2026-08-01, default off.** Mechanism behind
+`rank.freshness_weight` (0.0). Gate result: qrels NDCG@10 1.000 → 1.000
+and goldens unchanged (the harness corpus has uniform `fetched_at`, and
+`fw = 0` skips the column and the math entirely, so scoring is
+byte-identical); per the BENCHMARKING.md §0.5 gate no BEIR re-run was
+triggered. The reordering mechanism is proven by
+`freshness_boost_prefers_recent_with_fixed_now` and by the real-binary
+acceptance below. Flipping the default now requires a corpus where
+freshness can differentiate, measured through the same gate.
+
 **Best-practice basis.** Google's "query deserves freshness" systems and the
 leak's three date signals (`bylineDate`, `syntacticDate`, `semanticDate`).
 `fetched_at` is already a tantivy FAST field — a recency multiplier costs one

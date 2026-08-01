@@ -446,6 +446,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
             Some(std::sync::Arc::new(search::Searcher::open(
                 &data.join("index"),
                 cfg.rank.weight,
+                cfg.rank.freshness_weight,
             )?))
         } else {
             None
@@ -627,7 +628,11 @@ fn cmd_search(rest: &[String]) -> Result<()> {
             Ok(())
         });
     }
-    let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
+    let searcher = search::Searcher::open(
+        &data.join("index"),
+        cfg.rank.weight,
+        cfg.rank.freshness_weight,
+    )?;
     let out = searcher.search(&q, 0, cfg.api.page_size, true, diversity)?;
     if json {
         println!(

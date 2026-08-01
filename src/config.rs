@@ -32,6 +32,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 
 [rank]
 # weight = 0.3             # w in score = bm25 * (1 + w*centrality)
+# freshness_weight = 0.0   # fw in score * (1 + fw*e^(-age_days/90)); 0 disables
 # exact_bfs_max_hosts = 20000
 
 [warc]
@@ -138,6 +139,8 @@ impl Default for IndexCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct RankCfg {
     pub weight: f64,
+    /// Freshness multiplier: score × (1 + fw·e^(−age_days/90)); 0 disables.
+    pub freshness_weight: f64,
     pub exact_bfs_max_hosts: usize,
 }
 
@@ -145,6 +148,7 @@ impl Default for RankCfg {
     fn default() -> Self {
         Self {
             weight: 0.3,
+            freshness_weight: 0.0,
             exact_bfs_max_hosts: 20_000,
         }
     }
@@ -298,6 +302,9 @@ impl Config {
         if self.crawl.concurrency == 0 {
             return Err("crawl.concurrency must be > 0".into());
         }
+        if self.rank.freshness_weight < 0.0 {
+            return Err("rank.freshness_weight must be >= 0".into());
+        }
         for h in &self.admin.allowed_hosts {
             if h.is_empty() || h.contains('/') || h.contains(char::is_whitespace) {
                 return Err(
@@ -357,6 +364,7 @@ mod tests {
         assert_eq!(cfg.crawl.block_after_failures, 25);
         assert_eq!(cfg.index.languages, vec!["en"]);
         assert!((cfg.rank.weight - 0.3).abs() < f64::EPSILON);
+        assert_eq!(cfg.rank.freshness_weight, 0.0);
         assert!(!cfg.federation.enabled);
         assert!(cfg.sync.enabled);
         assert_eq!(cfg.api.bind, "127.0.0.1:8080");
