@@ -162,7 +162,7 @@ impl Searcher {
                 });
             let (top, total) = searcher.search(&query, &(collector, Count))?;
 
-            let mut kept: Vec<u64> = Vec::with_capacity(top.len());
+            let mut kept: Vec<u64> = Vec::new();
             let mut collapsed = 0usize;
             let mut sim_cols: HashMap<u32, Option<tantivy::fastfield::Column<u64>>> =
                 HashMap::new();

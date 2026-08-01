@@ -162,9 +162,9 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
     if !q.trim().is_empty() {
         match run_search(&api, q.clone(), page, p.federated, collapse).await {
             Ok(out) => {
+                let qe = crate::urlencode(&q);
                 let mut note = out.note();
                 if out.collapsed > 0 && collapse {
-                    let qe = crate::urlencode(&q);
                     note.push_str(&format!(
                         " · <a href=\"/?q={qe}&collapse=0\">show similar</a>"
                     ));
@@ -191,7 +191,6 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
                             .replace("</b>", "</mark>"),
                     ));
                 }
-                let qe = crate::urlencode(&q);
                 let cx = if p.collapse == Some(0) {
                     "&collapse=0"
                 } else {
