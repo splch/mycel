@@ -540,6 +540,12 @@ Probes every configured peer (see `mycel peers check`). Returns
 `{"peers": [{"peer": "bee", "ok": true, "detail": ""}]}`. HTTP 400 with
 `federation is not enabled` when the daemon runs without federation.
 
+During fan-out each peer has a circuit breaker (resilience4j/Envoy-style):
+after 5 consecutive failures or timeouts the peer is skipped for a 30
+cooldown that doubles per trip (1 h cap); the first query after the
+cooldown is the probe. A dead peer therefore costs at most one
+`fanout_timeout_ms` per cooldown window instead of one per query.
+
 ### `GET /admin` (the admin page)
 
 Server-rendered forms that expose the CLI against the running daemon:
@@ -599,7 +605,13 @@ Gauges for monitoring:
 ```
 
 `index_docs` counts live documents in the tantivy reader; `docs.*` counts
-catalog rows. A field reads `-1` if its query failed.
+catalog rows. A field reads `-1` if its query failed. Every response
+carries `snapshot_age_secs`: the gauges are full-table scans, so they are
+served from a snapshot refreshed at most every 5 s, stale-while-revalidate
+style. If a refresh cannot run (or a previous one wedges), the last
+snapshot is served with its age — up to 10 minutes old, after which the
+endpoint answers 503 `stats degraded` rather than silently passing off old
+data as fresh.
 
 ## 9. Crawler behavior
 

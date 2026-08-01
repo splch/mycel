@@ -8,13 +8,49 @@ use crate::search::Hit;
 use crate::{Result, config};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Per-peer circuit breaker (resilience4j / Envoy outlier-ejection
+/// semantics): BREAKER_TRIP consecutive failures open it; while open the
+/// peer is skipped entirely (no fan-out timeout paid per query); the first
+/// query after the cooldown is the half-open probe. Cooldown doubles per
+/// consecutive trip, capped.
+const BREAKER_TRIP: u32 = 5;
+const BREAKER_BASE_COOLDOWN: Duration = Duration::from_secs(30);
+const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(3600);
+
+#[derive(Default)]
+struct Breaker {
+    failures: u32,
+    open_until: Option<Instant>,
+}
+
+impl Breaker {
+    fn should_skip(&self, now: Instant) -> bool {
+        self.open_until.is_some_and(|t| now < t)
+    }
+
+    fn success(&mut self) {
+        self.failures = 0;
+        self.open_until = None;
+    }
+
+    fn failure(&mut self, now: Instant) {
+        self.failures += 1;
+        if self.failures >= BREAKER_TRIP {
+            let doublings = (self.failures - BREAKER_TRIP).min(10);
+            let cd = (BREAKER_BASE_COOLDOWN * 2u32.pow(doublings)).min(BREAKER_MAX_COOLDOWN);
+            self.open_until = Some(now + cd);
+        }
+    }
+}
 
 pub struct Fanout {
     pub endpoint: Arc<iroh::Endpoint>,
     pub peers: Vec<config::PeerCfg>,
     pub timeout_ms: u64,
     pool: tokio::sync::Mutex<HashMap<String, iroh::endpoint::Connection>>,
+    breakers: std::sync::Mutex<HashMap<String, Breaker>>,
 }
 
 impl Fanout {
@@ -28,14 +64,36 @@ impl Fanout {
             peers,
             timeout_ms,
             pool: tokio::sync::Mutex::new(HashMap::new()),
+            breakers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn record(&self, peer_id: &str, ok: bool) {
+        let mut breakers = self.breakers.lock().expect("breaker poisoned");
+        let b = breakers.entry(peer_id.to_string()).or_default();
+        if ok {
+            b.success();
+        } else {
+            b.failure(Instant::now());
         }
     }
 
     /// Query every peer in parallel; a slow or dead peer contributes nothing
-    /// and never delays past the timeout.
+    /// and never delays past the timeout. Peers whose breaker is open are
+    /// skipped outright.
     pub async fn search_peers(self: &Arc<Self>, query: &str, limit: usize) -> Vec<Vec<Hit>> {
         let mut handles = Vec::new();
         for peer in self.peers.clone() {
+            if self
+                .breakers
+                .lock()
+                .expect("breaker poisoned")
+                .get(&peer.id)
+                .is_some_and(|b| b.should_skip(Instant::now()))
+            {
+                tracing::debug!("peer {} skipped (circuit open)", peer.id);
+                continue;
+            }
             let this = self.clone();
             let q = query.to_string();
             handles.push(tokio::spawn(async move {
@@ -49,23 +107,27 @@ impl Fanout {
                 )
                 .await
                 {
-                    Ok(Ok(hits)) => hits
-                        .into_iter()
-                        .map(|h| Hit {
-                            host: crate::urlnorm::host_of(&h.url).unwrap_or_default(),
-                            url: h.url,
-                            title: h.title,
-                            snippet: h.snippet,
-                            score: h.score,
-                            fetched_at: 0,
-                            source: Some(badge.clone()),
-                        })
-                        .collect(),
+                    Ok(Ok(hits)) => {
+                        this.record(&peer.id, true);
+                        hits.into_iter()
+                            .map(|h| Hit {
+                                host: crate::urlnorm::host_of(&h.url).unwrap_or_default(),
+                                url: h.url,
+                                title: h.title,
+                                snippet: h.snippet,
+                                score: h.score,
+                                fetched_at: 0,
+                                source: Some(badge.clone()),
+                            })
+                            .collect()
+                    }
                     Ok(Err(e)) => {
+                        this.record(&peer.id, false);
                         tracing::info!("peer {badge} query failed: {e}");
                         Vec::new()
                     }
                     Err(_) => {
+                        this.record(&peer.id, false);
                         tracing::info!("peer {badge} query timed out");
                         Vec::new()
                     }
@@ -176,6 +238,41 @@ mod tests {
             fetched_at: 0,
             source: source.map(Into::into),
         }
+    }
+
+    #[test]
+    fn breaker_trips_skips_and_recovers() {
+        let t0 = Instant::now();
+        let mut b = Breaker::default();
+        for _ in 0..BREAKER_TRIP - 1 {
+            b.failure(t0);
+            assert!(!b.should_skip(t0), "closed until the threshold");
+        }
+        b.failure(t0);
+        assert!(b.should_skip(t0), "open at BREAKER_TRIP failures");
+        assert!(b.should_skip(t0 + BREAKER_BASE_COOLDOWN / 2));
+        assert!(
+            !b.should_skip(t0 + BREAKER_BASE_COOLDOWN),
+            "first query after cooldown is the half-open probe"
+        );
+        // probe fails: re-opens with a doubled cooldown
+        b.failure(t0 + BREAKER_BASE_COOLDOWN);
+        assert!(b.should_skip(t0 + BREAKER_BASE_COOLDOWN * 2));
+        // probe succeeds: fully closed
+        b.success();
+        assert_eq!(b.failures, 0);
+        assert!(!b.should_skip(t0));
+    }
+
+    #[test]
+    fn breaker_cooldown_is_capped() {
+        let t0 = Instant::now();
+        let mut b = Breaker::default();
+        for _ in 0..30 {
+            b.failure(t0);
+        }
+        let until = b.open_until.expect("open");
+        assert!(until - t0 <= BREAKER_MAX_COOLDOWN);
     }
 
     #[test]

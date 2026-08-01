@@ -41,7 +41,7 @@ src/
   net/proto.rs ALPNs, message structs, u32-LE+JSON frame codec                   ~150
   net/endpoint.rs identity, endpoint build, accept loop, allowlist gate          ~200
   net/sync.rs  sync server + pull state machine, quota, verify/commit/ingest     ~350
-  search/fanout.rs peer pool, parallel fan-out, round-robin merge, badges        ~200
+  search/fanout.rs peer pool, parallel fan-out, circuit breaker, round-robin merge, badges ~220
   bootstrap.rs CSV loaders, throttled ranged CC fetcher, resume, ingest, seed    ~700
 ```
 
@@ -122,7 +122,10 @@ allowed_hosts = []       # extra Host headers accepted on /admin (post-v1 extens
 [federation]
 enabled = false          # peerless default: no socket bound, nothing published
 fanout = true
-fanout_timeout_ms = 1500
+fanout_timeout_ms = 1500 # per-peer deadline; a per-peer circuit breaker (5
+                         # consecutive failures → 30s cooldown, ×2 to 1h cap,
+                         # half-open probe after) skips dead peers instead of
+                         # paying this timeout on every query
 
 [[federation.peers]]     # example
 # id = "<64-hex endpoint id>"   # from `mycel id` on the peer
@@ -355,7 +358,7 @@ No parquet/duckdb/aws crates in the binary: subset selection is external, docume
 | Crash anywhere | watermark truncation + in_flight reset + reconciliation ⇒ worst case a few pages recrawled |
 | Backup | `sqlite3 .backup` + rsync `warc/`; the index is never backed up |
 
-Logging: tracing (fmt+env-filter); info = startup summary, 60s crawl summary, warns; per-fetch at debug. Counters in writer thread → meta every 60s (fetch ok/err/429, bytes, indexed, dup/lang skips, queries); `/stats` adds gauges (queue depths, hosts by state, shards, WARC bytes, index docs, last_rank_at).
+Logging: tracing (fmt+env-filter); info = startup summary, 60s crawl summary, warns; per-fetch at debug. Counters in writer thread → meta every 60s (fetch ok/err/429, bytes, indexed, dup/lang skips, queries); `/stats` adds gauges (queue depths, hosts by state, shards, WARC bytes, index docs, last_rank_at) served as a bounded-staleness snapshot (5s TTL revalidate without lock-waiting, `snapshot_age_secs` on every response, 503 `stats degraded` past 10min).
 
 ## 14. Testing & acceptance bar
 

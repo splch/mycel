@@ -21,11 +21,14 @@ pub struct Api {
 }
 
 /// Serve-stale cache for /stats: the gauge counts are unindexed full-table
-/// scans, so recompute at most once per STATS_TTL.
+/// scans, so recompute at most once per STATS_TTL. Staleness is bounded:
+/// past STATS_MAX_STALE the snapshot is an error, not a gauge (RFC 5861
+/// stale-if-error semantics), and every response carries its age.
 #[derive(Default)]
 pub struct StatsCache(std::sync::Mutex<Option<(std::time::Instant, Arc<serde_json::Value>)>>);
 
 const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+const STATS_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -270,31 +273,62 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
         .0
         .lock()
         .expect("stats cache poisoned")
-        .as_ref()
-        .filter(|(at, _)| at.elapsed() < STATS_TTL)
-        .map(|(_, v)| v.clone());
-    if let Some(v) = cached {
-        return axum::Json(v).into_response();
+        .clone();
+    if let Some((at, v)) = &cached
+        && at.elapsed() < STATS_TTL
+    {
+        return with_age(v.clone(), at.elapsed()).into_response();
     }
+    // Revalidate WITHOUT waiting on the connection (try_lock, never
+    // blocking_lock): if another refresh — or a wedged one — holds it, this
+    // request serves what it has instead of piling up behind the lock.
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
-            let conn = api.stats_conn.blocking_lock();
-            stats_json(&conn, api.searcher.num_docs())
+            api.stats_conn
+                .try_lock()
+                .map(|conn| stats_json(&conn, api.searcher.num_docs()))
+                .ok()
         }
     })
     .await;
     match computed {
-        Ok(v) => {
+        Ok(Some(v)) => {
             let v = Arc::new(v);
             *api.stats_cache.0.lock().expect("stats cache poisoned") =
                 Some((std::time::Instant::now(), v.clone()));
-            axum::Json(v).into_response()
+            with_age(v, std::time::Duration::ZERO).into_response()
         }
+        Ok(None) => serve_stale_or_error(cached, "another refresh holds the stats connection"),
         Err(e) => {
             tracing::error!("stats computation panicked: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "stats failed").into_response()
+            serve_stale_or_error(cached, "stats computation panicked")
         }
+    }
+}
+
+fn with_age(v: Arc<serde_json::Value>, age: std::time::Duration) -> axum::Json<serde_json::Value> {
+    let mut obj = (*v).clone();
+    obj["snapshot_age_secs"] = age.as_secs().into();
+    axum::Json(obj)
+}
+
+fn serve_stale_or_error(
+    cached: Option<(std::time::Instant, Arc<serde_json::Value>)>,
+    why: &'static str,
+) -> axum::response::Response {
+    match cached {
+        Some((at, v)) if at.elapsed() <= STATS_MAX_STALE => {
+            with_age(v, at.elapsed()).into_response()
+        }
+        Some((at, _)) => {
+            tracing::error!(
+                "stats snapshot is {}s old ({why}); refusing to serve it",
+                at.elapsed().as_secs()
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, "stats degraded").into_response()
+        }
+        None => (StatusCode::SERVICE_UNAVAILABLE, why).into_response(),
     }
 }
 
