@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const DDL_V1: &str = r#"
 CREATE TABLE hosts (
@@ -131,6 +131,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(DDL_V1)?;
         conn.pragma_update(None, "user_version", 1)?;
     }
+    if version < 2 {
+        // v2: adaptive recrawl. Consecutive unchanged fetches double a URL's
+        // recrawl interval (see recrawl_interval); a changed fetch resets.
+        conn.execute_batch(
+            "ALTER TABLE frontier ADD COLUMN unchanged_streak INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
     Ok(())
 }
 
@@ -153,6 +161,15 @@ pub fn now_ms() -> i64 {
 /// round down to "now".
 fn gate_at(now_ms: i64, delay_ms: i64) -> i64 {
     (now_ms + delay_ms.max(0) + 999) / 1000
+}
+
+/// Adaptive recrawl: after `streak` consecutive unchanged fetches a page's
+/// interval is `recrawl_secs × 2^min(streak, 4)` (14d base → 224d cap). The
+/// change-rate signal is free (every fetch already compares payload shas);
+/// static pages decay toward rare recrawls, volatile pages stay hot (Nutch's
+/// adaptive fetch interval).
+fn recrawl_interval(base_secs: i64, streak: i64) -> i64 {
+    base_secs * (1_i64 << streak.clamp(0, 4))
 }
 
 // ------------------------------------------------------------- public API --
@@ -1252,7 +1269,8 @@ fn handle_complete(
             for (url, host) in &p.links {
                 enqueue(tx, cfg, now, Some(c.host_id), url, host, 0, c.depth + 1)?;
             }
-            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true)?;
+            // Fresh content: the recrawl interval drops back to the base.
+            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, Some(0))?;
             bump("fetch_ok", 1);
             bump("docs_stored", 1);
             bump("bytes_fetched", p.payload_len as i64);
@@ -1260,7 +1278,17 @@ fn handle_complete(
         Outcome::Unchanged => {
             tx.prepare_cached("UPDATE docs SET fetched_at = ?1 WHERE url = ?2")?
                 .execute(params![now, c.url])?;
-            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true)?;
+            let prev: i64 = tx
+                .prepare_cached("SELECT unchanged_streak FROM frontier WHERE id = ?1")?
+                .query_row([c.frontier_id], |r| r.get(0))?;
+            let streak = prev + 1;
+            requeue(
+                tx,
+                c.frontier_id,
+                now + recrawl_interval(cfg.recrawl_secs, streak),
+                true,
+                Some(streak),
+            )?;
             bump("fetch_ok", 1);
         }
         Outcome::Sitemap { pages, children } => {
@@ -1270,7 +1298,7 @@ fn handle_complete(
             for (url, host) in children {
                 enqueue(tx, cfg, now, None, url, host, 1, c.depth + 1)?;
             }
-            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true)?;
+            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, None)?;
             bump("fetch_ok", 1);
         }
         Outcome::CrossRedirect { target } => {
@@ -1358,13 +1386,22 @@ fn handle_complete(
 }
 
 /// Success path: back to queued with a future recrawl time and a clean slate.
-fn requeue(tx: &Transaction, frontier_id: i64, at: i64, reset_attempts: bool) -> Result<()> {
+/// `streak` sets the adaptive-recrawl counter (Some(0) on fresh content,
+/// Some(streak+1) on unchanged, None to leave it alone — e.g. sitemaps).
+fn requeue(
+    tx: &Transaction,
+    frontier_id: i64,
+    at: i64,
+    reset_attempts: bool,
+    streak: Option<i64>,
+) -> Result<()> {
     tx.prepare_cached(
         "UPDATE frontier SET state = 0, claimed_at = NULL, next_attempt_at = ?1,
-                attempts = CASE WHEN ?2 THEN 0 ELSE attempts END, last_error = NULL
+                attempts = CASE WHEN ?2 THEN 0 ELSE attempts END, last_error = NULL,
+                unchanged_streak = COALESCE(?4, unchanged_streak)
          WHERE id = ?3",
     )?
-    .execute(params![at, reset_attempts, frontier_id])?;
+    .execute(params![at, reset_attempts, frontier_id, streak])?;
     Ok(())
 }
 
@@ -1903,6 +1940,147 @@ mod tests {
         let jobs = db.claim(t + 3601, 1).await;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].attempts, 1);
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recrawl_interval_doubles_and_caps() {
+        let base = 14 * 86_400;
+        assert_eq!(recrawl_interval(base, 0), base);
+        assert_eq!(recrawl_interval(base, 1), base * 2);
+        assert_eq!(recrawl_interval(base, 2), base * 4);
+        assert_eq!(recrawl_interval(base, 3), base * 8);
+        assert_eq!(recrawl_interval(base, 4), base * 16);
+        assert_eq!(recrawl_interval(base, 99), base * 16, "exponent clamped");
+    }
+
+    #[test]
+    fn migrates_v1_to_v2_preserving_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        {
+            // A database written by a v1 binary: v1 DDL, user_version 1.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DDL_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO hosts (host, state, added_at) VALUES ('example.com', 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frontier (host_id, url, discovered_at)
+                 VALUES (1, 'http://example.com/', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let (url, streak): (String, i64) = conn
+            .query_row("SELECT url, unchanged_streak FROM frontier", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((url.as_str(), streak), ("http://example.com/", 0));
+    }
+
+    #[tokio::test]
+    async fn adaptive_recrawl_streaks() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+        let r: i64 = 14 * 86_400; // test_cfg's recrawl_secs
+        let t = now();
+        let state_of = || -> (i64, i64) {
+            check
+                .query_row(
+                    "SELECT next_attempt_at, unchanged_streak FROM frontier",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let stored = |job: &Job, now_ms: i64| {
+            let payload = b"<html><body>page</body></html>";
+            let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
+            let member = warc::gzip_member(&warc::build_response_record(
+                &job.url,
+                now_ms / 1000,
+                b"seed",
+                b"HTTP/1.1 200 OK",
+                payload,
+                &hex::encode(sha),
+                false,
+            ));
+            Completion {
+                frontier_id: job.frontier_id,
+                host_id: job.host_id,
+                depth: 0,
+                url: job.url.clone(),
+                outcome: Outcome::Stored(StoredPage {
+                    final_url: job.url.clone(),
+                    http_status: 200,
+                    member,
+                    payload_len: payload.len() as u64,
+                    sha256: sha,
+                    noindex: false,
+                    extract: None,
+                    links: vec![],
+                }),
+                next_delay_ms: 1000,
+                sticky_delay_ms: None,
+                host_fault: false,
+                now_ms,
+            }
+        };
+        let unchanged = |job: &Job, now_ms: i64| Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Unchanged,
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms,
+        };
+
+        // Fresh fetch: base interval, streak 0.
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(stored(&job, t * 1000)).await;
+        db.flush().await;
+        assert_eq!(state_of(), (t + r, 0));
+
+        // First unchanged: streak 1, interval ×2.
+        let job = db.claim(t + r, 1).await.pop().unwrap();
+        db.complete(unchanged(&job, (t + r) * 1000)).await;
+        db.flush().await;
+        assert_eq!(state_of(), (t + 3 * r, 1));
+
+        // Second unchanged: streak 2, interval ×4.
+        let job = db.claim(t + 3 * r, 1).await.pop().unwrap();
+        db.complete(unchanged(&job, (t + 3 * r) * 1000)).await;
+        db.flush().await;
+        assert_eq!(state_of(), (t + 7 * r, 2));
+
+        // Changed content: streak resets, base interval.
+        let job = db.claim(t + 7 * r, 1).await.pop().unwrap();
+        db.complete(stored(&job, (t + 7 * r) * 1000)).await;
+        db.flush().await;
+        assert_eq!(state_of(), (t + 8 * r, 0));
+
         db.shutdown().await;
         handle.join().unwrap();
     }

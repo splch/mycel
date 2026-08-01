@@ -171,6 +171,7 @@ CREATE TABLE frontier (
   next_attempt_at INTEGER NOT NULL DEFAULT 0, -- retry backoff AND recrawl schedule
   attempts INTEGER NOT NULL DEFAULT 0,
   depth INTEGER NOT NULL DEFAULT 0,
+  unchanged_streak INTEGER NOT NULL DEFAULT 0,  -- v2: consecutive unchanged fetches; recrawl ×2^min(streak,4)
   discovered_at INTEGER NOT NULL, claimed_at INTEGER, last_error TEXT
 );
 CREATE INDEX frontier_pick ON frontier (host_id, next_attempt_at, id) WHERE state = 0;
@@ -250,7 +251,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **robots.txt (RFC 9309)**: 2xx → cache body (≤512 KiB); 4xx → allow-all; **5xx/network error → complete disallow**, `robots_body=NULL`, host stalls, retried hourly. texting_robots parses per fetch (µs; `delay: Option<f32>`, `sitemaps: Vec<String>`).
 
-**Outcomes**: 200 new sha → WARC + docs(indexed=0) + links + requeue at `now+recrawl_days` (attempts reset); 200 unchanged sha → touch fetched_at only, **no WARC write**; 3xx same-host → follow in-request; 3xx cross-host → permanent + edge recorded + target enqueued if active; 4xx → permanent (+ tantivy delete if previously indexed); 5xx/timeout → retry `60s·4^(n−1)`, permanent after 3.
+**Outcomes**: 200 new sha → WARC + docs(indexed=0) + links + requeue at `now+recrawl_days` (attempts reset, streak reset); 200 unchanged sha → touch fetched_at only, **no WARC write**, streak+1 and requeue at `recrawl_days × 2^min(streak,4)` (adaptive recrawl, ≤16×); 3xx same-host → follow in-request; 3xx cross-host → permanent + edge recorded + target enqueued if active; 4xx → permanent (+ tantivy delete if previously indexed); 5xx/timeout → retry `60s·4^(n−1)`, permanent after 3.
 
 **Crash safety**: boot resets `state=1→0`, `in_flight→0`; runtime lease sweep (5 min) requeues rows claimed >15 min.
 
@@ -387,7 +388,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10).
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2).
 
 ## Verification (end-to-end, after M5)
 

@@ -61,6 +61,9 @@ the NDCG test fail.
 
 ## Phase 2 — Adaptive recrawl scheduling
 
+**Status: shipped 2026-08-01** (schema v2; `cargo test db::` covers interval
+math, v1→v2 migration, and the streak lifecycle; acceptance run below).
+
 **Best-practice basis.** Nutch's adaptive fetch interval; Cho & Garcia-Molina
 change-rate estimation. Mycel currently requeues every page at a flat
 `recrawl_days` (14d), yet every `Outcome::Unchanged` is a free observation of

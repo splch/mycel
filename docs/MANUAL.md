@@ -161,7 +161,10 @@ active hosts are crawled. To crawl subdomains, seed each one.
 **Frontier.** The per-host URL queue. A URL enters the frontier once (URLs
 are globally unique after normalization) and cycles through queued, in-flight,
 and either rescheduled (success, recrawl after `recrawl_days`) or permanently
-failed.
+failed. Recrawl is adaptive: each consecutive fetch whose content is unchanged
+doubles that URL's interval (×2, ×4, … capped at ×16); a changed fetch
+resets it to the base interval. Static pages decay toward rare recrawls;
+volatile pages stay hot.
 
 **Docs.** One row per URL: where its latest snapshot lives in WARC
 (shard, offset, length), its content hash, language, title, and index state
@@ -212,7 +215,7 @@ process start; nothing reloads live.
 | `robots_ttl_secs` | `3600` | How long a cached robots.txt is trusted before refetch. |
 | `timeout_secs` | `30` | Whole-request timeout (connect timeout is a fixed 10 s). |
 | `max_body_bytes` | `2097152` | Page body cap. Larger bodies are truncated at the cap and stored with `WARC-Truncated: length`. |
-| `recrawl_days` | `14` | Revisit interval for successfully fetched URLs (pages and sitemaps). |
+| `recrawl_days` | `14` | Base revisit interval for successfully fetched URLs (pages and sitemaps). Pages double their interval per consecutive unchanged fetch, capped at ×16. |
 | `max_urls_per_host` | `50000` | Admission cap on URLs accepted into the frontier per host. |
 | `block_after_failures` | `25` | Circuit breaker: block a host (state 2, unclaimable) after this many consecutive host-level failures — transport errors, 5xx, robots-unavailable stalls. 4xx, content-type rejects and 429s do not count (the host answered); any success resets. `0` disables. Re-activate a blocked host with `mycel seed <host>`. |
 | `scope` | `"host"` | Crawl scope. `"host"` (exact-host) is the only accepted value in v1. |
@@ -668,8 +671,8 @@ request, and the host's turn is not consumed.
 
 | response | behavior |
 |---|---|
-| 200 (new content) | Archived to WARC, cataloged, links harvested, indexed; URL rescheduled `recrawl_days` out. |
-| 200 (unchanged sha256) | Touch timestamp only; no WARC write; rescheduled. |
+| 200 (new content) | Archived to WARC, cataloged, links harvested, indexed; URL rescheduled at the base `recrawl_days` interval. |
+| 200 (unchanged sha256) | Touch timestamp only; no WARC write; rescheduled at double the URL's previous interval (×2^streak, capped at ×16). |
 | 3xx | See redirects above. |
 | 429 | Host's sticky delay doubles: `min(max(current, default) × 2, max_delay_ms)`, never lowered again. Retry after `max(Retry-After, new delay)`; permanent failure after 5 attempts. |
 | 503 | Retry after `Retry-After` (default 60 s, clamped to 1 h); not sticky; permanent after 5 attempts. |
