@@ -283,9 +283,9 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         });
     }
     let (cfg, data) = load_env()?;
-    // Refuse while a daemon holds the live index's writer lock. An old-schema
-    // index cannot even be opened; it is disposable (rebuilt below from
-    // WARC), so move it aside instead of failing.
+    // Refuse while a daemon holds the live index's writer lock. An
+    // old-schema index cannot even be opened; it is disposable, so move it
+    // aside instead of failing.
     let live_dir = data.join("index");
     match index::open_or_create(&live_dir) {
         Ok(live) => {
@@ -296,7 +296,7 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
                 );
             }
         }
-        Err(e) if e.to_string().contains("schema changed") => {
+        Err(e) if index::is_old_schema_err(&e) => {
             let stale = data.join("index.stale");
             if stale.exists() {
                 std::fs::remove_dir_all(&stale)?;
@@ -328,12 +328,10 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         std::fs::rename(&live_dir, &old)?;
     }
     std::fs::rename(&dest, data.join("index"))?;
-    if old.exists() {
-        std::fs::remove_dir_all(&old)?;
-    }
-    let stale = data.join("index.stale");
-    if stale.exists() {
-        std::fs::remove_dir_all(&stale)?;
+    for dir in [old, data.join("index.stale")] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
     }
     println!("reindexed from WARC: {indexed} indexed, {skipped} skipped");
     Ok(())
@@ -640,14 +638,7 @@ fn cmd_search(rest: &[String]) -> Result<()> {
     } else if out.hits.is_empty() {
         println!("no results ({} docs indexed)", searcher.num_docs());
     } else {
-        let mut line = format!("{} results", out.total);
-        if out.relaxed {
-            line.push_str(" (including partial matches)");
-        }
-        if out.collapsed > 0 {
-            line.push_str(&format!(" ({} similar omitted)", out.collapsed));
-        }
-        println!("{line}");
+        println!("{} results{}", out.total, out.note());
         for h in out.hits {
             let snippet = h
                 .snippet

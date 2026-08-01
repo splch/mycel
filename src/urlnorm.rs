@@ -72,8 +72,7 @@ pub fn parse_seed_entry(entry: &str) -> std::result::Result<(String, String), St
         let url = normalize(&format!("https://{raw}/"))
             .ok_or_else(|| format!("not a host name: {entry}"))?;
         // Key the hosts row through host_of (port-less), not the raw input:
-        // discovered links key the same way, and a port in the key would fork
-        // the host into two rows and stall crawl expansion.
+        // a port in the key would fork the host into two rows.
         let host = host_of(&url).ok_or_else(|| format!("not a host name: {entry}"))?;
         Ok((host, url))
     }

@@ -19,9 +19,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # max_body_bytes = 2097152
 # recrawl_days = 14
 # max_urls_per_host = 50000
-# block_after_failures = 25  # block a host (state=2) after this many consecutive
-#                            # host-level failures (transport/5xx/robots-down);
-#                            # 0 disables; `mycel seed` re-activates
+# block_after_failures = 25  # circuit breaker: block a host after this many
+#                            # consecutive host-level failures; 0 disables;
+#                            # `mycel seed` re-activates
 # scope = "host"           # exact-host membership in the hosts table (only v1 value)
 
 [index]

@@ -8,6 +8,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub struct Api {
@@ -20,15 +21,27 @@ pub struct Api {
     pub admin: Arc<crate::admin::AdminState>,
 }
 
-/// Serve-stale cache for /stats: the gauge counts are unindexed full-table
-/// scans, so recompute at most once per STATS_TTL. Staleness is bounded:
-/// past STATS_MAX_STALE the snapshot is an error, not a gauge (RFC 5861
-/// stale-if-error semantics), and every response carries its age.
-#[derive(Default)]
-pub struct StatsCache(std::sync::Mutex<Option<(std::time::Instant, Arc<serde_json::Value>)>>);
+type Snapshot = (Instant, Arc<serde_json::Value>);
 
-const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-const STATS_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Serve-stale cache for /stats: the gauges are unindexed full-table scans,
+/// so recompute at most once per STATS_TTL and serve the snapshot (with its
+/// age) otherwise. Past STATS_MAX_STALE it is an error, not a gauge.
+#[derive(Default)]
+pub struct StatsCache(std::sync::Mutex<Option<Snapshot>>);
+
+impl StatsCache {
+    /// The freshest snapshot, if any (only ever goes None → Some).
+    fn get(&self) -> Option<Snapshot> {
+        self.0.lock().expect("stats cache poisoned").clone()
+    }
+
+    fn put(&self, v: Arc<serde_json::Value>) {
+        *self.0.lock().expect("stats cache poisoned") = Some((Instant::now(), v));
+    }
+}
+
+const STATS_TTL: Duration = Duration::from_secs(5);
+const STATS_MAX_STALE: Duration = Duration::from_secs(600);
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -140,16 +153,10 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
     if !q.trim().is_empty() {
         match run_search(&api, q.clone(), page, p.federated).await {
             Ok(out) => {
-                let mut note = String::new();
-                if out.relaxed {
-                    note.push_str(" · including partial matches");
-                }
-                if out.collapsed > 0 {
-                    note.push_str(&format!(" · {} similar omitted", out.collapsed));
-                }
                 results.push_str(&format!(
-                    "<p><small>{} results{note}</small></p>",
-                    out.total
+                    "<p><small>{} results{}</small></p>",
+                    out.total,
+                    out.note()
                 ));
                 for h in &out.hits {
                     let badge = match &h.source {
@@ -252,7 +259,7 @@ async fn peers_check(State(api): State<Arc<Api>>) -> impl IntoResponse {
 }
 
 async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
-    let db_ok = tokio::time::timeout(std::time::Duration::from_secs(1), api.db.flush())
+    let db_ok = tokio::time::timeout(Duration::from_secs(1), api.db.flush())
         .await
         .is_ok();
     let docs = api.searcher.num_docs();
@@ -268,20 +275,13 @@ async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
 }
 
 async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
-    let cached = api
-        .stats_cache
-        .0
-        .lock()
-        .expect("stats cache poisoned")
-        .clone();
-    if let Some((at, v)) = &cached
+    if let Some((at, v)) = api.stats_cache.get()
         && at.elapsed() < STATS_TTL
     {
-        return with_age(v.clone(), at.elapsed()).into_response();
+        return with_age(v, at.elapsed()).into_response();
     }
-    // Revalidate WITHOUT waiting on the connection (try_lock, never
-    // blocking_lock): if another refresh — or a wedged one — holds it, this
-    // request serves what it has instead of piling up behind the lock.
+    // try_lock, never block: if another (possibly wedged) refresh holds the
+    // connection, serve what we have instead of piling up behind it.
     let computed = tokio::task::spawn_blocking({
         let api = api.clone();
         move || {
@@ -295,46 +295,29 @@ async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
     match computed {
         Ok(Some(v)) => {
             let v = Arc::new(v);
-            *api.stats_cache.0.lock().expect("stats cache poisoned") =
-                Some((std::time::Instant::now(), v.clone()));
-            with_age(v, std::time::Duration::ZERO).into_response()
+            api.stats_cache.put(v.clone());
+            with_age(v, Duration::ZERO).into_response()
         }
-        // A concurrent request may have completed a refresh while we
-        // abstained/failed: serve the freshest snapshot available, not the
-        // one cloned before our attempt.
+        // Re-read the cache: a concurrent request may have refreshed while
+        // we abstained.
         Ok(None) => serve_stale_or_error(
-            freshest(&api, cached),
+            api.stats_cache.get(),
             "another refresh holds the stats connection",
         ),
         Err(e) => {
             tracing::error!("stats computation panicked: {e}");
-            serve_stale_or_error(freshest(&api, cached), "stats computation panicked")
+            serve_stale_or_error(api.stats_cache.get(), "stats computation panicked")
         }
     }
 }
 
-fn freshest(
-    api: &Api,
-    fallback: Option<(std::time::Instant, Arc<serde_json::Value>)>,
-) -> Option<(std::time::Instant, Arc<serde_json::Value>)> {
-    api.stats_cache
-        .0
-        .lock()
-        .expect("stats cache poisoned")
-        .clone()
-        .or(fallback)
-}
-
-fn with_age(v: Arc<serde_json::Value>, age: std::time::Duration) -> axum::Json<serde_json::Value> {
+fn with_age(v: Arc<serde_json::Value>, age: Duration) -> axum::Json<serde_json::Value> {
     let mut obj = (*v).clone();
     obj["snapshot_age_secs"] = age.as_secs().into();
     axum::Json(obj)
 }
 
-fn serve_stale_or_error(
-    cached: Option<(std::time::Instant, Arc<serde_json::Value>)>,
-    why: &'static str,
-) -> axum::response::Response {
+fn serve_stale_or_error(cached: Option<Snapshot>, why: &'static str) -> axum::response::Response {
     match cached {
         Some((at, v)) if at.elapsed() <= STATS_MAX_STALE => {
             with_age(v, at.elapsed()).into_response()

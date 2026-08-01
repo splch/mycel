@@ -69,7 +69,7 @@ CREATE TABLE docs (                                -- current snapshot per URL; 
   http_status INTEGER NOT NULL,
   fetched_at  INTEGER NOT NULL,
   indexed     INTEGER NOT NULL DEFAULT 0,          -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                                 -- dup-exact|dup-near|lang|empty|noindex|error
+  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|error (legacy DBs: dup-near)
 );
 CREATE INDEX docs_sha     ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -239,9 +239,10 @@ pub struct Completion {
     pub next_delay_ms: i64,
     /// Sticky 429 doubling: new persistent crawl_delay_ms for the host.
     pub sticky_delay_ms: Option<i64>,
-    /// True when the failure indicts the host itself (transport error, 5xx,
-    /// robots-unavailable); 4xx/content-type/429/robots outcomes are the host
-    /// answering fine and don't count toward the circuit breaker.
+    /// True when the failure indicts the host itself (transport error, 5xx);
+    /// 4xx/content-type/429/robots outcomes don't count toward the circuit
+    /// breaker. (Robots-unavailable is a host fault too, but it is counted in
+    /// handle_robots — the stall RetryAt that follows must not recount it.)
     pub host_fault: bool,
     pub now_ms: i64,
 }
@@ -494,8 +495,8 @@ pub struct DbCfg {
     pub max_depth: i64,
     /// Languages to index (ISO 639-1); others stored, not indexed.
     pub languages: Vec<String>,
-    /// Block a host (state=2) after this many consecutive host-level failures
-    /// (the circuit breaker); <= 0 disables. `mycel seed` re-activates.
+    /// Circuit breaker: block a host (state=2) after this many consecutive
+    /// host-level failures; <= 0 disables. `mycel seed` re-activates.
     pub block_after_failures: i64,
 }
 
@@ -507,15 +508,15 @@ fn block_threshold(cfg: &DbCfg) -> i64 {
     }
 }
 
-/// Log once when the circuit breaker flips a host to blocked (state=2). A
-/// blocked host is never claimed again, so this cannot repeat until re-seeded.
+/// Log once when the breaker blocks a host (state=2); a blocked host is
+/// never claimed again, so this cannot repeat until re-seeded.
 fn warn_if_blocked(tx: &Transaction, host_id: i64, threshold: i64) -> Result<()> {
-    let state: i64 = tx
-        .prepare_cached("SELECT state FROM hosts WHERE id = ?1")?
-        .query_row([host_id], |r| r.get(0))?;
+    let (host, state): (String, i64) = tx
+        .prepare_cached("SELECT host, state FROM hosts WHERE id = ?1")?
+        .query_row([host_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     if state == 2 {
         tracing::warn!(
-            "blocked host {host_id} after {threshold} consecutive host-level failures; \
+            "blocked host {host} after {threshold} consecutive host-level failures; \
              reactivate with `mycel seed`"
         );
     }
@@ -1011,7 +1012,7 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     } else {
         gate_at(m.now_ms, m.delay_ms)
     };
-    // A served robots (even an empty allow-all) proves the host is alive and
+    // A served robots (even empty allow-all) proves the host is alive and
     // resets the failure count; unavailability counts toward the breaker.
     let fault = matches!(m.result, RobotsResult::Unavailable { .. });
     let threshold = block_threshold(cfg);
@@ -1326,9 +1327,9 @@ fn handle_complete(
         tx.prepare_cached("UPDATE hosts SET in_flight = 0 WHERE id = ?1")?
             .execute([c.host_id])?;
     } else {
-        // Circuit breaker: only host-level faults (host_fault) count, and any
-        // success resets. At the threshold the host is blocked (state=2) and
-        // drops out of claim/pending_soon until manually re-seeded.
+        // Circuit breaker: only host_fault outcomes count; any success
+        // resets. At the threshold the host is blocked (state=2) and drops
+        // out of claim/pending_soon until re-seeded.
         let threshold = block_threshold(cfg);
         tx.prepare_cached(
             "UPDATE hosts SET in_flight = 0, next_fetch_at = ?1,
@@ -1381,8 +1382,8 @@ fn fail_permanent(tx: &Transaction, frontier_id: i64, reason: &str) -> Result<()
 pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> Result<(u64, u64)> {
     let (mut hosts_n, mut urls_n) = (0u64, 0u64);
     for (host, url) in entries {
-        // Seeding is also the operator's re-activation path for hosts the
-        // circuit breaker blocked: state back to 1, failure count cleared.
+        // Seeding is also the re-activation path for breaker-blocked hosts:
+        // state back to 1, failure count cleared.
         conn.execute(
             "INSERT INTO hosts (host, state, added_at) VALUES (?1, 1, ?2)
              ON CONFLICT(host) DO UPDATE SET state = 1, consecutive_failures = 0",
@@ -1543,6 +1544,16 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    /// (state, consecutive_failures) for a host row.
+    fn host_row(conn: &Connection, host: &str) -> (i64, i64) {
+        conn.query_row(
+            "SELECT state, consecutive_failures FROM hosts WHERE host = ?1",
+            [host],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
     }
 
     fn test_warc_init(dir: &Path) -> WarcInit {
@@ -1812,14 +1823,7 @@ mod tests {
         handle.join().unwrap();
 
         let conn = open(&db_path).unwrap();
-        let (state, failures): (i64, i64) = conn
-            .query_row(
-                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((state, failures), (2, 3));
+        assert_eq!(host_row(&conn, "example.com"), (2, 3));
 
         // Re-seeding re-activates and clears the failure count.
         seed_into(
@@ -1828,14 +1832,7 @@ mod tests {
             &[("example.com".into(), "http://example.com/".into())],
         )
         .unwrap();
-        let (state, failures): (i64, i64) = conn
-            .query_row(
-                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((state, failures), (1, 0));
+        assert_eq!(host_row(&conn, "example.com"), (1, 0));
     }
 
     #[tokio::test]
@@ -1868,14 +1865,11 @@ mod tests {
         handle.join().unwrap();
 
         let conn = open(&db_path).unwrap();
-        let (state, failures): (i64, i64) = conn
-            .query_row(
-                "SELECT state, consecutive_failures FROM hosts WHERE host = 'example.com'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((state, failures), (2, 2), "two dead-robots cycles block");
+        assert_eq!(
+            host_row(&conn, "example.com"),
+            (2, 2),
+            "two dead-robots cycles block"
+        );
     }
 
     #[tokio::test]

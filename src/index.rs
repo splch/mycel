@@ -1,6 +1,6 @@
 //! The tantivy indexer thread. Owns the IndexWriter, the exact-dedup gate
-//! (sha256 via SQLite; near-duplicates are NOT gated here — they index and
-//! collapse at serve time, so no document is ever unfindable), boot/periodic
+//! (sha256 via SQLite; near-dups are NOT gated — they index and collapse at
+//! serve time, so no document is ever unfindable), boot/periodic
 //! reconciliation of docs left `indexed = 0`, and batched commits. All
 //! SQLite writes flow back through the db-writer (MarkDocs).
 
@@ -15,9 +15,8 @@ use tantivy::schema::{
 };
 use tantivy::{Index, Term, doc};
 
-/// Hamming radius for near-duplicate collapsing at serve time (Manku et
-/// al., k=3 at 8B-page scale). Docs closer than this in simhash space are
-/// shown once; nothing is dropped from the index.
+/// Hamming radius for serve-time near-dup collapsing (Manku et al., k=3 at
+/// 8B-page scale). Closer docs are shown once; nothing leaves the index.
 pub const NEAR_DUP_RADIUS: u32 = 3;
 
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
@@ -87,17 +86,25 @@ pub fn fields(schema: &Schema) -> Fields {
     }
 }
 
+/// Marker in the old-schema diagnostic below (stringly on purpose: tantivy's
+/// error carries no structured kind); `reindex` keys on `is_old_schema_err`.
+const OLD_SCHEMA_MARKER: &str = "schema changed";
+
+/// True when an `open_or_create` error is the old-schema diagnostic.
+pub fn is_old_schema_err(e: &crate::Error) -> bool {
+    e.to_string().contains(OLD_SCHEMA_MARKER)
+}
+
 /// Open the index at `dir`, creating it with our schema on first use. An
-/// index written by an older schema is not an error to paper over: say how
-/// to rebuild (WARC + the catalog are the source of truth; the index is
-/// disposable).
+/// old-schema index is not an error to paper over: say how to rebuild (the
+/// index is disposable; WARC + the catalog are the source of truth).
 pub fn open_or_create(dir: &Path) -> Result<Index> {
     let mmap = tantivy::directory::MmapDirectory::open(dir)?;
     Index::open_or_create(mmap, schema()).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("schema does not match") {
             format!(
-                "index at {} was built by an older mycel (schema changed); \
+                "index at {} was built by an older mycel ({OLD_SCHEMA_MARKER}); \
                  run `mycel reindex` to rebuild it from WARC ({msg})",
                 dir.display()
             )
@@ -202,9 +209,8 @@ impl Indexer {
         tracing::info!("indexer stopped");
     }
 
-    /// Exact-dedup gate (spec order), then delete-before-add (idempotent).
-    /// Near-dups index alongside their twins; search collapses them at
-    /// serve time.
+    /// Exact-dedup gate, then delete-before-add (idempotent). Near-dups
+    /// index alongside their twins; search collapses them at serve time.
     fn gate_and_add(&mut self, d: IndexDoc) {
         let exact_dup: bool = self
             .conn

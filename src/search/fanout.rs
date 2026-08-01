@@ -10,11 +10,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-peer circuit breaker (resilience4j / Envoy outlier-ejection
-/// semantics): BREAKER_TRIP consecutive failures open it; while open the
-/// peer is skipped entirely (no fan-out timeout paid per query); the first
-/// query after the cooldown is the half-open probe. Cooldown doubles per
-/// consecutive trip, capped.
+/// Per-peer circuit breaker (resilience4j / Envoy outlier-ejection style):
+/// BREAKER_TRIP consecutive failures open it; while open the peer is skipped
+/// outright; the first query after the cooldown is the half-open probe.
+/// Cooldown doubles per consecutive trip, capped.
 const BREAKER_TRIP: u32 = 5;
 const BREAKER_BASE_COOLDOWN: Duration = Duration::from_secs(30);
 const BREAKER_MAX_COOLDOWN: Duration = Duration::from_secs(3600);
@@ -68,6 +67,15 @@ impl Fanout {
         }
     }
 
+    /// True while the peer's breaker is open.
+    fn breaker_open(&self, peer_id: &str) -> bool {
+        self.breakers
+            .lock()
+            .expect("breaker poisoned")
+            .get(peer_id)
+            .is_some_and(|b| b.should_skip(Instant::now()))
+    }
+
     fn record(&self, peer_id: &str, ok: bool) {
         let mut breakers = self.breakers.lock().expect("breaker poisoned");
         let b = breakers.entry(peer_id.to_string()).or_default();
@@ -78,19 +86,12 @@ impl Fanout {
         }
     }
 
-    /// Query every peer in parallel; a slow or dead peer contributes nothing
-    /// and never delays past the timeout. Peers whose breaker is open are
-    /// skipped outright.
+    /// Query every peer in parallel; a slow, dead, or breaker-open peer
+    /// contributes nothing and never delays past the timeout.
     pub async fn search_peers(self: &Arc<Self>, query: &str, limit: usize) -> Vec<Vec<Hit>> {
         let mut handles = Vec::new();
         for peer in &self.peers {
-            if self
-                .breakers
-                .lock()
-                .expect("breaker poisoned")
-                .get(&peer.id)
-                .is_some_and(|b| b.should_skip(Instant::now()))
-            {
+            if self.breaker_open(&peer.id) {
                 tracing::debug!("peer {} skipped (circuit open)", peer.id);
                 continue;
             }

@@ -7,6 +7,7 @@ pub mod fanout;
 use crate::Result;
 use crate::index::{Fields, NEAR_DUP_RADIUS, fields};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
@@ -35,18 +36,32 @@ pub struct Hit {
     pub source: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Outcome {
     /// Matches before near-duplicate collapsing (and before pagination).
     pub total: usize,
     pub hits: Vec<Hit>,
-    /// True when the conjunctive parse matched nothing and the hits come
+    /// True when the conjunctive query matched nothing and the hits come
     /// from the disjunctive fallback (partial matches, BM25-ranked).
     pub relaxed: bool,
-    /// Hits hidden from this page as near-duplicates of a better-ranked hit
-    /// (simhash Hamming <= NEAR_DUP_RADIUS). Collapsing is presentational:
-    /// nothing is removed from the index.
+    /// Hits hidden from this page as near-duplicates (simhash Hamming <=
+    /// NEAR_DUP_RADIUS) of a better-ranked hit. Nothing leaves the index.
     pub collapsed: usize,
+}
+
+impl Outcome {
+    /// The relaxed/collapsed annotations shared by the HTML UI and the CLI:
+    /// "" or e.g. " · including partial matches · 3 similar omitted".
+    pub fn note(&self) -> String {
+        let mut s = String::new();
+        if self.relaxed {
+            s.push_str(" · including partial matches");
+        }
+        if self.collapsed > 0 {
+            s.push_str(&format!(" · {} similar omitted", self.collapsed));
+        }
+        s
+    }
 }
 
 impl Searcher {
@@ -71,12 +86,7 @@ impl Searcher {
         let page = page.min(MAX_PAGE);
         let (site_hosts, text) = split_site_filters(&raw);
         if text.is_empty() && site_hosts.is_empty() {
-            return Ok(Outcome {
-                total: 0,
-                hits: Vec::new(),
-                relaxed: false,
-                collapsed: 0,
-            });
+            return Ok(Outcome::default());
         }
 
         let searcher = self.reader.searcher();
@@ -94,10 +104,9 @@ impl Searcher {
                 parser.parse_query_lenient(&text).0
             })
         };
-        let run = |text_query: Option<Box<dyn Query>>| -> Result<(usize, Vec<Hit>, usize)> {
-            // The generator collects its terms from the query without
-            // retaining a borrow, so build it before the query moves into
-            // the boolean composition. One parse per pass, reused everywhere.
+        let run = |text_query: Option<Box<dyn Query>>| -> Result<Outcome> {
+            // Build the generator before the query moves into the boolean
+            // composition; it keeps no borrow. One parse serves both.
             let snippet_gen = text_query
                 .as_ref()
                 .and_then(|q| {
@@ -148,16 +157,13 @@ impl Searcher {
 
             let mut kept: Vec<u64> = Vec::with_capacity(top.len());
             let mut collapsed = 0usize;
-            let mut sim_cols: std::collections::HashMap<
-                u32,
-                Option<tantivy::fastfield::Column<u64>>,
-            > = std::collections::HashMap::new();
+            let mut sim_cols: HashMap<u32, Option<tantivy::fastfield::Column<u64>>> =
+                HashMap::new();
             let mut hits = Vec::with_capacity(top.len());
             for (score, addr) in top {
                 // Serve-time near-dup collapse: hide hits within the simhash
                 // radius of a better-ranked hit on this page. Docs without a
-                // simhash never collapse. The column is resolved once per
-                // segment, not once per hit.
+                // simhash never collapse; the column resolves once per segment.
                 if let Some(sim) = sim_cols
                     .entry(addr.segment_ord)
                     .or_insert_with(|| {
@@ -191,8 +197,8 @@ impl Searcher {
                     .map(|g| g.snippet_from_doc(&doc).to_html())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| {
-                        // The body string is only materialized on this path
-                        // (the generator usually wins); one bounded scan.
+                        // The body string is materialized only on this path
+                        // (the generator usually wins).
                         let body = text_of(self.fields.body);
                         let mut it = body.chars();
                         let mut s: String = it.by_ref().take(SNIPPET_CHARS).collect();
@@ -214,38 +220,28 @@ impl Searcher {
                     source: None,
                 });
             }
-            Ok((total, hits, collapsed))
-        };
-
-        // Query semantics: conjunctive first (precision); when it matches
-        // nothing, retry disjunctive and let BM25 rank partial matches — the
-        // standard zero-results fallback (Lucene/Algolia `allOptional`, Vespa
-        // weakAnd). site: filters are explicit intent and never relax.
-        //
-        // (A trimmed-conjunction middle pass — drop highest-DF terms per the
-        // ES conditional MSM spec — was benchmarked on TREC-COVID and
-        // REJECTED: nDCG@10 0.420 vs 0.439 without it. Subset conjunction
-        // isn't Lucene MSM: the dropped terms also leave the scoring, and
-        // when content terms are missing the kept-subset match is arbitrary.
-        // See docs/BENCHMARKING.md.)
-        let (total, hits, collapsed) = run(build_text(true))?;
-        // A lone term behaves identically under both semantics; only
-        // multi-term queries can benefit from the fallback pass.
-        if total > 0 || text.split_whitespace().nth(1).is_none() {
-            return Ok(Outcome {
+            Ok(Outcome {
                 total,
                 hits,
                 relaxed: false,
                 collapsed,
-            });
+            })
+        };
+
+        // Conjunctive first (precision); on zero hits, retry disjunctive and
+        // let BM25 rank partial matches — the standard zero-results fallback
+        // (Lucene MSM, Algolia `allOptional`, Vespa weakAnd). site: filters
+        // never relax. (A trimmed-conjunction middle pass was benchmarked on
+        // TREC-COVID and REJECTED: nDCG@10 0.420 vs 0.439; see
+        // docs/BENCHMARKING.md.)
+        let mut out = run(build_text(true))?;
+        // A lone term behaves identically under both semantics; skip the
+        // fallback unless the query has several terms.
+        if out.total == 0 && text.split_whitespace().nth(1).is_some() {
+            out = run(build_text(false))?;
+            out.relaxed = true;
         }
-        let (total, hits, collapsed) = run(build_text(false))?;
-        Ok(Outcome {
-            total,
-            hits,
-            relaxed: true,
-            collapsed,
-        })
+        Ok(out)
     }
 }
 
@@ -568,11 +564,11 @@ mod tests {
             String::from("# generated by golden_queries; UPDATE_GOLDENS=1 to refresh\n");
         for q in queries {
             let out = s.search(q, 0, 3).unwrap();
-            let (total, hits) = (out.total, out.hits);
             rendered.push_str(&format!(
-                "\n[[case]]\nquery = {q:?}\ntotal = {total}\ntop = ["
+                "\n[[case]]\nquery = {q:?}\ntotal = {}\ntop = [",
+                out.total
             ));
-            for (i, h) in hits.iter().enumerate() {
+            for (i, h) in out.hits.iter().enumerate() {
                 if i > 0 {
                     rendered.push_str(", ");
                 }
