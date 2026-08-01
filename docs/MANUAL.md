@@ -497,7 +497,7 @@ reverse-proxied service. All responses are JSON except `/` and `/admin`.
 Server-rendered HTML search UI with pagination. Accepts the same `q`,
 `page`, and `federated` parameters as the API.
 
-### `GET /api/search?q=<query>[&page=N][&federated=0|1]`
+### `GET /api/search?q=<query>[&page=N][&federated=0|1][&collapse=0|1]`
 
 ```json
 {
@@ -521,6 +521,7 @@ Server-rendered HTML search UI with pagination. Accepts the same `q`,
 - `q` empty or missing returns `total: 0, hits: []`.
 - `relaxed` is true when the all-terms query matched nothing and the hits are partial matches from the any-terms retry. `site:` filters stay mandatory under the fallback.
 - `collapsed` counts hits hidden from this page as near-duplicates (simhash Hamming ≤ 3) of a better-ranked hit. Collapsing is presentational only; `total` is the exact match count **before** collapsing.
+- `collapse` defaults to 1. `collapse=0` returns the full page with nothing hidden — the "show similar" escape hatch the web UI links next to the omitted count.
 - `page` defaults to 0.
 - `federated` defaults to the config (`federation.fanout` when federation is
   enabled, otherwise off). `federated=1` forces fan-out, `federated=0` forces

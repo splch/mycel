@@ -79,6 +79,11 @@ struct SearchParams {
     q: Option<String>,
     page: Option<usize>,
     federated: Option<u8>,
+    collapse: Option<u8>,
+}
+
+fn want_collapse(p: &SearchParams) -> bool {
+    p.collapse.map(|v| v != 0).unwrap_or(true)
 }
 
 async fn run_search(
@@ -86,6 +91,7 @@ async fn run_search(
     q: String,
     page: usize,
     federated: Option<u8>,
+    collapse: bool,
 ) -> std::result::Result<search::Outcome, String> {
     let searcher = api.searcher.clone();
     let page_size = api.page_size;
@@ -101,7 +107,8 @@ async fn run_search(
         && let Some(fed) = &api.fed
     {
         let local_q = q.clone();
-        let local = tokio::task::spawn_blocking(move || searcher.search(&local_q, 0, page_size));
+        let local =
+            tokio::task::spawn_blocking(move || searcher.search(&local_q, 0, page_size, collapse));
         let peer_lists = fed.fanout.search_peers(&q, page_size).await;
         let out = local
             .await
@@ -115,7 +122,7 @@ async fn run_search(
             ..out
         });
     }
-    tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size))
+    tokio::task::spawn_blocking(move || searcher.search(&q, page, page_size, collapse))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -125,6 +132,7 @@ async fn api_search(
     State(api): State<Arc<Api>>,
     Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
+    let collapse = want_collapse(&p);
     let q = p.q.unwrap_or_default();
     let page = p.page.unwrap_or(0);
     if q.trim().is_empty() {
@@ -133,7 +141,7 @@ async fn api_search(
         }))
         .into_response();
     }
-    match run_search(&api, q.clone(), page, p.federated).await {
+    match run_search(&api, q.clone(), page, p.federated, collapse).await {
         Ok(out) => axum::Json(serde_json::json!({
             "query": q, "page": page, "total": out.total, "hits": out.hits,
             "relaxed": out.relaxed, "collapsed": out.collapsed
@@ -147,16 +155,23 @@ async fn api_search(
 }
 
 async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl IntoResponse {
+    let collapse = want_collapse(&p);
     let q = p.q.unwrap_or_default();
     let page = p.page.unwrap_or(0);
     let mut results = String::new();
     if !q.trim().is_empty() {
-        match run_search(&api, q.clone(), page, p.federated).await {
+        match run_search(&api, q.clone(), page, p.federated, collapse).await {
             Ok(out) => {
+                let mut note = out.note();
+                if out.collapsed > 0 && collapse {
+                    let qe = crate::urlencode(&q);
+                    note.push_str(&format!(
+                        " · <a href=\"/?q={qe}&collapse=0\">show similar</a>"
+                    ));
+                }
                 results.push_str(&format!(
-                    "<p><small>{} results{}</small></p>",
-                    out.total,
-                    out.note()
+                    "<p><small>{} results{note}</small></p>",
+                    out.total
                 ));
                 for h in &out.hits {
                     let badge = match &h.source {
@@ -177,15 +192,20 @@ async fn ui(State(api): State<Arc<Api>>, Query(p): Query<SearchParams>) -> impl 
                     ));
                 }
                 let qe = crate::urlencode(&q);
+                let cx = if p.collapse == Some(0) {
+                    "&collapse=0"
+                } else {
+                    ""
+                };
                 if page > 0 {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}\">← prev</a> ",
+                        "<a href=\"/?q={qe}&page={}{cx}\">← prev</a> ",
                         page - 1
                     ));
                 }
                 if (page + 1) * api.page_size < out.total {
                     results.push_str(&format!(
-                        "<a href=\"/?q={qe}&page={}\">next →</a>",
+                        "<a href=\"/?q={qe}&page={}{cx}\">next →</a>",
                         page + 1
                     ));
                 }

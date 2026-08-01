@@ -263,7 +263,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 ## 7. Dedup
 
 1. **Exact** (gate, in the indexer): another URL with same `sha256` already indexed → `indexed=2 'dup-exact'`.
-2. **Near** (collapse, at serve time): 64-bit simhash over lowercased word tokens of extracted text, kept as a tantivy FAST field; a hit within Hamming radius 3 (Manku et al., k=3 at 8B-page scale) of a better-ranked hit on the page is hidden and counted in the response's `collapsed` field. Nothing is rejected: versioned/syndicated content stays findable (the industry pattern — Google's expandable "similar results omitted", Elasticsearch collapse/inner_hits). `total` counts matches before collapsing. Evidence: index-time near-dup dropped 18% of TREC-COVID judged-relevant docs (docs/BENCHMARKING.md, 2026-07).
+2. **Near** (collapse, at serve time): 64-bit simhash over lowercased word tokens of extracted text, kept as a tantivy FAST field; a hit within Hamming radius 3 (Manku et al., k=3 at 8B-page scale) of a better-ranked hit on the page is hidden and counted in the response's `collapsed` field, expandable via `collapse=0`. Nothing is rejected: versioned/syndicated content stays findable (the industry pattern — Google's expandable "similar results omitted", Elasticsearch collapse/inner_hits). `total` counts matches before collapsing. Evidence: index-time near-dup dropped 18% of TREC-COVID judged-relevant docs (docs/BENCHMARKING.md, 2026-07).
 
 Exact dupes stay in WARC and docs (corpus, shareable, webgraph feeds), never indexed.
 

@@ -80,8 +80,15 @@ impl Searcher {
         self.reader.searcher().num_docs()
     }
 
-    /// One page of results; see Outcome for the fields.
-    pub fn search(&self, raw: &str, page: usize, page_size: usize) -> Result<Outcome> {
+    /// One page of results; see Outcome for the fields. `collapse` toggles
+    /// near-duplicate collapsing (the "show similar" escape hatch).
+    pub fn search(
+        &self,
+        raw: &str,
+        page: usize,
+        page_size: usize,
+        collapse: bool,
+    ) -> Result<Outcome> {
         let raw: String = raw.chars().take(MAX_QUERY_CHARS).collect();
         let page = page.min(MAX_PAGE);
         let (site_hosts, text) = split_site_filters(&raw);
@@ -164,17 +171,18 @@ impl Searcher {
                 // Serve-time near-dup collapse: hide hits within the simhash
                 // radius of a better-ranked hit on this page. Docs without a
                 // simhash never collapse; the column resolves once per segment.
-                if let Some(sim) = sim_cols
-                    .entry(addr.segment_ord)
-                    .or_insert_with(|| {
-                        searcher
-                            .segment_reader(addr.segment_ord)
-                            .fast_fields()
-                            .u64("simhash")
-                            .ok()
-                    })
-                    .as_ref()
-                    .and_then(|c| c.first(addr.doc_id))
+                if collapse
+                    && let Some(sim) = sim_cols
+                        .entry(addr.segment_ord)
+                        .or_insert_with(|| {
+                            searcher
+                                .segment_reader(addr.segment_ord)
+                                .fast_fields()
+                                .u64("simhash")
+                                .ok()
+                        })
+                        .as_ref()
+                        .and_then(|c| c.first(addr.doc_id))
                 {
                     if kept
                         .iter()
@@ -331,7 +339,7 @@ mod tests {
 
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
-        let out = s.search("mycelium networks", 0, 10).unwrap();
+        let out = s.search("mycelium networks", 0, 10, true).unwrap();
         assert!(!out.relaxed);
         assert_eq!(out.total, 2);
         // c.com has the longer body (slightly lower BM25) but the centrality
@@ -347,12 +355,12 @@ mod tests {
 
         // zero-results fallback: no doc has both terms, so the disjunctive
         // pass returns the partial matches
-        let out = s.search("mycelium pasta", 0, 10).unwrap();
+        let out = s.search("mycelium pasta", 0, 10, true).unwrap();
         assert!(out.relaxed);
         assert_eq!(out.total, 3);
 
         // site: filter
-        let out = s.search("mycelium site:a.com", 0, 10).unwrap();
+        let out = s.search("mycelium site:a.com", 0, 10, true).unwrap();
         assert!(!out.relaxed);
         assert_eq!(out.total, 1);
         assert_eq!(out.hits[0].host, "a.com");
@@ -384,28 +392,28 @@ mod tests {
         s.reader.reload().unwrap();
 
         // no doc has all three terms: AND misses, OR ranks the 2-term doc first
-        let out = s.search("alpha beta gamma", 0, 10).unwrap();
+        let out = s.search("alpha beta gamma", 0, 10, true).unwrap();
         assert!(out.relaxed);
         assert_eq!(out.total, 2);
         assert_eq!(out.hits[0].url, "http://a.com/1");
 
         // single term: nothing to relax
-        let out = s.search("alpha", 0, 10).unwrap();
+        let out = s.search("alpha", 0, 10, true).unwrap();
         assert_eq!(out.total, 1);
         assert!(!out.relaxed);
 
         // conjunctive hit: no fallback
-        let out = s.search("alpha beta", 0, 10).unwrap();
+        let out = s.search("alpha beta", 0, 10, true).unwrap();
         assert_eq!(out.total, 1);
         assert!(!out.relaxed);
 
         // site: stays mandatory even when the text relaxes
-        let out = s.search("alpha beta site:b.com", 0, 10).unwrap();
+        let out = s.search("alpha beta site:b.com", 0, 10, true).unwrap();
         assert_eq!(out.total, 0);
         assert!(out.relaxed);
 
         // nothing matches under either semantics
-        let out = s.search("delta epsilon", 0, 10).unwrap();
+        let out = s.search("delta epsilon", 0, 10, true).unwrap();
         assert_eq!(out.total, 0);
         assert!(out.relaxed);
     }
@@ -438,13 +446,23 @@ mod tests {
 
         let s = Searcher::open(dir.path(), 0.3).unwrap();
         s.reader.reload().unwrap();
-        let out = s.search("shared reporting investigation", 0, 10).unwrap();
+        let out = s
+            .search("shared reporting investigation", 0, 10, true)
+            .unwrap();
         // total counts matches before collapsing; the syndicated twin is
         // hidden, the near-miss (bakery vs cathedral) is NOT within radius
         assert_eq!(out.total, 3);
         assert_eq!(out.hits.len(), 2);
         assert_eq!(out.collapsed, 1);
         assert_ne!(out.hits[0].url, out.hits[1].url);
+
+        // "show similar": collapse off -> every copy visible, nothing hidden
+        let out = s
+            .search("shared reporting investigation", 0, 10, false)
+            .unwrap();
+        assert_eq!(out.total, 3);
+        assert_eq!(out.hits.len(), 3);
+        assert_eq!(out.collapsed, 0);
     }
     /// Deterministic corpus + queries; top-3 URLs snapshotted in
     /// tests/golden/queries.toml. Regenerate with UPDATE_GOLDENS=1 after an
@@ -563,7 +581,7 @@ mod tests {
         let mut rendered =
             String::from("# generated by golden_queries; UPDATE_GOLDENS=1 to refresh\n");
         for q in queries {
-            let out = s.search(q, 0, 3).unwrap();
+            let out = s.search(q, 0, 3, true).unwrap();
             rendered.push_str(&format!(
                 "\n[[case]]\nquery = {q:?}\ntotal = {}\ntop = [",
                 out.total

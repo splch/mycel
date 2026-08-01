@@ -626,7 +626,7 @@ fn cmd_search(rest: &[String]) -> Result<()> {
         });
     }
     let searcher = search::Searcher::open(&data.join("index"), cfg.rank.weight)?;
-    let out = searcher.search(&q, 0, cfg.api.page_size)?;
+    let out = searcher.search(&q, 0, cfg.api.page_size, true)?;
     if json {
         println!(
             "{}",
