@@ -1,0 +1,130 @@
+# Graded relevance judgments over the deterministic corpus built in
+# src/search.rs::tests::ndcg_qrels (the corpus is code so the fixture and its
+# judgments can never drift apart; the grades are human judgments).
+#
+# grade 2 = highly relevant, grade 1 = relevant; unlisted URLs are nonrelevant.
+# floor = minimum acceptable NDCG@10. The baseline is 1.0 for every case:
+# any ranking regression that swaps a graded pair or lets a nonrelevant doc
+# outrank a graded one drops the case below its floor. The "dagger goblet"
+# case is the title-boost canary: its grade-2 doc matches only via the title
+# field, so removing the title boost flips the order and fails the test.
+
+[[case]]
+query = "rust ownership"
+floor = 0.999
+[case.grades]
+"https://rust-book.example.com/ownership" = 2
+"https://blog.example.dev/rust-ownership-notes" = 1
+
+[[case]]
+query = "mycelium networks"
+floor = 0.999
+[case.grades]
+"https://fungi.example.org/networks" = 2
+"https://blog.example.dev/mycelium-notes" = 1
+
+[[case]]
+query = "\"quick brown fox\""
+floor = 0.999
+[case.grades]
+"https://phrase.example.net/fox" = 2
+"https://blog.example.dev/fox-notes" = 1
+
+[[case]]
+query = "quantum entanglement"
+floor = 0.999
+[case.grades]
+"https://phys.example.org/entanglement" = 2
+"https://blog.example.dev/quantum-notes" = 1
+
+[[case]]
+query = "pasta recipe"
+floor = 0.999
+[case.grades]
+"https://cook.example.com/pasta-recipe" = 2
+"https://blog.example.dev/pasta-notes" = 1
+
+[[case]]
+query = "site:blog.example.dev ownership"
+floor = 0.999
+[case.grades]
+"https://blog.example.dev/ownership-deep-dive" = 2
+"https://blog.example.dev/ownership-quiz" = 1
+"https://blog.example.dev/rust-ownership-notes" = 1
+
+[[case]]
+query = "harvest signal"
+floor = 0.999
+[case.grades]
+"https://farm.example.org/harvest-signal" = 2
+"https://blog.example.dev/harvest-notes" = 1
+
+[[case]]
+query = "granite summit"
+floor = 0.999
+[case.grades]
+"https://alpine.example.org/granite-summit" = 2
+"https://blog.example.dev/granite-notes" = 1
+
+[[case]]
+query = "lantern harbor"
+floor = 0.999
+[case.grades]
+"https://coast.example.org/lantern-harbor" = 2
+"https://blog.example.dev/lantern-notes" = 1
+
+[[case]]
+query = "meadow willow breeze"
+floor = 0.999
+[case.grades]
+"https://poems.example.org/meadow" = 2
+"https://blog.example.dev/meadow-notes" = 1
+
+[[case]]
+query = "ember quartz"
+floor = 0.999
+[case.grades]
+"https://gems.example.org/ember-quartz" = 2
+"https://blog.example.dev/ember-notes" = 1
+
+[[case]]
+query = "orchard ripple compass"
+floor = 0.999
+[case.grades]
+"https://trail.example.org/orchard" = 2
+"https://blog.example.dev/orchard-notes" = 1
+
+[[case]]
+query = "archive library"
+floor = 0.999
+[case.grades]
+"https://town.example.org/archive-library" = 2
+"https://blog.example.dev/archive-notes" = 1
+
+[[case]]
+query = "search engine ranking"
+floor = 0.999
+[case.grades]
+"https://ir.example.org/search-engine-ranking" = 2
+"https://blog.example.dev/ranking-notes" = 1
+
+[[case]]
+query = "mycelium"
+floor = 0.999
+[case.grades]
+"https://fungi.example.org/networks" = 2
+"https://blog.example.dev/mycelium-notes" = 1
+
+[[case]]
+query = "harbor"
+floor = 0.999
+[case.grades]
+"https://coast.example.org/lantern-harbor" = 2
+"https://blog.example.dev/lantern-notes" = 1
+
+[[case]]
+query = "dagger goblet"
+floor = 0.999
+[case.grades]
+"https://museum.example.org/dagger-goblet" = 2
+"https://blog.example.dev/dagger-notes" = 1

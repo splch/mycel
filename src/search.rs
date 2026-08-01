@@ -604,4 +604,315 @@ mod tests {
             "ranking drifted; review and regenerate"
         );
     }
+
+    // ---------------------------------------------------- qrels harness --
+
+    /// Noise-doc vocabulary, deliberately disjoint from every query term.
+    const NOISE_WORDS: [&str; 24] = [
+        "tundra", "saddle", "puzzle", "candle", "hammer", "velvet", "copper", "window", "tunnel",
+        "marble", "carpet", "basket", "pillow", "rocket", "saucer", "timber", "wagon", "zipper",
+        "castle", "anchor", "glacier", "hammock", "iodine", "juniper",
+    ];
+
+    fn noise_soup(seed: u64, n: usize) -> String {
+        let mut state = seed;
+        let mut out = String::new();
+        for _ in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push_str(NOISE_WORDS[(state >> 33) as usize % NOISE_WORDS.len()]);
+            out.push(' ');
+        }
+        out
+    }
+
+    #[derive(serde::Deserialize)]
+    struct QrelsFile {
+        case: Vec<QrelsCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct QrelsCase {
+        query: String,
+        floor: f64,
+        grades: std::collections::BTreeMap<String, u32>,
+    }
+
+    /// DCG@10 with linear gains.
+    fn dcg(gains: impl Iterator<Item = u32>) -> f64 {
+        gains
+            .take(10)
+            .enumerate()
+            .map(|(i, g)| f64::from(g) / (i as f64 + 2.0).log2())
+            .sum()
+    }
+
+    /// NDCG@10 against tests/golden/qrels.toml over a deterministic corpus.
+    /// Baseline is 1.0 for every case; the "dagger goblet" case is the
+    /// title-boost canary (its grade-2 doc matches only via the title field).
+    #[test]
+    fn ndcg_qrels() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = crate::index::open_or_create(dir.path()).unwrap();
+        let f = fields(&index.schema());
+        // Single-threaded writer: deterministic doc→segment assignment.
+        let w: tantivy::IndexWriter = index.writer_with_num_threads(1, 64 * 1024 * 1024).unwrap();
+        let mut corpus_urls = std::collections::HashSet::new();
+        let mut add = |url: &str, host: &str, title: &str, body: &str| {
+            corpus_urls.insert(url.to_string());
+            w.add_document(doc!(
+                f.url => url, f.host => host, f.title => title, f.body => body,
+                f.lang => "en", f.fetched_at => 1u64, f.centrality => 0.0,
+            ))
+            .unwrap();
+        };
+        // Graded docs: per query a title-carrying grade-2 doc and a body-only
+        // grade-1 doc; noise docs match all terms once in a long body and must
+        // rank below both.
+        add(
+            "https://rust-book.example.com/ownership",
+            "rust-book.example.com",
+            "Rust ownership, borrowing, and lifetimes",
+            "Ownership is Rust's central feature: ownership borrowing lifetimes move semantics explained with many examples of ownership rules",
+        );
+        add(
+            "https://blog.example.dev/rust-ownership-notes",
+            "blog.example.dev",
+            "Weekend notes",
+            "rust ownership means every value has exactly one owner and ownership moves on assignment",
+        );
+        add(
+            "https://fungi.example.org/networks",
+            "fungi.example.org",
+            "Mycelium networks in the forest",
+            "mycelium networks connect trees underground and share nutrients through fungal strands",
+        );
+        add(
+            "https://blog.example.dev/mycelium-notes",
+            "blog.example.dev",
+            "Field journal",
+            "mycelium networks are vast fungal webs linking plant roots across the forest floor",
+        );
+        add(
+            "https://phrase.example.net/fox",
+            "phrase.example.net",
+            "The quick brown fox story",
+            "one day the quick brown fox jumps over the lazy dog and runs away into the meadow",
+        );
+        add(
+            "https://blog.example.dev/fox-notes",
+            "blog.example.dev",
+            "Fable notes",
+            "every typing student meets the quick brown fox during practice drills at school",
+        );
+        add(
+            "https://phys.example.org/entanglement",
+            "phys.example.org",
+            "Quantum entanglement explained",
+            "quantum entanglement links pairs of particles so measuring one affects the other instantly",
+        );
+        add(
+            "https://blog.example.dev/quantum-notes",
+            "blog.example.dev",
+            "Lab notebook",
+            "quantum entanglement appeared in the lab notes after the photon pair experiment succeeded",
+        );
+        add(
+            "https://cook.example.com/pasta-recipe",
+            "cook.example.com",
+            "Pasta recipe for beginners",
+            "this pasta recipe uses fresh eggs flour water and salt to make silky noodles at home",
+        );
+        add(
+            "https://blog.example.dev/pasta-notes",
+            "blog.example.dev",
+            "Kitchen diary",
+            "my favorite pasta recipe starts with boiling salted water before adding the noodles",
+        );
+        add(
+            "https://blog.example.dev/ownership-deep-dive",
+            "blog.example.dev",
+            "Ownership deep dive",
+            "ownership deep dive: how moves borrows and lifetimes interact in practice",
+        );
+        add(
+            "https://blog.example.dev/ownership-quiz",
+            "blog.example.dev",
+            "Quiz night",
+            "ownership questions from the quiz: who keeps the value after the function returns",
+        );
+        add(
+            "https://farm.example.org/harvest-signal",
+            "farm.example.org",
+            "Harvest signal timing",
+            "the harvest signal tells farmers when grain moisture is low enough to combine",
+        );
+        add(
+            "https://blog.example.dev/harvest-notes",
+            "blog.example.dev",
+            "Autumn journal",
+            "harvest signal lanterns marked the start of the wheat gathering this year",
+        );
+        add(
+            "https://alpine.example.org/granite-summit",
+            "alpine.example.org",
+            "Granite summit routes",
+            "granite summit ridges demand careful footwork and an early alpine start",
+        );
+        add(
+            "https://blog.example.dev/granite-notes",
+            "blog.example.dev",
+            "Trip report",
+            "the granite summit was cold and windy but the view over the valley was worth it",
+        );
+        add(
+            "https://coast.example.org/lantern-harbor",
+            "coast.example.org",
+            "Lantern harbor festival",
+            "the lantern harbor festival lights paper boats that drift across the bay at dusk",
+        );
+        add(
+            "https://blog.example.dev/lantern-notes",
+            "blog.example.dev",
+            "Travel diary",
+            "lantern harbor nights smell of salt and fried dough from the quayside stalls",
+        );
+        add(
+            "https://poems.example.org/meadow",
+            "poems.example.org",
+            "Meadow willow breeze",
+            "a meadow willow breeze moved through the tall grass before the summer storm",
+        );
+        add(
+            "https://blog.example.dev/meadow-notes",
+            "blog.example.dev",
+            "Sketchbook",
+            "meadow willow breeze: three words I sketched under the tree this afternoon",
+        );
+        add(
+            "https://gems.example.org/ember-quartz",
+            "gems.example.org",
+            "Ember quartz varieties",
+            "ember quartz glows orange under shortwave light and collectors prize it",
+        );
+        add(
+            "https://blog.example.dev/ember-notes",
+            "blog.example.dev",
+            "Rock hunting",
+            "ember quartz fragments littered the old mine tailings near the creek",
+        );
+        add(
+            "https://trail.example.org/orchard",
+            "trail.example.org",
+            "Orchard ripple compass",
+            "an orchard ripple compass marks the old survey line past the cider mill",
+        );
+        add(
+            "https://blog.example.dev/orchard-notes",
+            "blog.example.dev",
+            "Hike log",
+            "orchard ripple compass: odd landmark names from the valley trail map",
+        );
+        add(
+            "https://town.example.org/archive-library",
+            "town.example.org",
+            "Archive library hours",
+            "the archive library preserves town newspapers back to the first printing press",
+        );
+        add(
+            "https://blog.example.dev/archive-notes",
+            "blog.example.dev",
+            "Research visit",
+            "the archive library reading room smells of cedar and old paper",
+        );
+        add(
+            "https://ir.example.org/search-engine-ranking",
+            "ir.example.org",
+            "Search engine ranking signals",
+            "search engine ranking blends lexical scores link analysis and quality signals",
+        );
+        add(
+            "https://blog.example.dev/ranking-notes",
+            "blog.example.dev",
+            "Reading list",
+            "search engine ranking papers describe bm25 harmonic centrality and field weighting",
+        );
+        // Title-boost canary: the grade-2 doc matches ONLY via its title; the
+        // grade-1 doc repeats both terms in its body. Removing the title
+        // boost flips their order and must fail this test.
+        add(
+            "https://museum.example.org/dagger-goblet",
+            "museum.example.org",
+            "Dagger goblet exhibition",
+            &noise_soup(25, 40),
+        );
+        add(
+            "https://blog.example.dev/dagger-notes",
+            "blog.example.dev",
+            "Museum journal",
+            "dagger goblet dagger goblet dagger goblet filled the display notes this week",
+        );
+        // Noise: every query term present once in a long body (must rank
+        // last); fox-soup has the words but not the phrase.
+        add(
+            "https://noise.example.dev/fox-soup",
+            "noise.example.dev",
+            "Random journal",
+            "quick foxes and brown bears often appear in typing drills where quick brown is a color and fox means clever",
+        );
+        for (name, terms, seed) in [
+            ("soup-rust", "rust ownership", 11u64),
+            ("soup-mycelium", "mycelium networks", 12),
+            ("soup-quantum", "quantum entanglement", 14),
+            ("soup-pasta", "pasta recipe", 15),
+            ("soup-harvest", "harvest signal", 17),
+            ("soup-granite", "granite summit", 18),
+            ("soup-lantern", "lantern harbor", 19),
+            ("soup-meadow", "meadow willow", 20), // 2 of 3 terms
+            ("soup-ember", "ember quartz", 21),
+            ("soup-orchard", "orchard ripple", 22), // 2 of 3 terms
+            ("soup-archive", "archive library", 23),
+            ("soup-ranking", "search engine ranking", 24),
+        ] {
+            add(
+                &format!("https://noise.example.dev/{name}"),
+                "noise.example.dev",
+                "Random journal",
+                &format!("{terms} {}", noise_soup(seed, 60)),
+            );
+        }
+        let mut w = w;
+        w.commit().unwrap();
+
+        let s = Searcher::open(dir.path(), 0.3).unwrap();
+        s.reader.reload().unwrap();
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/qrels.toml");
+        let qrels: QrelsFile =
+            toml::from_str(&std::fs::read_to_string(&path).expect("qrels.toml readable"))
+                .expect("qrels.toml parses");
+        assert!(qrels.case.len() >= 15, "qrels harness shrank?");
+        for case in &qrels.case {
+            for url in case.grades.keys() {
+                assert!(corpus_urls.contains(url), "graded URL not in corpus: {url}");
+            }
+            let out = s.search(&case.query, 0, 10, true).unwrap();
+            let actual = dcg(out
+                .hits
+                .iter()
+                .map(|h| case.grades.get(&h.url).copied().unwrap_or(0)));
+            let mut ideal: Vec<u32> = case.grades.values().copied().collect();
+            ideal.sort_unstable_by(|a, b| b.cmp(a));
+            let idcg = dcg(ideal.into_iter());
+            let ndcg = if idcg == 0.0 { 1.0 } else { actual / idcg };
+            assert!(
+                ndcg >= case.floor,
+                "query {:?}: NDCG@10 {ndcg:.4} below floor {:.3} (hits: {:?})",
+                case.query,
+                case.floor,
+                out.hits.iter().map(|h| &h.url).collect::<Vec<_>>()
+            );
+        }
+    }
 }

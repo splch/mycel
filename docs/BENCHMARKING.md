@@ -31,6 +31,13 @@ one live-crawl soak as the closest honest approximation of end-to-end.
    boosts). Throughput numbers are medians of N runs, not single samples.
 4. **Production shape.** `cargo build --release`, default config except
    where a stage section says otherwise, daemon up for serving benchmarks.
+5. **Ranking changes are gated.** Any change to `search.rs` scoring,
+   `index.rs` schema, or `rank.rs` must show before/after numbers from the
+   in-tree harnesses in its commit message: `tests/golden/queries.toml`
+   (exact-order snapshot) and `tests/golden/qrels.toml` (NDCG@10 floors
+   over graded judgments; `cargo test ndcg_qrels`). A change that moves
+   no number says so explicitly. Full BEIR re-runs (§10) are required
+   only when the in-tree harnesses move.
 
 ## 1. Harness layout
 
