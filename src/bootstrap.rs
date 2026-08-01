@@ -131,9 +131,7 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
     }
     let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
     let html = extract::decode_html(payload, Some(&content_type));
-    let base = url::Url::parse(&url).ok()?;
-    let meta = extract::links_and_meta(&base, &html);
-    let ex = extract::full(&url, &html);
+    let analysis = extract::analyze(&url, &html)?;
     Some(IngestRecord {
         payload_len: payload.len() as u64,
         fetched_at: rec.date_secs().unwrap_or_else(db::now),
@@ -142,9 +140,9 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
         location: crate::db::IngestLocation::Append { member },
         sha256: sha,
         http_status: status,
-        noindex: meta.noindex,
-        extract: ex,
-        links: meta.links,
+        noindex: analysis.meta.noindex,
+        extract: analysis.extract,
+        links: analysis.meta.links,
     })
 }
 

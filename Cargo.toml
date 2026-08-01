@@ -17,7 +17,7 @@ texting_robots = "0.2"
 url = "2.5"
 quick-xml = "0.41"
 gaoya = "0.2"
-scraper = "0.27"
+dom_query = "=0.28.0" # must match dom_smoothie's dom_query exactly (shared Document type)
 dom_smoothie = "0"
 whichlang = "0.1"
 flate2 = "1"

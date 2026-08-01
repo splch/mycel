@@ -507,11 +507,11 @@ pub fn rebuild(
             let (_status, head, payload) = rec.http_parts().ok_or("error")?;
             let content_type = header_value(head, "content-type");
             let html = extract::decode_html(payload, content_type.as_deref());
-            let base = url::Url::parse(&url).map_err(|_| "error")?;
-            if extract::links_and_meta(&base, &html).noindex {
+            let a = extract::analyze(&url, &html).ok_or("error")?;
+            if a.meta.noindex {
                 return Err("noindex");
             }
-            let ex = extract::full(&url, &html).ok_or("empty")?;
+            let ex = a.extract.ok_or("empty")?;
             if !cfg.languages.iter().any(|l| l == ex.lang) {
                 return Err("lang");
             }

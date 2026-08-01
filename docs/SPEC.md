@@ -30,7 +30,8 @@ src/
   urlnorm.rs   normalization + scope check + tracking-param strip                 ~110
   warc.rs      WARC/1.0 gzip-member writer/reader, rotate/seal, watermark
                truncation, strict ISO-8601 subset                                 ~380
-  extract.rs   encoding_rs decode, dom_smoothie + scraper fallback, links,
+  extract.rs   encoding_rs decode, single dom_query parse: links/meta +
+               dom_smoothie Readability (with_document) + DOM-walk fallback,
                meta-robots, whichlang, simhash tokens                             ~260
   index.rs     tantivy schema, indexer thread, dedup gates, reconciliation,
                reindex-from-WARC with dir swap                                    ~380
@@ -59,7 +60,7 @@ texting_robots  = "0.2"
 url             = "2.5"
 quick-xml       = "0.41"
 gaoya           = "0.2"                                     # simhash only
-scraper         = "0.27"                                    # links + fallback extraction
+dom_query       = "=0.28.0"                               # the one DOM parse; pinned to dom_smoothie's version
 dom_smoothie    = "<pin latest 0.x at impl>"                # crate verified, version not
 whichlang       = "0.1"
 flate2          = "1"                                       # gzip WARC members
@@ -257,7 +258,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **URL normalization** (`url` crate): reject non-http(s) and >2048 chars; strip fragments; default ports drop; keep query order verbatim but strip `utm_*`, `gclid`, `fbclid`, `msclkid`.
 
-**Scope**: only `hosts.state=1` crawled; exact-host (subdomains distinct; no PSL). Link extraction (scraper, `a[href]`, skip `rel~=nofollow`, ≤2000/page, resolve→normalize→dedupe): off-host targets upsert candidate host rows (state=0, never crawled until seeded) + `links` edges (self-loops excluded). Enqueue iff target host active AND `urls_accepted < max_urls_per_host` AND `depth+1 ≤ 32`. `<meta name=robots>`: noindex → store, don't index; nofollow → no link extraction.
+**Scope**: only `hosts.state=1` crawled; exact-host (subdomains distinct; no PSL). Link extraction (dom_query, `a[href]`, skip `rel~=nofollow`, ≤2000/page, resolve→normalize→dedupe): off-host targets upsert candidate host rows (state=0, never crawled until seeded) + `links` edges (self-loops excluded). Enqueue iff target host active AND `urls_accepted < max_urls_per_host` AND `depth+1 ≤ 32`. `<meta name=robots>`: noindex → store, don't index; nofollow → no link extraction.
 
 **Sitemaps**: robots `Sitemap:` lines → frontier `kind=1`; identical politeness; streamed quick-xml parse (urlset→pages, sitemapindex→child sitemaps depth≤3; caps 50k locs / 50 MiB); `<lastmod>` seeds a page's first-fetch priority within the host (recently modified first); no WARC/docs rows. Recrawled every `recrawl_days` via the URL-unique frontier row.
 
@@ -270,7 +271,7 @@ Exact dupes stay in WARC and docs (corpus, shareable, webgraph feeds), never ind
 
 ## 8. Extract & index
 
-Pipeline (one function shared by crawl hot path, ingest, reconciliation, reindex): bytes → encoding_rs (header charset → meta sniff → UTF-8 lossy) → dom_smoothie Readability {title, text} → on Err or <100 chars: scraper fallback (`<title>` + body text sans script/style) → still <100 AND no usable `<title>` → `'empty'` (thin-but-titled pages index; engines rank title/anchor-only docs rather than dropping them) → whichlang (lang ∉ config → `'lang'`, stored not indexed) → simhash → exact-dedup gate → tantivy.
+Pipeline (one function shared by crawl hot path, ingest, reconciliation, reindex): bytes → encoding_rs (header charset → meta sniff → UTF-8 lossy) → ONE dom_query parse (links/meta) → dom_smoothie Readability `with_document` {title, text} → on Err or <100 chars: DOM-walk fallback (re-parses; rare) (`<title>` + body text sans script/style) → still <100 AND no usable `<title>` → `'empty'` (thin-but-titled pages index; engines rank title/anchor-only docs rather than dropping them) → whichlang (lang ∉ config → `'lang'`, stored not indexed) → simhash → exact-dedup gate → tantivy.
 
 ```rust
 // tantivy schema: en_stem pipeline, WithFreqsAndPositions (phrases work)
@@ -389,7 +390,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority.
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority; dom_query replaces scraper (a single DOM parse serves links/meta/Readability/fallback — measured 1.6× on ingest; scraper dropped from the dependency tree).
 
 ## Verification (end-to-end, after M5)
 

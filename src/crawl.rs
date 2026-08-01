@@ -731,14 +731,12 @@ fn build_stored(
     truncated: bool,
     now: i64,
 ) -> Outcome {
-    let Ok(base) = Url::parse(&final_url) else {
+    let html = crate::extract::decode_html(&body, Some(&content_type));
+    let Some(analysis) = crate::extract::analyze(&final_url, &html) else {
         return Outcome::PermanentFail {
             reason: "bad-final-url".into(),
         };
     };
-    let html = crate::extract::decode_html(&body, Some(&content_type));
-    let meta = crate::extract::links_and_meta(&base, &html);
-    let extract = crate::extract::full(&final_url, &html);
 
     head.extend_from_slice(format!("\r\ncontent-length: {}", body.len()).as_bytes());
     let seed = format!("{final_url}\u{0}{now}");
@@ -758,9 +756,9 @@ fn build_stored(
         member,
         payload_len: body.len() as u64,
         sha256: sha,
-        noindex: meta.noindex,
-        links: meta.links,
-        extract,
+        noindex: analysis.meta.noindex,
+        links: analysis.meta.links,
+        extract: analysis.extract,
     })
 }
 

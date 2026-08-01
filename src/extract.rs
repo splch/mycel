@@ -1,29 +1,20 @@
 //! HTML analysis: charset decoding, link extraction + meta-robots, readability
 //! main-content extraction, language id, and simhash. One pipeline shared by
 //! the crawl hot path and the indexer's cold (reconciliation/reindex) path.
+//!
+//! `analyze` does everything over a SINGLE DOM parse (dom_query), then hands
+//! the document to Readability (which mutates and consumes it). The rare
+//! thin-page fallback re-parses, as before.
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
 use url::Url;
-
-/// Selectors are parsed once per process, not once per page (extraction is
-/// the crawl/bootstrap hot path).
-static META_SEL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("meta[name][content]").expect("static selector"));
-static A_SEL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("a[href]").expect("static selector"));
-static TITLE_SEL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("title").expect("static selector"));
-static BODY_SEL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("body").expect("static selector"));
-static SKIP_SEL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("script, style, noscript").expect("static selector"));
 
 const MAX_LINKS_PER_PAGE: usize = 2000;
 /// Below this many characters of text a page leans on its title; with no
 /// usable title either, it is indexed as 'empty'.
 const MIN_TEXT_CHARS: usize = 100;
 
+#[derive(Default)]
 pub struct PageMeta {
     /// (normalized absolute link target, host key, squashed anchor text
     /// capped at 80 chars), deduped by target, capped at MAX_LINKS_PER_PAGE.
@@ -38,6 +29,22 @@ pub struct Extracted {
     /// ISO 639-1 code from whichlang (16 languages), e.g. "en".
     pub lang: &'static str,
     pub simhash: u64,
+}
+
+/// Everything a page yields: crawler-facing meta plus indexable content.
+pub struct Analysis {
+    pub meta: PageMeta,
+    pub extract: Option<Extracted>,
+}
+
+/// The full pipeline over one DOM parse. None = the URL itself is unusable
+/// (callers treat it as a bad-record error, as before).
+pub fn analyze(final_url: &str, html: &str) -> Option<Analysis> {
+    let base = Url::parse(final_url).ok()?;
+    let doc = dom_query::Document::from(html);
+    let meta = links_and_meta_doc(&base, &doc);
+    let extract = full_from_doc(final_url, html, doc);
+    Some(Analysis { meta, extract })
 }
 
 /// Decode raw HTML bytes: Content-Type charset → BOM → meta-charset sniff →
@@ -78,21 +85,16 @@ fn sniff_meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     encoding_rs::Encoding::for_label(&rest[start..start + end])
 }
 
-/// Parse the page once for links and robots meta. `final_url` is the URL the
-/// content was actually served from (post-redirect), the base for relatives.
-pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
-    let doc = scraper::Html::parse_document(html);
-
+/// Parse the page for links and robots meta, over an already-parsed document.
+/// `final_url` is the URL the content was actually served from
+/// (post-redirect), the base for relatives.
+fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document) -> PageMeta {
     let mut noindex = false;
     let mut nofollow = false;
-    for m in doc.select(&META_SEL) {
-        let name = m.value().attr("name").unwrap_or_default();
+    for m in doc.select("meta[name][content]").iter() {
+        let name = m.attr("name").unwrap_or_default();
         if name.eq_ignore_ascii_case("robots") {
-            let content = m
-                .value()
-                .attr("content")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let content = m.attr("content").unwrap_or_default().to_ascii_lowercase();
             noindex |= content.contains("noindex");
             nofollow |= content.contains("nofollow");
         }
@@ -101,26 +103,26 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
     let mut links = Vec::new();
     if !nofollow {
         let mut seen = HashSet::new();
-        for a in doc.select(&A_SEL) {
+        for a in doc.select("a[href]").iter() {
             if links.len() >= MAX_LINKS_PER_PAGE {
                 break;
             }
-            let rel = a.value().attr("rel").unwrap_or_default();
+            let rel = a.attr("rel").unwrap_or_default();
             if rel
                 .split_ascii_whitespace()
                 .any(|r| r.eq_ignore_ascii_case("nofollow"))
             {
                 continue;
             }
-            let href = a.value().attr("href").unwrap_or_default();
-            let Some(norm) = crate::urlnorm::normalize_rel(final_url, href) else {
+            let href = a.attr("href").unwrap_or_default();
+            let Some(norm) = crate::urlnorm::normalize_rel(final_url, &href) else {
                 continue;
             };
             let Some(host) = crate::urlnorm::host_of(&norm) else {
                 continue;
             };
             if seen.insert(norm.clone()) {
-                let text = squash_ws(&a.text().collect::<String>());
+                let text = squash_ws(&a.text());
                 let anchor: String = text.chars().take(80).collect();
                 links.push((norm, host, anchor));
             }
@@ -129,18 +131,32 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
     PageMeta { links, noindex }
 }
 
+/// Test-only convenience wrapper: parse, then extract links/meta.
+#[cfg(test)]
+pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
+    links_and_meta_doc(final_url, &dom_query::Document::from(html))
+}
+
 /// Readability's scoring gets expensive on very large documents; above this
 /// size go straight to the cheap fallback extractor.
 const READABILITY_MAX_BYTES: usize = 512 * 1024;
 
-/// Main-content extraction: dom_smoothie Readability first, scraper fallback
-/// (title tag + whole-body text). None = no usable title and not enough text.
-/// Thin-but-titled pages index; BM25 scores them down.
+/// Main-content extraction for callers that need no links (the index sweep):
+/// parse, then `full_from_doc`.
 pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
+    full_from_doc(final_url, html, dom_query::Document::from(html))
+}
+
+/// Readability first (it mutates and consumes the document), scraper-style
+/// fallback (title tag + body text sans script/style) when it yields too
+/// little. None = no usable title and not enough text. Thin-but-titled
+/// pages index; BM25 scores them down.
+fn full_from_doc(final_url: &str, html: &str, doc: dom_query::Document) -> Option<Extracted> {
     let (mut title, mut text) = if html.len() > READABILITY_MAX_BYTES {
         (String::new(), String::new())
     } else {
-        match dom_smoothie::Readability::new(html, Some(final_url), None)
+        // with_document on our already-parsed tree is exactly Readability::new.
+        match dom_smoothie::Readability::with_document(doc, Some(final_url), None)
             .ok()
             .and_then(|mut r| r.parse().ok())
         {
@@ -187,22 +203,23 @@ pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     })
 }
 
-/// `<title>` + body text with script/style dropped (scraper's text() skips
-/// non-text nodes; script/style contents are text nodes, so filter by parent).
+/// `<title>` + body text with script/style dropped (explicit stack walk;
+/// subtrees rooted at script/style/noscript are pruned).
 fn fallback_extract(html: &str) -> (String, String) {
-    let doc = scraper::Html::parse_document(html);
-    let title = doc
-        .select(&TITLE_SEL)
-        .next()
-        .map(|t| squash_ws(&t.text().collect::<String>()))
-        .unwrap_or_default();
+    let doc = dom_query::Document::from(html);
+    let title = squash_ws(&doc.select_single("title").text());
     let mut out = String::new();
-    if let Some(body) = doc.select(&BODY_SEL).next() {
-        let skipped: HashSet<_> = body.select(&SKIP_SEL).flat_map(|n| n.text()).collect();
-        for t in body.text() {
-            if !skipped.contains(t) {
-                out.push_str(t);
+    if let Some(body) = doc.select_single("body").nodes().first() {
+        let mut stack: Vec<dom_query::NodeRef> = body.children_it(true).collect();
+        while let Some(n) = stack.pop() {
+            if n.is_text() {
+                out.push_str(&n.text());
                 out.push(' ');
+            } else if n.is_element() {
+                match &*n.node_name().unwrap_or_default() {
+                    "script" | "style" | "noscript" => {}
+                    _ => stack.extend(n.children_it(true)), // reversed: pops in doc order
+                }
             }
         }
     }
