@@ -20,7 +20,15 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// Distinct inbound anchor texts kept per link target, at write and read time.
+pub const MAX_ANCHORS_PER_TARGET: i64 = 64;
+
+/// Sitemap jobs admitted per host. Sitemaps are discovery aids with their own
+/// small budget, separate from the page budget: a sitemapindex with hundreds
+/// of children must not consume `max_urls_per_host`.
+pub const MAX_SITEMAPS_PER_HOST: i64 = 20;
 
 const DDL_V1: &str = r#"
 CREATE TABLE hosts (
@@ -176,6 +184,47 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 5)?;
     }
+    if version < 6 {
+        // v6a: anchor_text becomes a clustered (url, text) primary key: the
+        // table is its own index, duplicates are impossible, and lookups by
+        // url walk a prefix. Rows whose target can never be indexed (no
+        // frontier row, no docs row) are dropped in the copy, which runs in
+        // url order through the old index so the new tree fills sequentially.
+        // Minutes on a corpus-sized table, so say so; one transaction, so a
+        // kill mid-way leaves the old table intact.
+        // v6b: sitemap jobs get their own per-host budget (sitemaps_accepted)
+        // and stop counting against the page budget.
+        let anchors: i64 = conn.query_row("SELECT count(*) FROM anchor_text", [], |r| r.get(0))?;
+        if anchors > 100_000 {
+            tracing::info!(
+                "compacting anchor_text ({anchors} rows): one-time migration, this can take minutes"
+            );
+        }
+        conn.execute_batch(
+            "PRAGMA temp_store = FILE;
+             BEGIN IMMEDIATE;
+             CREATE TABLE anchor_text_v6 (
+               url  TEXT NOT NULL,
+               text TEXT NOT NULL,
+               PRIMARY KEY (url, text)
+             ) WITHOUT ROWID;
+             INSERT OR IGNORE INTO anchor_text_v6 (url, text)
+               SELECT a.url, a.text FROM anchor_text a
+               WHERE EXISTS (SELECT 1 FROM frontier f WHERE f.url = a.url)
+                  OR EXISTS (SELECT 1 FROM docs d WHERE d.url = a.url)
+               ORDER BY a.url;
+             DROP TABLE anchor_text;
+             ALTER TABLE anchor_text_v6 RENAME TO anchor_text;
+             ALTER TABLE hosts ADD COLUMN sitemaps_accepted INTEGER NOT NULL DEFAULT 0;
+             UPDATE hosts SET sitemaps_accepted = s.n
+               FROM (SELECT host_id, count(*) AS n FROM frontier WHERE kind = 1 GROUP BY host_id) AS s
+               WHERE s.host_id = hosts.id;
+             UPDATE hosts SET urls_accepted = max(urls_accepted - sitemaps_accepted, 0);
+             PRAGMA user_version = 6;
+             COMMIT;
+             PRAGMA temp_store = MEMORY;",
+        )?;
+    }
     Ok(())
 }
 
@@ -228,6 +277,9 @@ pub struct Job {
     pub robots_last_modified: Option<String>,
     pub crawl_delay_ms: i64,
     pub prior_sha: Option<Vec<u8>>,
+    /// Pages admitted so far for the host: a sitemap job for a host at its
+    /// page budget can admit nothing and is deferred without a fetch.
+    pub urls_accepted: i64,
 }
 
 pub enum RobotsResult {
@@ -287,6 +339,12 @@ pub enum Outcome {
     },
     /// robots.txt disallow: no HTTP request was made, host turn not consumed.
     Denied,
+    /// Not worth fetching right now (a sitemap for a host whose page budget
+    /// is spent): back to queued at `at`, attempt refunded, no HTTP request
+    /// was made, host turn not consumed.
+    Deferred {
+        at: i64,
+    },
     PermanentFail {
         reason: String,
     },
@@ -1097,7 +1155,7 @@ impl Writer {
 const CLAIM_SQL: &str = "
 SELECT h.id, h.host, f.id, f.url, f.kind, f.attempts, f.depth,
        h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256,
-       h.robots_etag, h.robots_last_modified
+       h.robots_etag, h.robots_last_modified, h.urls_accepted
 FROM hosts h
 JOIN frontier f ON f.id = (
    SELECT f2.id FROM frontier f2
@@ -1127,6 +1185,7 @@ fn claim(tx: &Transaction, now: i64, batch: usize) -> Result<Vec<Job>> {
                 prior_sha: r.get(10)?,
                 robots_etag: r.get(11)?,
                 robots_last_modified: r.get(12)?,
+                urls_accepted: r.get(13)?,
             })
         })?;
         for row in rows {
@@ -1458,49 +1517,55 @@ fn handle_complete(
     let mut success = true;
     match &c.outcome {
         Outcome::Stored(p) => {
-            let (offset, len) = ws.shard.append_member(&p.member)?;
-            ws.dirty = true;
-            store_doc(
-                tx,
-                cfg,
-                counters,
-                index_tx,
-                &StoreDoc {
-                    url: &p.final_url,
-                    host_id: c.host_id,
-                    shard_id: ws.shard_db_id,
-                    offset: offset as i64,
-                    len: len as i64,
-                    http_status: p.http_status,
-                    fetched_at: now,
-                    payload_len: p.payload_len,
-                    sha256: &p.sha256,
-                    noindex: p.noindex,
-                    extract: &p.extract,
-                    links: &p.links,
-                    link_depth: c.depth + 1,
-                    guard_fetched_at: false,
-                },
-            )?;
-            // Fresh content: the recrawl interval drops back to the base.
-            requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, Some(0))?;
+            // The fetch path compared against the frontier URL's own snapshot;
+            // a same-host redirect stores under the final URL, so look there
+            // too. Identical bytes already on file mean no WARC write.
+            let prior: Option<Vec<u8>> = tx
+                .prepare_cached("SELECT sha256 FROM docs WHERE url = ?1")?
+                .query_row([&p.final_url], |r| r.get(0))
+                .ok();
+            if prior.as_deref() == Some(&p.sha256[..]) {
+                touch_unchanged(tx, cfg, c, &p.final_url, now)?;
+            } else {
+                let (offset, len) = ws.shard.append_member(&p.member)?;
+                ws.dirty = true;
+                store_doc(
+                    tx,
+                    cfg,
+                    counters,
+                    index_tx,
+                    &StoreDoc {
+                        url: &p.final_url,
+                        host_id: c.host_id,
+                        shard_id: ws.shard_db_id,
+                        offset: offset as i64,
+                        len: len as i64,
+                        http_status: p.http_status,
+                        fetched_at: now,
+                        payload_len: p.payload_len,
+                        sha256: &p.sha256,
+                        noindex: p.noindex,
+                        extract: &p.extract,
+                        links: &p.links,
+                        link_depth: c.depth + 1,
+                        guard_fetched_at: false,
+                    },
+                )?;
+                // Fresh content: the recrawl interval drops back to the base.
+                requeue(tx, c.frontier_id, now + cfg.recrawl_secs, true, Some(0))?;
+            }
             bump(counters, "fetch_ok", 1);
         }
         Outcome::Unchanged => {
-            tx.prepare_cached("UPDATE docs SET fetched_at = ?1 WHERE url = ?2")?
-                .execute(params![now, c.url])?;
-            let prev: i64 = tx
-                .prepare_cached("SELECT unchanged_streak FROM frontier WHERE id = ?1")?
-                .query_row([c.frontier_id], |r| r.get(0))?;
-            let streak = prev + 1;
-            requeue(
-                tx,
-                c.frontier_id,
-                now + recrawl_interval(cfg.recrawl_secs, streak),
-                true,
-                Some(streak),
-            )?;
+            touch_unchanged(tx, cfg, c, &c.url, now)?;
             bump(counters, "fetch_ok", 1);
+        }
+        Outcome::Deferred { at } => {
+            tx.prepare_cached(
+                "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0),
+                                     next_attempt_at = ?1 WHERE id = ?2",
+            )?
+            .execute(params![at, c.frontier_id])?;
         }
         Outcome::Sitemap { pages, children } => {
             for (url, host, lastmod) in pages {
@@ -1568,7 +1633,7 @@ fn handle_complete(
         }
     }
 
-    if matches!(c.outcome, Outcome::Denied) {
+    if matches!(c.outcome, Outcome::Denied | Outcome::Deferred { .. }) {
         // No HTTP request happened: the host's politeness turn is not consumed.
         tx.prepare_cached("UPDATE hosts SET in_flight = 0 WHERE id = ?1")?
             .execute([c.host_id])?;
@@ -1601,6 +1666,30 @@ fn handle_complete(
         }
     }
     Ok(())
+}
+
+/// Same bytes as the snapshot on file: touch the docs row's fetched_at and
+/// stretch the frontier row's recrawl interval (adaptive recrawl).
+fn touch_unchanged(
+    tx: &Transaction,
+    cfg: &DbCfg,
+    c: &Completion,
+    doc_url: &str,
+    now: i64,
+) -> Result<()> {
+    tx.prepare_cached("UPDATE docs SET fetched_at = ?1 WHERE url = ?2")?
+        .execute(params![now, doc_url])?;
+    let prev: i64 = tx
+        .prepare_cached("SELECT unchanged_streak FROM frontier WHERE id = ?1")?
+        .query_row([c.frontier_id], |r| r.get(0))?;
+    let streak = prev + 1;
+    requeue(
+        tx,
+        c.frontier_id,
+        now + recrawl_interval(cfg.recrawl_secs, streak),
+        true,
+        Some(streak),
+    )
 }
 
 /// Success path: back to queued with a future recrawl time and a clean slate.
@@ -1666,6 +1755,9 @@ pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> R
 
 /// Record a candidate host + webgraph edge, and enqueue the URL if its host is
 /// active and under caps. The single admission point for every discovered URL.
+/// Pages and sitemaps draw on separate budgets (`urls_accepted` vs
+/// `sitemaps_accepted`), and obvious non-HTML assets are never admitted as
+/// pages: the content-type gate would reject them after a politeness turn.
 /// `due` seeds next_attempt_at on a fresh row (0 = immediately due; negative
 /// values sort earlier — the sitemap lastmod hint).
 #[allow(clippy::too_many_arguments)]
@@ -1682,9 +1774,11 @@ fn enqueue(
 ) -> Result<()> {
     tx.prepare_cached("INSERT OR IGNORE INTO hosts (host, state, added_at) VALUES (?1, 0, ?2)")?
         .execute(params![host, now])?;
-    let (host_id, state, accepted): (i64, i64, i64) = tx
-        .prepare_cached("SELECT id, state, urls_accepted FROM hosts WHERE host = ?1")?
-        .query_row([host], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let (host_id, state, accepted, sitemaps): (i64, i64, i64, i64) = tx
+        .prepare_cached(
+            "SELECT id, state, urls_accepted, sitemaps_accepted FROM hosts WHERE host = ?1",
+        )?
+        .query_row([host], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     if let Some(from) = from_host
         && from != host_id
     {
@@ -1694,41 +1788,76 @@ fn enqueue(
         )?
         .execute(params![from, host_id])?;
     }
-    if state == 1 && accepted < cfg.max_urls_per_host && depth <= cfg.max_depth {
-        let inserted = tx
-            .prepare_cached(
-                "INSERT OR IGNORE INTO frontier
-                   (host_id, url, kind, state, next_attempt_at, attempts, depth, discovered_at)
-                 VALUES (?1, ?2, ?3, 0, ?6, 0, ?4, ?5)",
-            )?
-            .execute(params![host_id, url, kind, depth, now, due])?;
-        if inserted > 0 {
-            tx.prepare_cached("UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1")?
-                .execute([host_id])?;
+    if state != 1 || depth > cfg.max_depth {
+        return Ok(());
+    }
+    let under_cap = if kind == 1 {
+        sitemaps < MAX_SITEMAPS_PER_HOST
+    } else {
+        if crate::urlnorm::is_binary_asset(url) {
+            return Ok(());
         }
+        accepted < cfg.max_urls_per_host
+    };
+    if !under_cap {
+        return Ok(());
+    }
+    let inserted = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO frontier
+               (host_id, url, kind, state, next_attempt_at, attempts, depth, discovered_at)
+             VALUES (?1, ?2, ?3, 0, ?6, 0, ?4, ?5)",
+        )?
+        .execute(params![host_id, url, kind, depth, now, due])?;
+    if inserted > 0 {
+        let bump_sql = if kind == 1 {
+            "UPDATE hosts SET sitemaps_accepted = sitemaps_accepted + 1 WHERE id = ?1"
+        } else {
+            "UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1"
+        };
+        tx.prepare_cached(bump_sql)?.execute([host_id])?;
     }
     Ok(())
 }
 
-/// Append inbound anchor text for a link target. Append-only (deduped and
-/// capped at read time in anchors_for); self-links carry no signal.
+/// Keep inbound anchor text for a link target: only for URLs this node can
+/// ever index (a frontier row, or a docs row from ingest/sync), at most
+/// MAX_ANCHORS_PER_TARGET distinct texts per target, duplicates absorbed by
+/// the (url, text) primary key. Self-links carry no signal. A URL admitted
+/// later gets its anchors from the recrawl that re-discovers the link, the
+/// same staleness model as centrality.
 fn record_anchor(tx: &Transaction, page_url: &str, target: &str, anchor: &str) -> Result<()> {
     if anchor.is_empty() || target == page_url {
         return Ok(());
     }
-    tx.prepare_cached("INSERT INTO anchor_text (url, text) VALUES (?1, ?2)")?
+    let indexable: bool = tx
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM frontier WHERE url = ?1)
+                 OR EXISTS (SELECT 1 FROM docs WHERE url = ?1)",
+        )?
+        .query_row([target], |r| r.get(0))?;
+    if !indexable {
+        return Ok(());
+    }
+    let kept: i64 = tx
+        .prepare_cached("SELECT count(*) FROM (SELECT 1 FROM anchor_text WHERE url = ?1 LIMIT ?2)")?
+        .query_row(params![target, MAX_ANCHORS_PER_TARGET], |r| r.get(0))?;
+    if kept >= MAX_ANCHORS_PER_TARGET {
+        return Ok(());
+    }
+    tx.prepare_cached("INSERT OR IGNORE INTO anchor_text (url, text) VALUES (?1, ?2)")?
         .execute(params![target, anchor])?;
     Ok(())
 }
 
-/// A URL's inbound anchor texts, deduped and concatenated for indexing (the
-/// table is append-only, so dedup happens here). Caps bound a spammed
-/// target's field size. Applied at index time like centrality: fresh anchors
-/// reach the index on the target's recrawl or a `reindex`.
+/// A URL's inbound anchor texts, concatenated for indexing. Applied at index
+/// time like centrality: fresh anchors reach the index on the target's
+/// recrawl or a `reindex`.
 pub fn anchors_for(conn: &Connection, url: &str) -> Result<String> {
-    let mut stmt =
-        conn.prepare_cached("SELECT DISTINCT text FROM anchor_text WHERE url = ?1 LIMIT 64")?;
-    let rows = stmt.query_map([url], |r| r.get::<_, String>(0))?;
+    let mut stmt = conn.prepare_cached("SELECT text FROM anchor_text WHERE url = ?1 LIMIT ?2")?;
+    let rows = stmt.query_map(params![url, MAX_ANCHORS_PER_TARGET], |r| {
+        r.get::<_, String>(0)
+    })?;
     let mut out = String::new();
     for t in rows.flatten() {
         if !out.is_empty() {
@@ -2029,15 +2158,14 @@ mod tests {
             .unwrap();
         assert_eq!(edges, 1);
 
-        // Anchor text recorded for both targets, none for the self-link.
+        // Anchor text recorded for the admitted target only: other.org is a
+        // candidate host (never crawled unless seeded), so its anchor is not
+        // kept, and the self-link carries no signal.
         assert_eq!(
             anchors_for(&conn, "http://example.com/about").unwrap(),
             "about us"
         );
-        assert_eq!(
-            anchors_for(&conn, "http://other.org/").unwrap(),
-            "other site"
-        );
+        assert_eq!(anchors_for(&conn, "http://other.org/").unwrap(), "");
         assert_eq!(anchors_for(&conn, "http://example.com/").unwrap(), "");
 
         // Watermark equals the physical file size; record is readable back.
@@ -2473,7 +2601,7 @@ mod tests {
         let conn = open(&dir.path().join("t.sqlite")).unwrap();
         for text in ["rust book", "the rust book", "rust book"] {
             conn.execute(
-                "INSERT INTO anchor_text (url, text) VALUES ('http://a.com/', ?1)",
+                "INSERT OR IGNORE INTO anchor_text (url, text) VALUES ('http://a.com/', ?1)",
                 [text],
             )
             .unwrap();
@@ -2483,10 +2611,17 @@ mod tests {
             [],
         )
         .unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM anchor_text WHERE url = 'http://a.com/'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "the (url, text) key absorbs the duplicate");
         let got = anchors_for(&conn, "http://a.com/").unwrap();
         assert!(got.contains("rust book"));
         assert!(got.contains("the rust book"));
-        assert_eq!(got.matches("rust book").count(), 2, "deduped at read time");
         assert!(!got.contains("unrelated"));
     }
 
@@ -2514,14 +2649,16 @@ mod tests {
                 .unwrap()
         };
         let stored = |job: &Job, now_ms: i64| {
-            let payload = b"<html><body>page</body></html>";
-            let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
+            // Distinct bytes per fetch: identical bytes are "unchanged" by
+            // definition, wherever the writer finds the prior snapshot.
+            let payload = format!("<html><body>page at {now_ms}</body></html>").into_bytes();
+            let sha: [u8; 32] = sha2::Sha256::digest(&payload).into();
             let member = warc::gzip_member(&warc::build_response_record(
                 &job.url,
                 now_ms / 1000,
                 b"seed",
                 b"HTTP/1.1 200 OK",
-                payload,
+                &payload,
                 &hex::encode(sha),
                 false,
             ));
@@ -2784,6 +2921,432 @@ mod tests {
             (2, Some("lang".into())),
             "other labels are untouched"
         );
+    }
+
+    /// The schema exactly as a v5 binary left it, so the v6 step runs alone.
+    fn v5_database(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(DDL_V1).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE frontier ADD COLUMN unchanged_streak INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE anchor_text (url TEXT NOT NULL, text TEXT NOT NULL);
+             CREATE INDEX anchor_text_url ON anchor_text (url);
+             ALTER TABLE hosts ADD COLUMN robots_etag TEXT;
+             ALTER TABLE hosts ADD COLUMN robots_last_modified TEXT;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_v6_compacts_anchors_and_splits_the_sitemap_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        {
+            let conn = v5_database(&path);
+            conn.execute_batch(
+                "INSERT INTO hosts (host, state, urls_accepted, added_at) VALUES ('a.com', 1, 5, 0);
+                 INSERT INTO shards (name, origin_node, created_at) VALUES ('s', 'o', 0);
+                 INSERT INTO frontier (host_id, url, kind, discovered_at) VALUES
+                   (1, 'http://a.com/', 0, 0), (1, 'http://a.com/p', 0, 0),
+                   (1, 'http://a.com/s1.xml', 1, 0), (1, 'http://a.com/s2.xml', 1, 0),
+                   (1, 'http://a.com/s3.xml', 1, 0);
+                 INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                                   fetched_at, indexed) VALUES
+                   ('http://ingested.org/x', 1, 1, 0, 1, x'00', 200, 0, 1);
+                 INSERT INTO anchor_text (url, text) VALUES
+                   ('http://a.com/p', 'page'), ('http://a.com/p', 'page'),
+                   ('http://a.com/p', 'the page'),
+                   ('http://ingested.org/x', 'ingested'),
+                   ('http://nowhere.example/', 'never crawled'),
+                   ('http://nowhere.example/', 'still never');",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT url, text FROM anchor_text ORDER BY url, text")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("http://a.com/p".into(), "page".into()),
+                ("http://a.com/p".into(), "the page".into()),
+                ("http://ingested.org/x".into(), "ingested".into()),
+            ],
+            "duplicates collapsed, unindexable targets dropped, docs-only targets kept"
+        );
+        // The key now enforces uniqueness on its own.
+        conn.execute(
+            "INSERT OR IGNORE INTO anchor_text (url, text) VALUES ('http://a.com/p', 'page')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            anchors_for(&conn, "http://a.com/p").unwrap(),
+            "page the page"
+        );
+        // Sitemap rows moved to their own budget; the page budget got them back.
+        let (pages, sitemaps): (i64, i64) = conn
+            .query_row(
+                "SELECT urls_accepted, sitemaps_accepted FROM hosts WHERE host = 'a.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pages, sitemaps), (2, 3));
+    }
+
+    #[tokio::test]
+    async fn anchors_kept_only_for_indexable_targets_and_capped() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        // 70 distinct anchors to one same-host target (admitted), the same
+        // anchor twice to another, and one to a candidate-host URL.
+        let mut links: Vec<(String, String, String)> = (0..70)
+            .map(|i| {
+                (
+                    "http://example.com/hub".to_string(),
+                    "example.com".to_string(),
+                    format!("t{i:02}"),
+                )
+            })
+            .collect();
+        for _ in 0..2 {
+            links.push((
+                "http://example.com/dup".into(),
+                "example.com".into(),
+                "same words".into(),
+            ));
+        }
+        links.push((
+            "http://other.org/".into(),
+            "other.org".into(),
+            "elsewhere".into(),
+        ));
+        let payload = b"<html><body>hub page</body></html>";
+        let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
+        let member = warc::gzip_member(&warc::build_response_record(
+            &job.url,
+            t,
+            b"seed",
+            b"HTTP/1.1 200 OK",
+            payload,
+            &hex::encode(sha),
+            false,
+        ));
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Stored(StoredPage {
+                final_url: job.url.clone(),
+                http_status: 200,
+                member,
+                payload_len: payload.len() as u64,
+                sha256: sha,
+                noindex: false,
+                extract: None,
+                links,
+            }),
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let count = |url: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM anchor_text WHERE url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("http://example.com/hub"), MAX_ANCHORS_PER_TARGET);
+        assert_eq!(
+            count("http://example.com/dup"),
+            1,
+            "duplicate text stored once"
+        );
+        assert_eq!(
+            count("http://other.org/"),
+            0,
+            "candidate-host target: not indexable"
+        );
+        assert_eq!(
+            anchors_for(&conn, "http://example.com/hub")
+                .unwrap()
+                .split(' ')
+                .count(),
+            MAX_ANCHORS_PER_TARGET as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn sitemaps_have_their_own_budget_and_assets_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('example.com', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let host_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frontier (host_id, url, kind, discovered_at)
+             VALUES (?1, 'http://example.com/sitemap.xml', 1, 0)",
+            [host_id],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let mut cfg = test_cfg();
+        cfg.max_urls_per_host = 3;
+        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), cfg, None).unwrap();
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        assert_eq!(job.kind, 1);
+        let pages = (0..5)
+            .map(|i| {
+                (
+                    format!("http://example.com/p{i}"),
+                    "example.com".to_string(),
+                    None,
+                )
+            })
+            .chain([(
+                "http://example.com/brochure.pdf".to_string(),
+                "example.com".to_string(),
+                None,
+            )])
+            .collect();
+        let children = (0..25)
+            .map(|i| {
+                (
+                    format!("http://example.com/s{i}.xml"),
+                    "example.com".to_string(),
+                )
+            })
+            .collect();
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Sitemap { pages, children },
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+
+        let conn = open(&db_path).unwrap();
+        let queued = |kind: i64| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM frontier WHERE kind = ?1 AND url != 'http://example.com/sitemap.xml'",
+                [kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            queued(0),
+            3,
+            "page budget: 3 of 5 pages, and never the .pdf"
+        );
+        assert_eq!(
+            queued(1),
+            MAX_SITEMAPS_PER_HOST,
+            "sitemap budget: 20 of 25 children"
+        );
+        let (pages_n, sitemaps_n): (i64, i64) = conn
+            .query_row(
+                "SELECT urls_accepted, sitemaps_accepted FROM hosts WHERE id = ?1",
+                [host_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((pages_n, sitemaps_n), (3, MAX_SITEMAPS_PER_HOST));
+        let pdf: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM frontier WHERE url = 'http://example.com/brochure.pdf'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pdf, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_job_refunds_the_claim_and_keeps_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/sitemap.xml");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Deferred { at: t + 1000 },
+            next_delay_ms: 0,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+        let (state, at, attempts): (i64, i64, i64) = check
+            .query_row(
+                "SELECT state, next_attempt_at, attempts FROM frontier",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((state, at, attempts), (0, t + 1000, 0));
+        let (in_flight, gate): (i64, i64) = check
+            .query_row("SELECT in_flight, next_fetch_at FROM hosts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (in_flight, gate),
+            (0, 0),
+            "no HTTP happened: turn not consumed"
+        );
+        assert!(db.claim(t + 999, 1).await.is_empty());
+        assert_eq!(db.claim(t + 1000, 1).await.len(), 1);
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirected_recrawl_with_the_same_bytes_writes_nothing() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+        let r: i64 = 14 * 86_400;
+        // /a redirects on-host to /b: the snapshot lives under /b.
+        let via_redirect = |job: &Job, now_ms: i64| {
+            let payload = b"<html><body>canonical page</body></html>";
+            let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
+            let member = warc::gzip_member(&warc::build_response_record(
+                "http://example.com/b",
+                now_ms / 1000,
+                b"seed",
+                b"HTTP/1.1 200 OK",
+                payload,
+                &hex::encode(sha),
+                false,
+            ));
+            Completion {
+                frontier_id: job.frontier_id,
+                host_id: job.host_id,
+                depth: 0,
+                url: job.url.clone(),
+                outcome: Outcome::Stored(StoredPage {
+                    final_url: "http://example.com/b".into(),
+                    http_status: 200,
+                    member,
+                    payload_len: payload.len() as u64,
+                    sha256: sha,
+                    noindex: false,
+                    extract: None,
+                    links: vec![],
+                }),
+                next_delay_ms: 1000,
+                sticky_delay_ms: None,
+                host_fault: false,
+                now_ms,
+            }
+        };
+        let shard_bytes = || -> i64 {
+            check
+                .query_row("SELECT bytes FROM shards WHERE state = 0", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(via_redirect(&job, t * 1000)).await;
+        db.flush().await;
+        let after_first = shard_bytes();
+        let docs: i64 = check
+            .query_row("SELECT count(*) FROM docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 1, "stored under the final URL");
+
+        // The recrawl of /a lands on the same bytes at /b: no WARC member,
+        // adaptive recrawl stretches /a's interval.
+        let job = db.claim(t + r, 1).await.pop().unwrap();
+        assert!(
+            job.prior_sha.is_none(),
+            "the frontier URL itself has no snapshot"
+        );
+        db.complete(via_redirect(&job, (t + r) * 1000)).await;
+        db.flush().await;
+        assert_eq!(shard_bytes(), after_first, "nothing appended");
+        let (streak, next): (i64, i64) = check
+            .query_row(
+                "SELECT unchanged_streak, next_attempt_at FROM frontier",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((streak, next), (1, t + 3 * r));
+        let touched: i64 = check
+            .query_row("SELECT fetched_at FROM docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(touched, t + r);
+        db.shutdown().await;
+        handle.join().unwrap();
     }
 
     #[tokio::test]

@@ -26,6 +26,9 @@ const LATENCY_DELAY_FACTOR: i64 = 10;
 /// the RFC 9309 maximum of 24h, since a conditional re-fetch is cheap and
 /// corrects staleness. Without validators the configured TTL applies.
 const ROBOTS_VALIDATED_TTL_SECS: u64 = 86_400;
+/// When the pool is saturated, wait for fetches to finish before claiming
+/// again, but never leave a freed slot idle longer than this.
+const CLAIM_GRACE: Duration = Duration::from_millis(100);
 
 fn robots_ttl(cfg: &CrawlCfg, has_validators: bool) -> u64 {
     if has_validators {
@@ -50,7 +53,16 @@ struct Shared {
 }
 
 pub fn build_client(cfg: &CrawlCfg) -> Result<reqwest::Client> {
+    // Prefer HTML; keep */* so robots.txt and sitemaps still negotiate.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(
+            "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+        ),
+    );
     Ok(reqwest::Client::builder()
+        .default_headers(headers)
         .user_agent(format!(
             "mycel/{} (+{})",
             env!("CARGO_PKG_VERSION"),
@@ -79,6 +91,9 @@ pub async fn run(
         fetched: AtomicU64::new(0),
     });
     let sem = Arc::new(Semaphore::new(concurrency));
+    // Claim once this many slots are free, so claims stay batched (each one
+    // is a command on the single db-writer) without the pool draining.
+    let claim_floor = (concurrency / 8).max(1);
     let mut tasks = tokio::task::JoinSet::new();
     let mut idle_rounds = 0u32;
     let mut last_tick = Instant::now();
@@ -108,12 +123,16 @@ pub async fn run(
         }
         while tasks.try_join_next().is_some() {}
 
-        let free = sem.available_permits();
-        let jobs = if free > 0 {
-            db.claim(db::now(), free.min(32)).await
-        } else {
-            Vec::new()
+        // Slots first, then work. A saturated pool is not an idle one: wait
+        // for a batch of fetches to finish (or the grace period), never for a
+        // fixed sleep. `Ready(0)` means nothing finished in time: run the
+        // periodic checks above and wait again.
+        let free = match await_capacity(&sem, &cancel, claim_floor, CLAIM_GRACE).await {
+            Capacity::Cancelled => break,
+            Capacity::Ready(0) => continue,
+            Capacity::Ready(n) => n,
         };
+        let jobs = db.claim(db::now(), free.min(32)).await;
         if jobs.is_empty() {
             let all_idle = sem.available_permits() == concurrency;
             idle_rounds = if all_idle { idle_rounds + 1 } else { 0 };
@@ -153,8 +172,59 @@ pub async fn run(
     Ok(shared.fetched.load(Ordering::Relaxed))
 }
 
+/// What the scheduler found when it asked for fetch slots.
+enum Capacity {
+    /// This many permits are free (possibly 0 after the grace period).
+    Ready(usize),
+    Cancelled,
+}
+
+/// Wait for fetch slots without ever mistaking "saturated" for "idle": return
+/// as soon as `floor` permits are free (so claims stay batched), or after
+/// `grace` with whatever has freed up (so a slot never idles longer than
+/// that), or on cancellation.
+async fn await_capacity(
+    sem: &Arc<Semaphore>,
+    cancel: &CancellationToken,
+    floor: usize,
+    grace: Duration,
+) -> Capacity {
+    if sem.available_permits() >= floor {
+        return Capacity::Ready(sem.available_permits());
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => Capacity::Cancelled,
+        got = sem.clone().acquire_many_owned(floor as u32) => {
+            drop(got);
+            Capacity::Ready(sem.available_permits())
+        }
+        _ = tokio::time::sleep(grace) => Capacity::Ready(sem.available_permits()),
+    }
+}
+
 async fn fetch_task(st: Arc<Shared>, job: Job) {
     let now = db::now();
+
+    // A sitemap for a host whose page budget is spent can admit nothing:
+    // defer it a recrawl interval without spending the host's turn.
+    if job.kind == 1 && job.urls_accepted >= st.cfg.max_urls_per_host as i64 {
+        st.db
+            .complete(Completion {
+                frontier_id: job.frontier_id,
+                host_id: job.host_id,
+                depth: job.depth,
+                url: job.url.clone(),
+                outcome: Outcome::Deferred {
+                    at: now + st.cfg.recrawl_days as i64 * 86_400,
+                },
+                next_delay_ms: 0,
+                sticky_delay_ms: None,
+                host_fault: false,
+                now_ms: db::now_ms(),
+            })
+            .await;
+        return;
+    }
 
     // Stale robots? This host turn goes to robots.txt; the URL is refunded.
     let ttl = robots_ttl(
@@ -823,6 +893,46 @@ mod tests {
             max_delay_ms: 3_600_000,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn await_capacity_returns_on_slots_not_on_a_timer() {
+        let sem = Arc::new(Semaphore::new(4));
+        let cancel = CancellationToken::new();
+        // Saturate the pool, then let two "fetches" finish shortly.
+        let mut held: Vec<_> = (0..4)
+            .map(|_| sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held.pop());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held.pop());
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(held);
+        });
+        let t = Instant::now();
+        let got = await_capacity(&sem, &cancel, 2, Duration::from_secs(5)).await;
+        assert!(
+            matches!(got, Capacity::Ready(n) if n >= 2),
+            "wakes when the floor is reached"
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "did not sit out the grace period"
+        );
+        // The floor is out of reach: the grace period returns what is free.
+        let t = Instant::now();
+        let got = await_capacity(&sem, &cancel, 4, Duration::from_millis(100)).await;
+        assert!(matches!(got, Capacity::Ready(n) if (2..4).contains(&n)));
+        assert!(t.elapsed() >= Duration::from_millis(90));
+        // Cancellation wins over both.
+        cancel.cancel();
+        assert!(matches!(
+            await_capacity(&sem, &cancel, 4, Duration::from_secs(5)).await,
+            Capacity::Cancelled
+        ));
+        releaser.abort();
     }
 
     #[test]

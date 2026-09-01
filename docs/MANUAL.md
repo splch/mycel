@@ -190,7 +190,10 @@ web describes it, and often the only description thin pages (landing pages,
 paywalled stubs) get. Anchors are recorded from every crawled and ingested
 page (`rel=nofollow` and self-links excluded) and indexed into the target's
 document at index time with the same staleness model as centrality: fresh
-anchors apply on the target's recrawl or at the next `reindex`.
+anchors apply on the target's recrawl or at the next `reindex`. Only targets
+this node can index keep anchors (a queued URL or a stored document), at most
+64 distinct texts per target, each text stored once; a URL admitted later
+collects its anchors from the recrawls that re-discover its links.
 
 **Identity.** `identity.key` holds the node's secret key. Its public half is
 the *endpoint id* (64 hex chars, printed by `mycel id`), which is both the
@@ -223,7 +226,7 @@ process start; nothing reloads live.
 | `timeout_secs` | `30` | Whole-request timeout (connect timeout is a fixed 10 s). |
 | `max_body_bytes` | `2097152` | Page body cap. Larger bodies are truncated at the cap and stored with `WARC-Truncated: length`. |
 | `recrawl_days` | `14` | Base revisit interval for successfully fetched URLs (pages and sitemaps). Pages double their interval per consecutive unchanged fetch, capped at ×16. |
-| `max_urls_per_host` | `50000` | Admission cap on URLs accepted into the frontier per host. |
+| `max_urls_per_host` | `50000` | Admission cap on page URLs accepted into the frontier per host. Sitemap jobs have their own fixed budget of 20 per host and do not count here. |
 | `block_after_failures` | `25` | Circuit breaker: block a host (state 2, unclaimable) after this many consecutive host-level failures — transport errors, 5xx, robots-unavailable stalls. 4xx, content-type rejects and 429s do not count (the host answered); any success resets. `0` disables. Re-activate a blocked host with `mycel seed <host>`. |
 | `scope` | `"host"` | Crawl scope. `"host"` (exact-host) is the only accepted value in v1. |
 
@@ -655,9 +658,11 @@ Disallow: /
 ```
 
 **Scheduling.** At most one in-flight request per host, globally capped at
-`crawl.concurrency`. Within a host, URLs are fetched in FIFO order of their
-due time. The politeness delay after *every* completed request (success or
-failure) is:
+`crawl.concurrency`. The scheduler refills the pool as fetches finish: it
+waits for free slots, never on a timer, so a saturated crawl is never
+mistaken for an idle one, and it only sleeps when a claim comes back empty.
+Within a host, URLs are fetched in FIFO order of their due time. The
+politeness delay after *every* completed request (success or failure) is:
 
 ```
 delay = max(default_delay_ms, robots crawl-delay (capped at 30 s),
@@ -705,7 +710,7 @@ request, and the host's turn is not consumed.
 | response | behavior |
 |---|---|
 | 200 (new content) | Archived to WARC, cataloged, links harvested, indexed; URL rescheduled at the base `recrawl_days` interval. |
-| 200 (unchanged sha256) | Touch timestamp only; no WARC write; rescheduled at double the URL's previous interval (×2^streak, capped at ×16). |
+| 200 (unchanged sha256) | Touch timestamp only; no WARC write; rescheduled at double the URL's previous interval (×2^streak, capped at ×16). Also applies when a same-host redirect lands on a URL whose stored snapshot has the same bytes. |
 | 3xx | See redirects above. |
 | 429 | Host's sticky delay doubles: `min(max(current, default) × 2, max_delay_ms)`, never lowered again. Retry after `max(Retry-After, new delay)`; permanent failure after 5 attempts. |
 | 503 | Retry after `Retry-After` (default 60 s, clamped to 1 h); not sticky; permanent after 5 attempts. |
@@ -741,7 +746,11 @@ scoped to another crawler (`googlebot: noindex`) are ignored; unscoped ones
 and the `mycel:` and `*:` scopes apply. Off-host
 link targets create candidate host rows and webgraph edges but are never
 crawled until seeded. Same-host links are enqueued while the host is under
-`max_urls_per_host` and link depth ≤ 32.
+`max_urls_per_host` and link depth ≤ 32. Links whose path ends in an obvious
+non-HTML extension (images, media, fonts, archives, PDFs and office
+documents, scripts, stylesheets, feeds, data files) still count as webgraph
+edges but are never enqueued; requests carry an `Accept` header that
+prefers HTML.
 
 **URL normalization.** http(s) only; ≤ 2048 chars; fragments, credentials
 dropped; default ports dropped; host lowercased and punycoded; dot-segments
@@ -752,7 +761,11 @@ collapsed; query strings kept byte-for-byte except the tracking parameters
 are supported (10 MiB compressed download cap, 50 MiB decompressed cap);
 at most 50 000 `<loc>` entries are read per file; only same-host locations
 are kept. `<sitemapindex>` children are enqueued as further sitemap jobs
-(bounded by the same depth cap as pages). A `<lastmod>` on a `<url>` seeds
+(bounded by the same depth cap as pages). Sitemap jobs have their own budget
+of 20 per host and do not count against `max_urls_per_host`; once a host's
+page budget is spent, its remaining sitemap jobs are deferred a recrawl
+interval without a fetch, since nothing they list could be admitted. A
+`<lastmod>` on a `<url>` seeds
 its first-fetch priority within the host: recently modified pages are
 fetched first (it does not affect retries or recrawls). Sitemaps are re-fetched every
 `recrawl_days` and are not archived to WARC.
@@ -1091,6 +1104,14 @@ subcommands, not special tools:
 - Schema v5 relabels catalog rows: `error` marks on URLs whose frontier row
   failed permanently become `dead`; every other `error` mark goes back to
   pending and is re-indexed by the first boot sweep after the upgrade.
+- Schema v6 rebuilds the anchor-text table as a deduplicated `(url, text)`
+  key and drops rows for targets that can never be indexed. It runs on the
+  first open and takes minutes on a corpus-sized table (about three minutes
+  for 60 million rows on a laptop SSD; a log line announces it); the
+  transaction needs free disk roughly the size of the old table,
+  and the database file does not shrink until you run `VACUUM` with the
+  daemon stopped. It also moves sitemap jobs onto their own per-host budget
+  and refunds them from the page budget.
 - If a mycel upgrade ships a tantivy version that cannot read the old index,
   rebuild it: `rm -rf <data>/index && mycel reindex`. The corpus is
   untouched.
@@ -1184,6 +1205,8 @@ Fixed caps (not configurable) in v1:
 | robots.txt body | 512 KiB |
 | robots redirect hops / page redirect hops | 5 |
 | sitemap: compressed / decompressed / locations | 10 MiB / 50 MiB / 50 000 |
+| sitemap jobs per host | 20 |
+| inbound anchor texts kept per URL | 64 |
 | retry attempts: 429 and 503 / other errors | 5 / 3 |
 | federation frame | 4 MiB |
 | federation query / results per peer | 1 KiB / 50 hits |

@@ -36,6 +36,9 @@ Durability invariant (the **watermark protocol**, `warc.rs` + `db.rs`): the db-w
 - Politeness gates use millisecond ceiling math (`gate_at`) so a delay can never round down to zero. 429 doubles `crawl_delay_ms` sticky-per-host, never lowered. Robots 5xx = complete disallow, host stalled an hour.
 - The robots URL is derived from the job URL (keeps the port); the hosts-table key deliberately has no port.
 - Crawl scope = hosts with `state=1` only; discovered off-host links become candidate host rows (state 0) and webgraph edges, never crawl work, until `seed`/`bootstrap` promotes them.
+- Admission (`db.rs::enqueue`) is the single gate: pages draw on `urls_accepted` (`max_urls_per_host`), sitemap jobs on `sitemaps_accepted` (fixed 20/host), and obvious non-HTML extensions (`urlnorm::is_binary_asset`) are dropped after the webgraph edge is recorded. A sitemap for a host at its page cap is `Outcome::Deferred` (no fetch, turn not consumed).
+- Anchor text is kept only for targets with a frontier or docs row, ≤64 distinct texts each; the `(url, text)` primary key (schema v6) makes duplicates impossible.
+- The scheduler waits for slots (`crawl.rs::await_capacity`) and never sleeps while saturated; the 500 ms sleep is only for a claim that returned nothing.
 - `crawl` exits when nothing is due within a 1-hour horizon (`pending_soon`); politeness-gated and backing-off rows are still "pending work".
 
 ## Federation invariants

@@ -57,6 +57,43 @@ fn finish(mut u: Url) -> Option<String> {
     (s.len() <= MAX_URL_LEN).then_some(s)
 }
 
+/// Path extensions that are never HTML pages: images, media, fonts, archives
+/// and installers, office documents, stylesheets and scripts, feeds and
+/// machine-readable data. Links to these stay webgraph edges but never become
+/// crawl work: the content-type gate would reject the response after a
+/// politeness turn was spent on it. Conservative on purpose: `.txt`, `.md`
+/// and friends are left alone because some hosts render them as HTML.
+const BINARY_EXTENSIONS: &[&str] = &[
+    // images
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tif", "tiff", "avif", "heic",
+    // audio / video
+    "mp3", "mp4", "m4a", "m4v", "mov", "avi", "mkv", "webm", "ogg", "ogv", "oga", "wav", "flac",
+    "aac", "wmv", "flv", // fonts
+    "woff", "woff2", "ttf", "otf", "eot", // archives / installers / binaries
+    "zip", "gz", "tgz", "tar", "bz2", "xz", "zst", "7z", "rar", "dmg", "iso", "exe", "msi", "apk",
+    "deb", "rpm", "jar", "whl", "bin", // documents
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "epub", "rtf", "ps",
+    // stylesheets / scripts / data / feeds
+    "css", "js", "mjs", "map", "wasm", "json", "xml", "rss", "atom", "csv", "tsv", "sqlite",
+    "parquet",
+];
+
+/// Does the URL's last path segment carry an extension we never fetch as a
+/// page? Query strings are ignored (`/download?file=x.zip` is a page).
+pub fn is_binary_asset(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    let last = u
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .unwrap_or("");
+    let Some((_, ext)) = last.rsplit_once('.') else {
+        return false;
+    };
+    BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
 /// One `mycel seed` entry, from the CLI or the admin page: a bare host name
 /// (enqueues its https root) or a full URL. Returns (host key, normalized URL).
 pub fn parse_seed_entry(entry: &str) -> std::result::Result<(String, String), String> {
@@ -185,6 +222,32 @@ mod tests {
         );
         assert!(parse_seed_entry("not a host").is_err());
         assert!(parse_seed_entry("example.com/path").is_err());
+    }
+
+    #[test]
+    fn binary_asset_filter() {
+        for u in [
+            "http://e.com/a.PDF",
+            "http://e.com/img/logo.png?v=3",
+            "http://e.com/dl/x.tar.gz",
+            "http://e.com/feed.xml",
+            "http://e.com/static/app.js",
+            "http://e.com/fonts/a.woff2",
+        ] {
+            assert!(is_binary_asset(u), "{u}");
+        }
+        for u in [
+            "http://e.com/",
+            "http://e.com/page.html",
+            "http://e.com/README.md",
+            "http://e.com/robots.txt",
+            "http://e.com/index.php?f=a.pdf",
+            "http://e.com/v1.2/",
+            "http://e.com/download?file=x.zip",
+            "http://e.com/.hidden",
+        ] {
+            assert!(!is_binary_asset(u), "{u}");
+        }
     }
 
     #[test]
