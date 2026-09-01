@@ -213,7 +213,7 @@ initInstruments({ reduced });
       duration: 0.55, stagger: 0.28, ease: 'power2.inOut',
       onUpdate() {
         const gone = dupes.filter(d => parseFloat(g.getProperty(d, 'opacity')) < 0.5).length;
-        count.textContent = `${7 - gone} fetched`;
+        count.textContent = `${7 - gone} shown`;
       },
     });
     tl.fromTo('.dup-line--keep', { color: '#a49c8f' }, { color: '#ffcf7d', duration: 0.6 }, '-=0.3');

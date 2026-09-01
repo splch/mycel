@@ -27,6 +27,11 @@ pub enum IndexMsg {
     Add(Box<IndexDoc>),
     Delete(String),
     Sweep,
+    /// Finish whatever sweep is running (every pending row), then stop: the
+    /// one-shot commands (`reindex --missing`, `ingest`, `bootstrap`).
+    Finish,
+    /// Stop after the current sweep batch: the long-running daemons, where a
+    /// Ctrl-C must not wait for a corpus-sized sweep.
     Shutdown,
 }
 
@@ -218,20 +223,23 @@ struct Indexer {
     conn: rusqlite::Connection,
     writer: tantivy::IndexWriter,
     fields: Fields,
-    /// doc_ids added/marked-skipped since the last completed mark round;
-    /// keeps the periodic sweep from double-processing in-flight rows.
-    in_flight: HashSet<i64>,
     /// The shard handle the sweep is currently reading (rows arrive ordered
     /// by shard_id, offset, so one open() per shard instead of per record).
     cur_shard: Option<(String, std::fs::File)>,
-    /// True while a reconciliation sweep is running: in_flight must not be
-    /// cleared on commit (the writer applies marks later, and a cleared set
-    /// would let the next sweep batch re-select and reprocess those docs).
-    sweeping: bool,
     pending_marks: Vec<(i64, i64, Option<&'static str>)>,
     dirty_ops: usize,
     last_commit: Instant,
     last_sweep: Instant,
+}
+
+/// A pending docs row as the sweep reads it: id, url, host, centrality,
+/// fetched_at, shard name, member offset, member length.
+type PendingRow = (i64, String, String, f64, i64, String, i64, i64);
+
+/// Whether a drained channel asked the indexer to stop.
+enum Drained {
+    Continue,
+    Shutdown,
 }
 
 impl Indexer {
@@ -248,9 +256,7 @@ impl Indexer {
             conn,
             writer,
             fields: f,
-            in_flight: HashSet::new(),
             cur_shard: None,
-            sweeping: false,
             pending_marks: Vec::new(),
             dirty_ops: 0,
             last_commit: Instant::now(),
@@ -264,32 +270,54 @@ impl Indexer {
     fn run(&mut self, rx: mpsc::Receiver<IndexMsg>) -> Result<()> {
         tracing::info!("indexer up");
         // Boot reconciliation: index whatever a previous run left pending.
-        self.sweep()?;
-        loop {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(IndexMsg::Add(d)) => self.gate_and_add(*d)?,
-                Ok(IndexMsg::Delete(url)) => {
-                    self.writer
-                        .delete_term(Term::from_field_text(self.fields.url, &url));
-                    self.dirty_ops += 1;
+        if let Drained::Continue = self.sweep(&rx)? {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(msg) => {
+                        if let Drained::Shutdown = self.handle(msg, &rx)? {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Ok(IndexMsg::Sweep) => self.sweep()?,
-                Ok(IndexMsg::Shutdown) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if self.dirty_ops >= self.cfg.commit_docs
-                || (self.dirty_ops > 0
-                    && self.last_commit.elapsed().as_secs() >= self.cfg.commit_secs)
-            {
-                self.commit_and_mark()?;
-            }
-            if self.last_sweep.elapsed() >= SWEEP_EVERY {
-                self.sweep()?;
+                self.maybe_commit()?;
+                if self.last_sweep.elapsed() >= SWEEP_EVERY
+                    && let Drained::Shutdown = self.sweep(&rx)?
+                {
+                    break;
+                }
             }
         }
         self.commit_and_mark()?;
         tracing::info!("indexer stopped");
+        Ok(())
+    }
+
+    /// One message. A sweep request runs to completion here, interleaving
+    /// hot-path messages between its batches.
+    fn handle(&mut self, msg: IndexMsg, rx: &mpsc::Receiver<IndexMsg>) -> Result<Drained> {
+        match msg {
+            IndexMsg::Add(d) => self.gate_and_add(*d)?,
+            IndexMsg::Delete(url) => self.delete(&url),
+            IndexMsg::Sweep => return self.sweep(rx),
+            IndexMsg::Finish | IndexMsg::Shutdown => return Ok(Drained::Shutdown),
+        }
+        Ok(Drained::Continue)
+    }
+
+    fn delete(&mut self, url: &str) {
+        self.writer
+            .delete_term(Term::from_field_text(self.fields.url, url));
+        self.dirty_ops += 1;
+    }
+
+    fn maybe_commit(&mut self) -> Result<()> {
+        if self.dirty_ops >= self.cfg.commit_docs
+            || (self.dirty_ops > 0 && self.last_commit.elapsed().as_secs() >= self.cfg.commit_secs)
+        {
+            self.commit_and_mark()?;
+        }
         Ok(())
     }
 
@@ -307,7 +335,7 @@ impl Indexer {
             )
             .unwrap_or(false);
         if exact_dup {
-            self.mark(d.doc_id, 2, Some("dup-exact"));
+            self.skip(d.doc_id, &d.url, "dup-exact");
             return Ok(());
         }
         self.writer
@@ -315,18 +343,22 @@ impl Indexer {
         self.writer
             .add_document(tantivy_doc(&self.fields, &d))
             .map_err(|e| format!("add_document failed for {}: {e}", d.url))?;
-        self.in_flight.insert(d.doc_id);
         self.pending_marks.push((d.doc_id, 1, None));
         self.dirty_ops += 1;
         Ok(())
     }
 
-    /// A skip decision needs no commit: mark immediately.
-    fn mark(&mut self, doc_id: i64, indexed: i64, reason: Option<&'static str>) {
-        self.in_flight.insert(doc_id);
-        self.dbh.mark_docs_blocking(vec![(doc_id, indexed, reason)]);
+    /// A skip verdict: the row is marked at once, and any entry an earlier
+    /// pass left in the index is removed (an online re-index can turn an
+    /// indexed page into a duplicate, a wrong language, or a noindex page).
+    fn skip(&mut self, doc_id: i64, url: &str, reason: &'static str) {
+        self.delete(url);
+        self.dbh.mark_docs_blocking(vec![(doc_id, 2, Some(reason))]);
     }
 
+    /// Commit, hand the marks to the db-writer, and wait for them to land, so
+    /// a sweep batch that follows never re-selects rows whose marks are still
+    /// in flight.
     fn commit_and_mark(&mut self) -> Result<()> {
         if self.dirty_ops == 0 && self.pending_marks.is_empty() {
             return Ok(());
@@ -337,12 +369,7 @@ impl Indexer {
                 if !marks.is_empty() {
                     self.dbh.mark_docs_blocking(marks);
                 }
-                // Cleared only outside sweeps: the db-writer applies marks
-                // after this commit, so clearing mid-sweep would let the
-                // next batch re-select docs whose marks are still in flight.
-                if !self.sweeping {
-                    self.in_flight.clear();
-                }
+                self.dbh.flush_blocking();
                 self.dirty_ops = 0;
                 self.last_commit = Instant::now();
             }
@@ -352,7 +379,6 @@ impl Indexer {
                 // A rollback that fails too means the writer is dead: fatal.
                 tracing::error!("index commit failed: {e}");
                 self.pending_marks.clear();
-                self.in_flight.clear();
                 self.dirty_ops = 0;
                 self.writer
                     .rollback()
@@ -363,31 +389,25 @@ impl Indexer {
     }
 
     /// Reconciliation: cold-path (re-)extraction of docs left `indexed = 0`:
-    /// crash recovery, `ingest` registrations, and `reindex --missing`.
-    /// Bounded to the docs pending when the sweep starts: docs arriving
-    /// mid-sweep already travel the hot path (their Add is queued), so
-    /// chasing them here would double-process and, under a live ingest,
-    /// never terminate.
-    fn sweep(&mut self) -> Result<()> {
+    /// crash recovery, `ingest` registrations, `reindex --missing`, and
+    /// `reindex --online`. Bounded to the docs pending when the sweep starts
+    /// (docs arriving mid-sweep already travel the hot path). Between
+    /// batches the channel is drained, so hot-path documents never queue
+    /// behind a long sweep, and a Shutdown ends the sweep after the batch.
+    fn sweep(&mut self, rx: &mpsc::Receiver<IndexMsg>) -> Result<Drained> {
         self.last_sweep = Instant::now();
         let max_id: i64 = self
             .conn
             .query_row("SELECT COALESCE(MAX(id), 0) FROM docs", [], |r| r.get(0))
             .unwrap_or(0);
-        self.sweeping = true;
-        let outcome = self.sweep_batches(max_id);
-        self.sweeping = false;
-        outcome
-    }
-
-    fn sweep_batches(&mut self, max_id: i64) -> Result<()> {
         let mut total = 0usize;
+        let mut finish = false;
         loop {
             let batch = match self.load_pending_batch(max_id) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("sweep query failed: {e}");
-                    return Ok(());
+                    return Ok(Drained::Continue);
                 }
             };
             if batch.is_empty() {
@@ -398,62 +418,66 @@ impl Indexer {
                 self.reindex_row(row)?;
             }
             self.commit_and_mark()?;
+            // Hot-path work that arrived during the batch goes first.
+            loop {
+                match rx.try_recv() {
+                    Ok(IndexMsg::Add(d)) => self.gate_and_add(*d)?,
+                    Ok(IndexMsg::Delete(url)) => self.delete(&url),
+                    Ok(IndexMsg::Sweep) => {}
+                    Ok(IndexMsg::Finish) => finish = true,
+                    Ok(IndexMsg::Shutdown) => {
+                        tracing::info!("reconciled {total} pending docs before shutdown");
+                        return Ok(Drained::Shutdown);
+                    }
+                    Err(_) => break,
+                }
+            }
+            self.maybe_commit()?;
         }
         if total > 0 {
             tracing::info!("reconciled {total} pending docs");
         }
-        Ok(())
+        Ok(if finish {
+            Drained::Shutdown
+        } else {
+            Drained::Continue
+        })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn load_pending_batch(
-        &self,
-        max_id: i64,
-    ) -> Result<Vec<(i64, String, String, f64, i64, String, i64, i64)>> {
-        let in_flight: Vec<i64> = self.in_flight.iter().copied().collect();
+    fn load_pending_batch(&self, max_id: i64) -> Result<Vec<PendingRow>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
              FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
              WHERE d.indexed = 0 AND d.id <= ?2 ORDER BY d.shard_id, d.offset LIMIT ?1",
         )?;
-        let rows = stmt.query_map(
-            params![SWEEP_BATCH as i64 + in_flight.len() as i64, max_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            },
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            let row: (i64, String, String, f64, i64, String, i64, i64) = row?;
-            if !self.in_flight.contains(&row.0) {
-                out.push(row);
-            }
-        }
-        Ok(out)
+        let rows = stmt.query_map(params![SWEEP_BATCH as i64, max_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
     }
 
     /// Per-record verdicts ('error' for an unreadable record, the content
-    /// gates) are marked here; only a dead writer propagates as Err.
-    fn reindex_row(
-        &mut self,
-        row: (i64, String, String, f64, i64, String, i64, i64),
-    ) -> Result<()> {
+    /// gates) are marked here; only a dead writer propagates as Err. The
+    /// gates are the same ones a fresh fetch runs, so an online re-index can
+    /// retire a page that was indexed under older rules.
+    fn reindex_row(&mut self, row: PendingRow) -> Result<()> {
         let (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) = row;
         if !matches!(&self.cur_shard, Some((n, _)) if *n == shard_name) {
             match std::fs::File::open(self.cfg.warc_dir.join(&shard_name)) {
                 Ok(f) => self.cur_shard = Some((shard_name.clone(), f)),
                 Err(e) => {
                     tracing::warn!("cannot open shard for {url}: {e}");
-                    self.mark(doc_id, 2, Some("error"));
+                    self.skip(doc_id, &url, "error");
                     return Ok(());
                 }
             }
@@ -463,40 +487,46 @@ impl Indexer {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("cannot read WARC member for {url}: {e}");
-                self.mark(doc_id, 2, Some("error"));
+                self.skip(doc_id, &url, "error");
                 return Ok(());
             }
         };
         let Some((_status, head, payload)) = rec.http_parts() else {
-            self.mark(doc_id, 2, Some("error"));
+            self.skip(doc_id, &url, "error");
             return Ok(());
         };
-        // Rows normally passed the noindex gate at insert time; rows returned
-        // to pending by a migration may predate the header form of it.
         let hdr = extract::RobotsHeader::parse(
             warc::http_header_values(head, "x-robots-tag")
                 .iter()
                 .map(String::as_str),
         );
-        if hdr.noindex {
-            self.mark(doc_id, 2, Some("noindex"));
-            return Ok(());
-        }
         let content_type = warc::http_header_value(head, "content-type");
         let html = extract::decode_html(payload, content_type.as_deref());
-        let Some(ex) = extract::full(&url, &html) else {
-            self.mark(doc_id, 2, Some("empty"));
+        let Some(a) = extract::analyze(&url, &html, hdr) else {
+            self.skip(doc_id, &url, "error");
+            return Ok(());
+        };
+        if a.meta.noindex {
+            self.skip(doc_id, &url, "noindex");
+            return Ok(());
+        }
+        if a.meta.refresh.is_some() {
+            self.skip(doc_id, &url, "redirect");
+            return Ok(());
+        }
+        let Some(ex) = a.extract else {
+            self.skip(doc_id, &url, "empty");
             return Ok(());
         };
         if !self.cfg.languages.iter().any(|l| l == ex.lang) {
-            self.mark(doc_id, 2, Some("lang"));
+            self.skip(doc_id, &url, "lang");
             return Ok(());
         }
         let anchors = match db::anchors_for(&self.conn, &url) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!("anchor lookup failed for {url}: {e}");
-                self.mark(doc_id, 2, Some("error"));
+                self.skip(doc_id, &url, "error");
                 return Ok(());
             }
         };
@@ -590,6 +620,9 @@ pub fn rebuild(
             let a = extract::analyze(&url, &html, hdr).ok_or("error")?;
             if a.meta.noindex {
                 return Err("noindex");
+            }
+            if a.meta.refresh.is_some() {
+                return Err("redirect");
             }
             let ex = a.extract.ok_or("empty")?;
             if !cfg.languages.iter().any(|l| l == ex.lang) {
@@ -712,6 +745,9 @@ mod tests {
             let (o, l) = shard.append_member(&warc::gzip_member(&rec)).unwrap();
             (o as i64, l as i64, sha.to_vec())
         };
+        let shell = b"<html><head><meta http-equiv=\"refresh\" content=\"0; url=/pending\">\
+                      <title>Moved</title></head><body>Redirecting...</body></html>"
+            .to_vec();
         let rows = [
             (
                 "http://a.com/pending",
@@ -731,6 +767,7 @@ mod tests {
                 2,
                 Some("dead"),
             ),
+            ("http://a.com/shell", shell, 0, None),
         ];
         let mut placed = Vec::new();
         for (url, html, _, _) in &rows {
@@ -765,8 +802,8 @@ mod tests {
             rebuild(&cfg, &mut conn, &dir.path().join("index.new")).unwrap();
         assert_eq!(
             (n_indexed, n_skipped),
-            (2, 0),
-            "pending + retried error; dead untouched"
+            (2, 1),
+            "pending + retried error indexed; the refresh shell skipped; dead untouched"
         );
         let label = |url: &str| -> (i64, Option<String>) {
             conn.query_row(
@@ -779,6 +816,125 @@ mod tests {
         assert_eq!(label("http://a.com/pending"), (1, None));
         assert_eq!(label("http://a.com/retry"), (1, None));
         assert_eq!(label("http://a.com/dead"), (2, Some("dead".into())));
+        assert_eq!(label("http://a.com/shell"), (2, Some("redirect".into())));
+    }
+
+    /// One-shot commands must not lose pending rows past the first sweep
+    /// batch: `Finish` lets the boot sweep run to the end, then stops.
+    #[test]
+    fn finish_completes_the_whole_sweep() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let warc_dir = dir.path().join("warc");
+        let index_dir = dir.path().join("index");
+        std::fs::create_dir_all(&warc_dir).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('a.com', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let mut shard = warc::ShardFile::create(warc_dir.join("s-000001.warc.gz")).unwrap();
+        let n = SWEEP_BATCH + 50;
+        let mut placed = Vec::new();
+        for i in 0..n {
+            let html = page(
+                &format!("Page {i}"),
+                &format!("topic number {i} of the batch"),
+            );
+            let sha = sha2::Sha256::digest(&html);
+            let url = format!("http://a.com/p{i}");
+            let rec = warc::build_response_record(
+                &url,
+                1_700_000_000,
+                url.as_bytes(),
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/html",
+                &html,
+                &hex::encode(sha),
+                false,
+            );
+            let (o, l) = shard.append_member(&warc::gzip_member(&rec)).unwrap();
+            placed.push((url, o as i64, l as i64, sha.to_vec()));
+        }
+        shard.flush().unwrap();
+        conn.execute(
+            "INSERT INTO shards (name, state, origin_node, bytes, records, created_at)
+             VALUES ('s-000001.warc.gz', 1, 'o', ?1, ?2, 0)",
+            params![shard.end as i64, n as i64],
+        )
+        .unwrap();
+        for (url, o, l, sha) in &placed {
+            conn.execute(
+                "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                                   fetched_at, indexed)
+                 VALUES (?1, 1, 1, ?2, ?3, ?4, 200, 1700000000, 0)",
+                params![url, o, l, sha],
+            )
+            .unwrap();
+        }
+        drop(shard);
+        drop(conn);
+
+        // The engine exactly as `reindex --missing` assembles it, with Finish
+        // sent at once: the boot sweep is still on its first batch.
+        let (tx, rx) = std::sync::mpsc::channel::<IndexMsg>();
+        let (dbh, writer_handle) = db::spawn_writer(
+            db::open(&db_path).unwrap(),
+            db::WarcInit {
+                dir: warc_dir.clone(),
+                node8: "deadbeef".into(),
+                origin: "deadbeef".repeat(8),
+                contact: "http://c/".into(),
+                shard_cap_bytes: 1 << 30,
+            },
+            db::DbCfg {
+                recrawl_secs: 14 * 86_400,
+                max_urls_per_host: 50_000,
+                max_depth: 32,
+                languages: vec!["en".into()],
+                block_after_failures: 25,
+            },
+            Some(tx.clone()),
+        )
+        .unwrap();
+        let cfg = IndexerCfg {
+            index_dir: index_dir.clone(),
+            db_path: db_path.clone(),
+            warc_dir,
+            commit_docs: 1000,
+            commit_secs: 60,
+            heap_mb: 64,
+            languages: vec!["en".into()],
+        };
+        let writer = open_writer(&cfg).unwrap();
+        let indexer =
+            spawn_indexer_with(cfg, dbh.clone(), rx, CancellationToken::new(), writer).unwrap();
+        tx.send(IndexMsg::Finish).unwrap();
+        indexer.join().unwrap().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            dbh.flush().await;
+            dbh.shutdown().await;
+        });
+        writer_handle.join().unwrap();
+
+        let conn = db::open(&db_path).unwrap();
+        let indexed: i64 = conn
+            .query_row("SELECT count(*) FROM docs WHERE indexed = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            indexed as usize, n,
+            "every pending row indexed, not just the first batch"
+        );
+        let index = open_or_create(&index_dir).unwrap();
+        assert_eq!(index.reader().unwrap().searcher().num_docs() as usize, n);
     }
 
     #[test]

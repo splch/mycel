@@ -139,6 +139,14 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
             .map(String::as_str),
     );
     let analysis = extract::analyze(&url, &html, hdr)?;
+    // A meta-refresh shell cannot be followed here, but its target is a
+    // link like any other: harvested (no anchor), and the shell stays out
+    // of the index.
+    let mut links = analysis.meta.links;
+    let redirect = analysis.meta.refresh.is_some();
+    if let Some((target, host)) = analysis.meta.refresh {
+        links.push((target, host, String::new()));
+    }
     Some(IngestRecord {
         payload_len: payload.len() as u64,
         fetched_at: rec.date_secs().unwrap_or_else(db::now),
@@ -148,8 +156,9 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
         sha256: sha,
         http_status: status,
         noindex: analysis.meta.noindex,
+        redirect,
         extract: analysis.extract,
-        links: analysis.meta.links,
+        links,
     })
 }
 
@@ -450,6 +459,32 @@ mod tests {
         // warcinfo records are not ingestable
         let info = warc::parse_record(&warc::build_warcinfo(0, "http://c/")).unwrap();
         assert!(prepare_ingest(&info, vec![]).is_none());
+    }
+
+    #[test]
+    fn ingest_marks_meta_refresh_shells() {
+        let payload = b"<html><head><meta http-equiv=\"refresh\" content=\"0; url=/real\">\
+                        <title>Moved</title></head><body>Redirecting...</body></html>";
+        let sha = hex::encode(sha2::Sha256::digest(payload));
+        let rec = warc::parse_record(&warc::build_response_record(
+            "http://example.com/old",
+            1_700_000_000,
+            b"seed",
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/html",
+            payload,
+            &sha,
+            false,
+        ))
+        .unwrap();
+        let ir = prepare_ingest(&rec, vec![]).expect("response record ingests");
+        assert!(ir.redirect, "a shell for another URL");
+        assert!(
+            ir.links
+                .iter()
+                .any(|(u, h, _)| u == "http://example.com/real" && h == "example.com"),
+            "the refresh target is harvested as a link: {:?}",
+            ir.links
+        );
     }
 
     #[test]

@@ -52,7 +52,7 @@ src/
 [dependencies]
 tokio           = { version = "1", features = ["rt-multi-thread","macros","sync","time","signal"] }
 tokio-util      = "0.7"                                    # CancellationToken
-reqwest         = { version = "0.13", default-features = false, features = ["rustls-tls","gzip"] }  # http2 off: per-host serial fetch
+reqwest         = { version = "0.13", default-features = false, features = ["rustls","webpki-roots","gzip","json"] }  # http2 off: per-host serial fetch
 rusqlite        = { version = "0.40", features = ["bundled"] }
 tantivy         = "0.26"
 iroh            = "1"                                       # endpoint surface ONLY (no iroh-gossip/-blobs)
@@ -73,7 +73,7 @@ serde_json      = "1"
 csv             = "1"                                       # hosts.csv / records.csv
 hex             = "0.4"
 fastrand        = "2"                                       # jitter
-axum            = { version = "0.8", default-features = false, features = ["http1","tokio","json","query"] }
+axum            = { version = "0.8", default-features = false, features = ["http1","tokio","json","query","form"] }
 rustls          = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }  # reqwest+iroh link two crypto providers; main() must pick the default
 tracing         = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt","env-filter"] }
@@ -156,13 +156,14 @@ CREATE TABLE hosts (
   crawl_delay_ms INTEGER NOT NULL DEFAULT 1000,  -- 429 doubles, sticky, capped
   next_fetch_at INTEGER NOT NULL DEFAULT 0,   -- politeness gate (unix secs)
   in_flight INTEGER NOT NULL DEFAULT 0,       -- max one request per host
+  next_due_at INTEGER NOT NULL DEFAULT 0,     -- v7: earliest queued row's due time (i64::MAX = nothing queued); derived, rebuilt at boot
   robots_body TEXT, robots_status INTEGER, robots_fetched_at INTEGER,   -- body ≤512 KiB
   urls_accepted INTEGER NOT NULL DEFAULT 0,   -- page admissions
   sitemaps_accepted INTEGER NOT NULL DEFAULT 0, -- v6: sitemap-job admissions, own budget (≤20)
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  added_at INTEGER NOT NULL, last_error TEXT
+  added_at INTEGER NOT NULL, last_error TEXT   -- last host-level fault (transport, 5xx, robots outage)
 );
-CREATE INDEX hosts_sched ON hosts (next_fetch_at) WHERE state = 1 AND in_flight = 0;
+CREATE INDEX hosts_sched ON hosts (next_fetch_at, next_due_at) WHERE state = 1 AND in_flight = 0;
 
 CREATE TABLE frontier (
   id INTEGER PRIMARY KEY,
@@ -189,7 +190,7 @@ CREATE TABLE docs (                           -- current snapshot per URL; histo
   lang TEXT, title TEXT,
   http_status INTEGER NOT NULL, fetched_at INTEGER NOT NULL,
   indexed INTEGER NOT NULL DEFAULT 0,         -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                            -- dup-exact|lang|empty|noindex|error|dead
+  skip_reason TEXT                            -- dup-exact|lang|empty|noindex|redirect|error|dead
 );
 CREATE INDEX docs_sha ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -204,7 +205,7 @@ CREATE TABLE shards (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,                  -- filename; local: {node8}-{seq:06}.warc.gz
   state INTEGER NOT NULL DEFAULT 0,           -- 0=open 1=sealed
-  source TEXT NOT NULL DEFAULT 'crawl',       -- crawl|bootstrap|ingest|sync (provenance)
+  source TEXT NOT NULL DEFAULT 'crawl',       -- crawl = written by this node (crawl, bootstrap, ingest share the open shard); sync = pulled from a peer
   origin_node TEXT NOT NULL,                  -- EndpointId hex; self for local shards
   bytes INTEGER NOT NULL DEFAULT 0,           -- durable watermark while open; size when sealed
   records INTEGER NOT NULL DEFAULT 0,
@@ -222,7 +223,7 @@ CREATE TABLE anchor_text (                    -- v3, reshaped v6: inbound anchor
 ) WITHOUT ROWID;
 ```
 
-**Writer pattern**: one OS thread owns the write connection, drains a bounded mpsc (cap 10k = backpressure). Correctness-critical reads (claims, dedup checks) flow through the same channel with oneshot replies → strict ordering, zero contention. **Drain-batching**: recv one command, try_recv up to 255 more, one transaction, turning thousands of tiny commits into few sequential WAL writes (Marginalia disk-wear doctrine). `rank`/`reindex`/sqlite3 CLI open separate read connections (WAL-safe).
+**Writer pattern**: one OS thread owns the write connection, drains a bounded mpsc (cap 256 = backpressure). Correctness-critical reads (claims, dedup checks) flow through the same channel with oneshot replies → strict ordering, zero contention. **Drain-batching**: recv one command, try_recv up to 255 more, one transaction, turning thousands of tiny commits into few sequential WAL writes (Marginalia disk-wear doctrine). `rank`/`reindex`/sqlite3 CLI open separate read connections (WAL-safe).
 
 ## 5. WARC store (hand-rolled, ~380 LoC)
 
@@ -245,8 +246,9 @@ JOIN frontier f ON f.id = (
    SELECT f2.id FROM frontier f2
    WHERE f2.host_id = h.id AND f2.state = 0 AND f2.next_attempt_at <= :now
    ORDER BY f2.next_attempt_at, f2.id LIMIT 1)
-WHERE h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at <= :now
+WHERE h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at <= :now AND h.next_due_at <= :now
 ORDER BY h.next_fetch_at LIMIT :batch;
+-- next_due_at is maintained by enqueue/seed (min), completions and the lease sweep (recompute), and boot recovery
 -- same txn: frontier.state=1, claimed_at=now, attempts+1; hosts.in_flight=1
 ```
 
@@ -258,7 +260,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **robots.txt (RFC 9309)**: 2xx → cache body (≤512 KiB) and any ETag/Last-Modified validators; 429 → stall exactly like 5xx but without a breaker fault (the host answered: back off); other 4xx → allow-all; **5xx/network error → complete disallow**, `robots_body=NULL`, host stalls, retried hourly. With validators on file the cache TTL extends to 24h (the RFC maximum) and re-fetches are conditional (`If-None-Match`/`If-Modified-Since`; 304 keeps the cached rules and refreshes the timestamp). texting_robots parses per fetch (µs; `delay: Option<f32>`, `sitemaps: Vec<String>`).
 
-**Outcomes**: 200 new sha → WARC + docs(indexed=0) + links + requeue at `now+recrawl_days` (attempts reset, streak reset); 200 unchanged sha → touch fetched_at only, **no WARC write**, streak+1 and requeue at `recrawl_days × 2^min(streak,4)` (adaptive recrawl, ≤16×; the writer applies the same rule when a same-host redirect lands on a final URL whose stored sha matches); 3xx same-host → follow in-request; 3xx cross-host → permanent + edge recorded + target enqueued if active; 4xx → permanent (+ tantivy delete if previously indexed); 5xx/timeout → retry `60s·4^(n−1)`, permanent after 3.
+**Outcomes**: 200 with an instant meta refresh → treated as a 3xx to its target (same hop budget and robots checks; the shell is never stored); 200 new sha → WARC + docs(indexed=0) + links + requeue at `now+recrawl_days` (attempts reset, streak reset); 200 unchanged sha → touch fetched_at only, **no WARC write**, streak+1 and requeue at `recrawl_days × 2^min(streak,4)` (adaptive recrawl, ≤16×; the writer applies the same rule when a same-host redirect lands on a final URL whose stored sha matches); 3xx same-host → follow in-request; 3xx cross-host → permanent + edge recorded + target enqueued if active; 4xx → permanent (+ tantivy delete if previously indexed); 5xx/timeout → retry `60s·4^(n−1)`, permanent after 3.
 
 **Crash safety**: boot resets `state=1→0`, `in_flight→0`; runtime lease sweep (5 min) requeues rows claimed >15 min.
 
@@ -289,7 +291,7 @@ simhash: u64 FAST  (serve-time near-dup collapse; older indexes fail open
            with a schema error and `reindex` moves them aside + rebuilds)
 ```
 
-Indexer thread: consumes in-memory channel from crawl (already-extracted text, no double work) + 5-min sweep + boot reconciliation of `indexed=0` (re-reads WARC). `delete_term(url)` before every add → idempotent, recrawl updates in place. Commit at 1000 docs / 60s; then batch-set `indexed=1`. Crash-safe in both orderings (tantivy rollback + replay; delete-before-add). The writer lock is taken before the WARC shard is opened (a second process refuses to start), and a killed writer is fatal: the indexer cancels the daemon, which exits non-zero for the supervisor to restart; nothing is marked, so the boot sweep replays the pending rows. `error` marks (unreadable records) are retried by `reindex`; `dead` marks (URL failed permanently on recrawl) are not.
+Indexer thread: consumes in-memory channel from crawl (already-extracted text, no double work) + 5-min sweep + boot reconciliation of `indexed=0` (re-reads WARC, running the same gates as a fresh fetch, and draining the hot-path channel between batches so a long sweep never starves it; marks are flushed through the db-writer before the next batch is selected). `reindex --online` returns every non-dead row to `indexed=0` in short transactions from a second connection and lets that sweep re-index the corpus without downtime (how new ranks and anchors reach an existing index). `delete_term(url)` before every add → idempotent, recrawl updates in place. Commit at 1000 docs / 60s; then batch-set `indexed=1`. Crash-safe in both orderings (tantivy rollback + replay; delete-before-add). The writer lock is taken before the WARC shard is opened (a second process refuses to start), and a killed writer is fatal: the indexer cancels the daemon, which exits non-zero for the supervisor to restart; nothing is marked, so the boot sweep replays the pending rows. `error` marks (unreadable records) are retried by `reindex`; `dead` marks (URL failed permanently on recrawl) are not.
 
 `reindex`: rebuild into `index.new/` reading docs `ORDER BY shard_id, offset` (sequential I/O), swap dirs; daemon stopped. `ingest` only registers (indexed=0), safe while running. `reindex --missing` = index pending only.
 
@@ -314,12 +316,12 @@ search <q> [--json] [--federated]   one-shot query (own read-only reader)
 bootstrap --hosts F [--records F]   seed centrality+activate hosts; ranged-fetch CC records
 ingest <file|dir>…         register+index local .warc/.warc.gz; safe while running
 rank [--force]             harmonic centrality → hosts.centrality
-reindex [--missing]        full rebuild from WARC into index.new + swap (daemon stopped)
+reindex [--missing|--online]   full rebuild from WARC into index.new + swap (daemon stopped); --online re-indexes through the running daemon's sweep
 status [--json]            counters, queue depths, shards, disk, last_rank_at
 seed <host|url>… [--from-file F]    promote hosts to active + enqueue roots
 ```
 
-axum (spec-time choice; fallback raw hyper): `GET /api/search?q&page[&federated=0|1]` → JSON `{query,page,total,hits:[{url,host,title,snippet,score,fetched_at,source?}]}`; `GET /` server-rendered HTML (format! + 5-line escaper, no template engine); `GET /healthz` (db round-trip + reader check); `GET /stats`; `GET /admin` + `POST /admin/{seed,rank,sweep,ingest,bootstrap,peers,config}` (post-v1 extension): CLI-parity forms against the running daemon, gated by a per-boot CSRF token + Host check, long jobs in-process one at a time through the daemon's own writer paths; `init` and full `reindex` stay CLI-only (writer lock).
+axum (spec-time choice; fallback raw hyper): `GET /api/search?q&page[&federated=0|1]` → JSON `{query,page,total,hits:[{url,host,title,snippet,score,fetched_at,source?}]}`; `GET /` server-rendered HTML (format! + 5-line escaper, no template engine); `GET /healthz` (db round-trip + reader check); `GET /stats`; `GET /admin` + `POST /admin/{seed,rank,sweep,reindex,ingest,bootstrap,peers,config}` (post-v1 extension): CLI-parity forms against the running daemon, gated by a per-boot CSRF token + Host check, long jobs in-process one at a time through the daemon's own writer paths; `init` and full `reindex` stay CLI-only (writer lock).
 
 ## 11. Federation (iroh)
 
@@ -397,7 +399,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority; dom_query replaces scraper (a single DOM parse serves links/meta/Readability/fallback — measured 1.6× on ingest; scraper dropped from the dependency tree); `X-Robots-Tag` honored like the meta tag; robots.txt 429 stalls like 5xx without a breaker fault; a `dead` skip label distinct from `error` (schema v5 relabels and returns indexer casualties to pending); the daemon raises its own fd soft limit; a killed tantivy writer is fatal rather than per-doc `error` marks; `reindex` holds the writer lock for the whole rebuild and every WARC-writing command takes it before opening the shard; a failed fsync/watermark/commit truncates the open shard back to the durable position; anchor text bounded (schema v6: `(url, text)` primary key, ≤64 texts per target, only for targets with a frontier or docs row); sitemap jobs on their own ≤20-per-host budget with deferral at the page cap; obvious non-HTML asset extensions never admitted; the unchanged check keyed by final URL in the writer; the scheduler waits for slots and never sleeps while saturated.
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority; dom_query replaces scraper (a single DOM parse serves links/meta/Readability/fallback — measured 1.6× on ingest; scraper dropped from the dependency tree); `X-Robots-Tag` honored like the meta tag; robots.txt 429 stalls like 5xx without a breaker fault; a `dead` skip label distinct from `error` (schema v5 relabels and returns indexer casualties to pending); the daemon raises its own fd soft limit; a killed tantivy writer is fatal rather than per-doc `error` marks; `reindex` holds the writer lock for the whole rebuild and every WARC-writing command takes it before opening the shard; a failed fsync/watermark/commit truncates the open shard back to the durable position; anchor text bounded (schema v6: `(url, text)` primary key, ≤64 texts per target, only for targets with a frontier or docs row); sitemap jobs on their own ≤20-per-host budget with deferral at the page cap; obvious non-HTML asset extensions never admitted; the unchanged check keyed by final URL in the writer; the scheduler waits for slots and never sleeps while saturated; `reindex --online` (re-index through the running daemon's sweep, which now drains the hot path between batches); `hosts.next_due_at` (schema v7) so the claim skips exhausted hosts without a frontier probe; instant meta refresh treated as a redirect (`redirect` skip label for shells that arrive via ingest/sync); `hosts.last_error` records host-level faults; a 10 s shutdown drain; the admin CSRF token from the node-key CSPRNG.
 
 ## Verification (end-to-end, after M5)
 

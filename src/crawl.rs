@@ -29,6 +29,8 @@ const ROBOTS_VALIDATED_TTL_SECS: u64 = 86_400;
 /// When the pool is saturated, wait for fetches to finish before claiming
 /// again, but never leave a freed slot idle longer than this.
 const CLAIM_GRACE: Duration = Duration::from_millis(100);
+/// How long a graceful shutdown waits for in-flight fetches.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(10);
 
 fn robots_ttl(cfg: &CrawlCfg, has_validators: bool) -> u64 {
     if has_validators {
@@ -165,7 +167,10 @@ pub async fn run(
         }
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+    // Drain briefly, then let the rest go: abandoned fetches are safe (boot
+    // recovery releases their claims), and a service manager's stop timeout
+    // has to cover this plus the final index commit.
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, async {
         while tasks.join_next().await.is_some() {}
     })
     .await;
@@ -575,38 +580,13 @@ async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outco
             let Some(target) = urlnorm::normalize_rel(&base, loc) else {
                 return (Outcome::CrossRedirect { target: None }, None);
             };
-            hops += 1;
-            if hops > MAX_REDIRECT_HOPS {
-                return (
-                    Outcome::PermanentFail {
-                        reason: "redirect-loop".into(),
-                    },
-                    None,
-                );
-            }
-            let Some(thost) = urlnorm::host_of(&target) else {
-                return (Outcome::CrossRedirect { target: None }, None);
-            };
-            if thost == job.host {
-                if let Some(r) = robot
-                    && !r.allowed(&target)
-                {
-                    return (
-                        Outcome::PermanentFail {
-                            reason: "robots-redirect".into(),
-                        },
-                        None,
-                    );
+            match redirect_step(job, robot, &mut hops, target) {
+                Redirected::Follow(next) => {
+                    cur = next;
+                    continue;
                 }
-                cur = target;
-                continue;
+                Redirected::Done(outcome) => return (outcome, None),
             }
-            return (
-                Outcome::CrossRedirect {
-                    target: Some((target, thost)),
-                },
-                None,
-            );
         }
 
         if status == 429 {
@@ -739,7 +719,7 @@ async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outco
 
         // Page: extraction + WARC member build are CPU-bound, so they run off the runtime.
         let url_for_record = final_url.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
+        let built = tokio::task::spawn_blocking(move || {
             build_stored(
                 url_for_record,
                 status,
@@ -752,11 +732,65 @@ async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outco
             )
         })
         .await
-        .unwrap_or_else(|e| Outcome::PermanentFail {
-            reason: format!("extract-panic: {e}"),
+        .unwrap_or_else(|e| {
+            Built::Outcome(Outcome::PermanentFail {
+                reason: format!("extract-panic: {e}"),
+            })
         });
-        return (outcome, None);
+        match built {
+            Built::Outcome(outcome) => return (outcome, None),
+            // An instant meta refresh: a redirect by other means, with the
+            // same hop budget and the same rules as a Location header.
+            Built::Refresh(target) => match redirect_step(job, robot, &mut hops, target) {
+                Redirected::Follow(next) => {
+                    cur = next;
+                    continue;
+                }
+                Redirected::Done(outcome) => return (outcome, None),
+            },
+        }
     }
+}
+
+/// The shared tail of every redirect, whether a 3xx Location or an instant
+/// meta refresh: count the hop, keep same-host targets in-request when robots
+/// allows them, hand cross-host targets back as a CrossRedirect.
+fn redirect_step(job: &Job, robot: Option<&Robot>, hops: &mut u32, target: String) -> Redirected {
+    *hops += 1;
+    if *hops > MAX_REDIRECT_HOPS {
+        return Redirected::Done(Outcome::PermanentFail {
+            reason: "redirect-loop".into(),
+        });
+    }
+    let Some(thost) = urlnorm::host_of(&target) else {
+        return Redirected::Done(Outcome::CrossRedirect { target: None });
+    };
+    if thost != job.host {
+        return Redirected::Done(Outcome::CrossRedirect {
+            target: Some((target, thost)),
+        });
+    }
+    if let Some(r) = robot
+        && !r.allowed(&target)
+    {
+        return Redirected::Done(Outcome::PermanentFail {
+            reason: "robots-redirect".into(),
+        });
+    }
+    Redirected::Follow(target)
+}
+
+/// Where a redirect leads: another same-host fetch, or a final outcome.
+enum Redirected {
+    Follow(String),
+    Done(Outcome),
+}
+
+/// What the blocking page builder produced.
+enum Built {
+    Outcome(Outcome),
+    /// The page is an instant meta refresh to this (normalized) URL.
+    Refresh(String),
 }
 
 /// Reconstruct the HTTP header block for the WARC record: status line + headers
@@ -803,7 +837,7 @@ fn build_stored(
     sha: [u8; 32],
     truncated: bool,
     now: i64,
-) -> Outcome {
+) -> Built {
     let html = crate::extract::decode_html(&body, Some(&content_type));
     // X-Robots-Tag rides in the stored head, so rebuilds see it too.
     let hdr = crate::extract::RobotsHeader::parse(
@@ -812,10 +846,13 @@ fn build_stored(
             .map(String::as_str),
     );
     let Some(analysis) = crate::extract::analyze(&final_url, &html, hdr) else {
-        return Outcome::PermanentFail {
+        return Built::Outcome(Outcome::PermanentFail {
             reason: "bad-final-url".into(),
-        };
+        });
     };
+    if let Some((target, _)) = analysis.meta.refresh {
+        return Built::Refresh(target);
+    }
 
     head.extend_from_slice(format!("\r\ncontent-length: {}", body.len()).as_bytes());
     let seed = format!("{final_url}\u{0}{now}");
@@ -829,7 +866,7 @@ fn build_stored(
         truncated,
     );
     let member = warc::gzip_member(&record);
-    Outcome::Stored(StoredPage {
+    Built::Outcome(Outcome::Stored(StoredPage {
         final_url,
         http_status: status,
         member,
@@ -838,7 +875,7 @@ fn build_stored(
         noindex: analysis.meta.noindex,
         links: analysis.meta.links,
         extract: analysis.extract,
-    })
+    }))
 }
 
 fn parse_sitemap_outcome(host: &str, body: Vec<u8>) -> Outcome {

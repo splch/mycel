@@ -57,7 +57,7 @@
       <p class="epitaph">Open-source web search in Rust. Essentially one developer. Archived by its owner; no successor.</p>
       <div class="rebuttal">
         <svg class="thread" viewBox="0 0 20 60" preserveAspectRatio="none" aria-hidden="true"><path d="M10,60 C4,48 16,40 9,28 C4,19 13,12 10,0" pathLength="100"/></svg>
-        <p><strong>what grew back:</strong> survivability as architecture. ~8,500 lines, 27 boring dependencies, and data formats that stay valuable even if development pauses for a year.</p>
+        <p><strong>what grew back:</strong> survivability as architecture. ~13,000 lines, 27 boring dependencies, and data formats that stay valuable even if development pauses for a year.</p>
       </div>
     </article>
 
@@ -145,8 +145,8 @@
     <div class="panel">
       <p class="chlabel">04 · index</p>
       <h2>The index is a regrowable organ.</h2>
-      <p>Text is extracted; near-duplicates are composted, exact by sha256, near by simhash. What survives enters a tantivy BM25 index. Corrupt it, upgrade it, delete it: <code>mycel reindex</code> grows it back from WARC.</p>
-      <figure class="dedup" id="dedup" aria-label="near-duplicate pages collapsing into one indexed document">
+      <p>Text is extracted; exact duplicates are composted by sha256. Near-duplicates all enter the tantivy BM25 index and are folded together at search time by simhash, so no page is ever unfindable. Corrupt the index, upgrade it, delete it: <code>mycel reindex</code> grows it back from WARC.</p>
+      <figure class="dedup" id="dedup" aria-label="near-duplicate pages folding into one search result">
         <div class="dup-lines">
           <p class="dup-line">10 Best Hikes Near Portland (2026 Edition, Updated)</p>
           <p class="dup-line">10 Best Hikes Near Portland, 2026 Edition [Updated]</p>
@@ -156,7 +156,7 @@
           <p class="dup-line">10 Best Portland Hikes: Updated 2026 Edition</p>
           <p class="dup-line dup-line--keep">10 Best Hikes Near Portland (2026 Edition, Updated)</p>
         </div>
-        <figcaption><span id="dedup-count">7 fetched</span> → <strong>1 indexed</strong> · <code>skip_reason: dup-near · simhash Δ ≤ 3</code></figcaption>
+        <figcaption>7 fetched → 7 indexed → <strong><span id="dedup-count">7 shown</span></strong> · <code>collapsed at search time · simhash Δ ≤ 3</code></figcaption>
       </figure>
     </div>
   </section>
@@ -208,14 +208,15 @@
     <details class="sqlbox">
       <summary>the actual claim query (src/db.rs)</summary>
 <pre><code>SELECT h.id, h.host, f.id, f.url, f.kind, f.attempts, f.depth,
-       h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256
+       h.robots_body, h.robots_fetched_at, h.crawl_delay_ms, d.sha256,
+       h.robots_etag, h.robots_last_modified, h.urls_accepted
 FROM hosts h
 JOIN frontier f ON f.id = (
    SELECT f2.id FROM frontier f2
    WHERE f2.host_id = h.id AND f2.state = 0 AND f2.next_attempt_at &lt;= ?1
    ORDER BY f2.next_attempt_at, f2.id LIMIT 1)
 LEFT JOIN docs d ON d.url = f.url
-WHERE <mark>h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at &lt;= ?1</mark>
+WHERE <mark>h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at &lt;= ?1</mark> AND h.next_due_at &lt;= ?1
 ORDER BY h.next_fetch_at
 LIMIT ?2</code></pre>
     </details>
@@ -239,7 +240,7 @@ LIMIT ?2</code></pre>
   <div class="numbers">
     <div class="num"><strong data-count="1">1</strong><span>binary</span></div>
     <div class="num"><strong data-count="27">27</strong><span>dependencies</span></div>
-    <div class="num"><strong data-count="8500" data-approx="~" data-format="comma">~8,500</strong><span>lines of rust</span></div>
+    <div class="num"><strong data-count="13000" data-approx="~" data-format="comma">~13,000</strong><span>lines of rust</span></div>
     <div class="num"><strong data-count="0">0</strong><span>servers required</span></div>
   </div>
 

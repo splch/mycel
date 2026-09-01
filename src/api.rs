@@ -60,6 +60,7 @@ pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Resu
         .route("/admin", get(crate::admin::page))
         .route("/admin/seed", post(crate::admin::seed))
         .route("/admin/sweep", post(crate::admin::sweep))
+        .route("/admin/reindex", post(crate::admin::reindex_online))
         .route("/admin/rank", post(crate::admin::rank_job))
         .route("/admin/ingest", post(crate::admin::ingest_job))
         .route("/admin/bootstrap", post(crate::admin::bootstrap_job))

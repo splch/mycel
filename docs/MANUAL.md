@@ -1,8 +1,9 @@
 # mycel user manual
 
-This manual describes mycel 0.2.0. It covers installation, configuration,
-every command, the query language, the HTTP API, crawler behavior, Common
-Crawl bootstrapping, federation, and day-2 operations. The design rationale
+This manual describes the mycel this repository builds (`mycel version`
+prints the exact version). It covers installation, configuration, every
+command, the query language, the HTTP API, crawler behavior, Common Crawl
+bootstrapping, federation, and day-2 operations. The design rationale
 lives in [RESEARCH.md](RESEARCH.md) and the specification in [SPEC.md](SPEC.md);
 this document tells you how to run the thing.
 
@@ -64,7 +65,6 @@ $ git clone https://github.com/splch/mycel
 $ cd mycel
 $ cargo build --release
 $ ./target/release/mycel version
-mycel 0.2.0
 ```
 
 There are no runtime dependencies: SQLite is bundled, TLS is rustls. The
@@ -407,7 +407,9 @@ Point-in-time counters from the database (read-only, safe anytime): hosts by
 state, frontier depths, docs total/pending/indexed, webgraph edge count,
 shard count and WARC bytes, and lifetime counters (`fetch_ok`, `fetch_err`,
 `fetch_429`, `bytes_fetched`, `docs_stored`, `docs_indexed`, `docs_skipped`,
-`queries`). Counters are flushed to the database every 60 s while a daemon
+`queries`). `bytes_fetched` is the decoded size of the pages stored, not
+bytes on the wire (sitemaps, robots, rejected bodies, and compression are
+not in it). Counters are flushed to the database every 60 s while a daemon
 runs and at shutdown, so `status` can lag live activity by up to a minute.
 
 ### `mycel rank [--force]`
@@ -445,6 +447,17 @@ immediately everywhere via `mycel reindex`. Safe to run beside the daemon
   (crash leftovers, freshly ingested files). Refuses to start while a
   daemon holds the index writer lock (see
   [One writer at a time](#one-writer-at-a-time)).
+- `mycel reindex --online`: queue every document (dead pages excepted) for
+  re-indexing by the running daemon, **without stopping it**. The daemon's
+  reconciliation sweep re-extracts each document from WARC with today's
+  gates, centrality, and anchor text, batch by batch, while search keeps
+  serving the current entries until each is replaced or retired. This is
+  how new `rank` values and accumulated anchor text reach an existing
+  index. The sweep starts within five minutes (or at the daemon's next
+  start), interleaves freshly crawled pages between batches, and takes
+  about as long as a full rebuild. Safe beside the daemon: short write
+  transactions on its own connection, like `seed` and `rank`. The admin
+  page has the same operation as a button.
 
 ### `mycel bootstrap --hosts F [--records F]`
 
@@ -580,7 +593,8 @@ cooldown is the probe. A dead peer therefore costs at most one
 Server-rendered forms that expose the CLI against the running daemon:
 node identity and status (the `mycel id` / `mycel status` gauges), `seed`,
 `rank [--force]`, `ingest`, `bootstrap`, an "index pending docs" button
-(= `reindex --missing`), `peers check`, and a `mycel.toml` editor. Long
+(= `reindex --missing`), a "re-index everything online" button
+(= `reindex --online`), `peers check`, and a `mycel.toml` editor. Long
 operations (rank, ingest, bootstrap) run in-process, one at a time; the page
 shows the last job's outcome, and detailed progress stays on stderr.
 
@@ -704,6 +718,11 @@ request, and the host's turn is not consumed.
 - Cross-host: the redirect is not followed. The source URL is marked done
   (`redirect:<target>`), a webgraph edge is recorded, and the target is
   enqueued only if its host is already active.
+- An instant meta refresh (`<meta http-equiv="refresh" content="0; url=…">`)
+  is a redirect by other means and takes the same path, hop budget included;
+  the shell page itself is never stored. Delayed refreshes are content.
+  Shells that reach the store through `ingest` or a peer are kept but
+  skipped as `redirect`, with the target harvested as a link.
 
 **HTTP outcomes.**
 
@@ -1010,7 +1029,7 @@ shard, so a second one refuses to start instead.
 | `run`, `crawl` | everything | one of these at a time |
 | `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | refused as a second process (writer-lock probe); use the admin page instead |
 | `reindex` (full) | index + db | refuses by itself (writer-lock probe) |
-| `seed`, `bootstrap --hosts`, `rank` | db (short write txn) | yes |
+| `seed`, `bootstrap --hosts`, `rank`, `reindex --online` | db (short write txns) | yes |
 | `search`, `status`, `id`, `peers check` | read-only | yes |
 | external `sqlite3` reads | db read | yes (WAL) |
 
@@ -1042,7 +1061,9 @@ WantedBy=multi-user.target
 ```
 
 A SIGKILL or power loss is also safe (see crash safety), just less tidy:
-whatever was past the durability watermark is simply recrawled.
+whatever was past the durability watermark is simply recrawled. A graceful
+stop waits up to 10 s for in-flight fetches, then commits the index and
+flushes the database; the 40 s above leaves room for a slow final commit.
 
 **File descriptors.** A wide crawl holds thousands of idle keep-alive
 sockets on top of the index and WARC handles. The daemon raises its own soft
@@ -1112,6 +1133,9 @@ subcommands, not special tools:
   and the database file does not shrink until you run `VACUUM` with the
   daemon stopped. It also moves sitemap jobs onto their own per-host budget
   and refunds them from the page budget.
+- Schema v7 adds a per-host cache of the earliest queued due time and
+  rebuilds the scheduling index on it; instant, and recomputed at every
+  start.
 - If a mycel upgrade ships a tantivy version that cannot read the old index,
   rebuild it: `rm -rf <data>/index && mycel reindex`. The corpus is
   untouched.
@@ -1153,8 +1177,9 @@ Common ones: `lang` (page not in `index.languages`), `empty` (under 100
 chars of extracted text and no usable title), `dup-exact` (another URL is
 already indexed with the same bytes), `noindex` (the page or its response
 headers opted out), `dead` (the URL failed permanently on a later fetch),
-`error` (an unreadable record; `reindex` retries these). Near-duplicates
-are never skipped: they index and collapse at search time.
+`error` (an unreadable record; `reindex` retries these), `redirect` (an
+instant meta-refresh shell for another URL). Near-duplicates are never
+skipped: they index and collapse at search time.
 
 **`the index is in use; stop 'mycel run'/'crawl' before reindexing`** —
 exactly what it says; only one process may hold the index writer.

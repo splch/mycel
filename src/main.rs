@@ -39,7 +39,9 @@ Commands:
                              seed centrality + activate hosts; fetch Common Crawl records
   ingest <file|dir>...       register + index local .warc / .warc.gz
   rank [--force]             compute harmonic centrality over the host webgraph
-  reindex [--missing]        rebuild the index from WARC (daemon stopped)
+  reindex [--missing|--online]
+                             rebuild the index from WARC (daemon stopped), index pending
+                             docs, or re-index everything through the running daemon
   status [--json]            counters, queue depths, shards, disk
   seed <host|url>... [--from-file F]
                              promote hosts to active + enqueue roots
@@ -275,9 +277,23 @@ fn cmd_run() -> Result<()> {
     })
 }
 
-/// `mycel reindex [--missing]`: index docs left pending (--missing), or (M3)
-/// rebuild the whole index from WARC.
+/// `mycel reindex [--missing|--online]`: index docs left pending
+/// (--missing), queue every document for the daemon's sweep to re-index
+/// without downtime (--online), or rebuild the whole index from WARC.
 fn cmd_reindex(rest: &[String]) -> Result<()> {
+    if rest.iter().any(|a| a == "--online") {
+        // Short write transactions on our own connection: safe beside the
+        // daemon, like `seed` and `rank`. The daemon's sweep does the work.
+        let (_cfg, data) = load_env()?;
+        let conn = db::open(&data.join("mycel.sqlite"))?;
+        let n = db::requeue_indexed(&conn)?;
+        println!(
+            "{n} documents queued for re-indexing; a running daemon's sweep picks them up \
+             within 5 minutes (or its next start does), and search keeps serving the \
+             current entries until each one is replaced"
+        );
+        return Ok(());
+    }
     let missing = rest.iter().any(|a| a == "--missing");
     if missing {
         return daemon(DaemonOpts {
@@ -698,7 +714,14 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
         }
 
         // Shutdown order: indexer first (its marks need the writer alive).
-        let _ = index_tx.send(index::IndexMsg::Shutdown);
+        // One-shot commands exist to finish the pending work, so their sweep
+        // runs to the end; the daemons stop after the current batch.
+        let stop = if matches!(opts.work, DaemonWork::Crawl { .. }) {
+            index::IndexMsg::Shutdown
+        } else {
+            index::IndexMsg::Finish
+        };
+        let _ = index_tx.send(stop);
         let indexer_outcome = tokio::task::spawn_blocking(move || indexer.join()).await;
         db.flush().await;
         db.shutdown().await;
@@ -905,7 +928,7 @@ fn cmd_status(rest: &[String]) -> Result<()> {
         let obj = serde_json::json!({
             "hosts": { "active": s.hosts_active, "candidate": s.hosts_candidate },
             "frontier": { "queued": s.queued, "in_flight": s.in_flight, "failed_permanent": s.failed },
-            "docs": { "total": s.docs_total, "pending": s.docs_pending, "indexed": s.docs_indexed },
+            "docs": { "total": s.docs_total, "pending": s.docs_pending, "indexed": s.docs_indexed, "skipped": s.docs_skipped },
             "webgraph_edges": s.edges,
             "shards": { "count": s.shards, "warc_bytes": s.warc_bytes },
             "counters": s.counters,
@@ -921,8 +944,8 @@ fn cmd_status(rest: &[String]) -> Result<()> {
             s.queued, s.in_flight, s.failed
         );
         println!(
-            "docs      {} total, {} pending, {} indexed",
-            s.docs_total, s.docs_pending, s.docs_indexed
+            "docs      {} total, {} pending, {} indexed, {} skipped",
+            s.docs_total, s.docs_pending, s.docs_indexed, s.docs_skipped
         );
         println!("webgraph  {} host edges", s.edges);
         println!("warc      {} shards, {} bytes", s.shards, s.warc_bytes);

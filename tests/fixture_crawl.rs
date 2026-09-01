@@ -10,6 +10,10 @@ const PHRASE: &str = "unmistakable-fixture-phrase";
 const HDR_PHRASE: &str = "header-noindex-sentinel";
 /// Lives on a page reachable only through that noindex page's links.
 const DEEP_PHRASE: &str = "reached-through-header-noindex-page";
+/// Body text of an instant meta-refresh shell: never stored, never indexed.
+const SHELL_PHRASE: &str = "meta-refresh-shell-text";
+/// Lives on the page that shell refreshes to.
+const LANDING_PHRASE: &str = "landing-after-meta-refresh";
 
 /// Distinct filler per page: byte-identical filler across pages would be
 /// exact-duplicated (sha256) and never index.
@@ -77,7 +81,7 @@ fn serve_fixture(listener: TcpListener) {
                 page_with(
                     "Home",
                     1,
-                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a> <a href=\"/tagged.html\">t</a>",
+                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a> <a href=\"/tagged.html\">t</a> <a href=\"/moved.html\">m</a>",
                 ),
             ),
             "/a.html" => (
@@ -115,6 +119,26 @@ fn serve_fixture(listener: TcpListener) {
                 "text/html",
                 "",
                 page_with("Deep", 6, &format!("<p>{DEEP_PHRASE}</p>")),
+            ),
+            // An instant meta refresh is a redirect: followed in-request,
+            // the shell itself never stored.
+            "/moved.html" => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with(
+                    "Moved",
+                    7,
+                    &format!(
+                        "<meta http-equiv=\"refresh\" content=\"0; url=/landing.html\"><p>{SHELL_PHRASE}</p>"
+                    ),
+                ),
+            ),
+            "/landing.html" => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with("Landing", 8, &format!("<p>{LANDING_PHRASE}</p>")),
             ),
             _ => ("404 Not Found", "text/plain", "", "nope".to_string()),
         };
@@ -224,6 +248,18 @@ fn crawl_index_search_roundtrip() {
             .unwrap()
             .ends_with("/deep.html")
     );
+
+    // The meta-refresh shell was followed like a 3xx: the landing page is
+    // indexed, the shell's own text never was.
+    let v = search(LANDING_PHRASE);
+    assert_eq!(v["total"], 1, "landing page reached through the refresh");
+    assert!(
+        v["hits"][0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/landing.html")
+    );
+    assert_eq!(search(SHELL_PHRASE)["total"], 0, "the shell is not a page");
 
     // A full rebuild from WARC (holding the writer lock throughout) reproduces
     // the index, header gate included.

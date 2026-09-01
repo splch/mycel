@@ -21,6 +21,10 @@ pub struct PageMeta {
     /// Empty when the page declares nofollow.
     pub links: Vec<(String, String, String)>,
     pub noindex: bool,
+    /// An instant meta refresh (`content="0; url=..."`) pointing elsewhere:
+    /// (normalized target, host key). The page is a shell for its target and
+    /// is treated like a 3xx by the crawler, and never indexed by anyone.
+    pub refresh: Option<(String, String)>,
 }
 
 pub struct Extracted {
@@ -151,6 +155,27 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHea
             nofollow |= content.contains("nofollow");
         }
     }
+    // An instant meta refresh is a redirect in disguise; a delayed one is
+    // content (live scoreboards, dashboards) and stays a page.
+    let mut refresh = None;
+    for m in doc.select("meta[http-equiv][content]").iter() {
+        if !m
+            .attr("http-equiv")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("refresh")
+        {
+            continue;
+        }
+        let content = m.attr("content").unwrap_or_default();
+        if let Some(target) = parse_meta_refresh(&content)
+            && let Some(norm) = crate::urlnorm::normalize_rel(final_url, target)
+            && let Some(host) = crate::urlnorm::host_of(&norm)
+            && norm != final_url.as_str()
+        {
+            refresh = Some((norm, host));
+            break;
+        }
+    }
 
     let mut links = Vec::new();
     if !nofollow {
@@ -180,7 +205,31 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHea
             }
         }
     }
-    PageMeta { links, noindex }
+    PageMeta {
+        links,
+        noindex,
+        refresh,
+    }
+}
+
+/// The URL of an instant meta refresh (`0; url=X`, `0;URL='X'`, `0, X`), or
+/// None for delayed refreshes, self-reloads, and malformed values.
+fn parse_meta_refresh(content: &str) -> Option<&str> {
+    let content = content.trim();
+    let split = content.find([';', ','])?;
+    let delay: f64 = content[..split].trim().parse().ok()?;
+    if delay > 0.0 {
+        return None;
+    }
+    let mut rest = content[split + 1..].trim();
+    if rest
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("url="))
+    {
+        rest = rest[4..].trim();
+    }
+    let rest = rest.trim_matches(['\'', '"']).trim();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Test-only convenience wrapper: parse, then extract links/meta.
@@ -197,8 +246,9 @@ pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
 /// size go straight to the cheap fallback extractor.
 const READABILITY_MAX_BYTES: usize = 512 * 1024;
 
-/// Main-content extraction for callers that need no links (the index sweep):
-/// parse, then `full_from_doc`.
+/// Test-only convenience: main-content extraction without links or meta
+/// (production callers go through `analyze`, one parse for everything).
+#[cfg(test)]
 pub fn full(final_url: &str, html: &str) -> Option<Extracted> {
     full_from_doc(final_url, html, dom_query::Document::from(html))
 }
@@ -454,6 +504,41 @@ mod tests {
             a.meta.links.is_empty(),
             "header nofollow suppresses extraction"
         );
+    }
+
+    #[test]
+    fn meta_refresh_detection() {
+        assert_eq!(parse_meta_refresh("0; url=/new"), Some("/new"));
+        assert_eq!(
+            parse_meta_refresh("0;URL='http://e.com/x'"),
+            Some("http://e.com/x")
+        );
+        assert_eq!(parse_meta_refresh(" 0 , /plain "), Some("/plain"));
+        assert_eq!(
+            parse_meta_refresh("5; url=/later"),
+            None,
+            "a delayed refresh is content"
+        );
+        assert_eq!(parse_meta_refresh("0"), None, "a bare reload");
+        assert_eq!(parse_meta_refresh("nonsense"), None);
+
+        let html = r#"<html><head><meta http-equiv="Refresh" content="0; url=/landing"></head>
+                      <body>Redirecting...</body></html>"#;
+        let a = analyze("http://example.com/moved", html, RobotsHeader::default()).unwrap();
+        assert_eq!(
+            a.meta.refresh,
+            Some((
+                "http://example.com/landing".to_string(),
+                "example.com".to_string()
+            ))
+        );
+        let html = r#"<html><head><meta http-equiv="refresh" content="30"></head>
+                      <body>Live scores</body></html>"#;
+        let a = analyze("http://example.com/live", html, RobotsHeader::default()).unwrap();
+        assert!(a.meta.refresh.is_none());
+        let html = r#"<html><head><meta http-equiv="refresh" content="0; url=http://example.com/moved"></head></html>"#;
+        let a = analyze("http://example.com/moved", html, RobotsHeader::default()).unwrap();
+        assert!(a.meta.refresh.is_none(), "a self-refresh is not a redirect");
     }
 
     #[test]

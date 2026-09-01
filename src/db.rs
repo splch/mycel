@@ -20,7 +20,11 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// `hosts.next_due_at` for a host with no queued frontier row: sorts after
+/// every real timestamp, so the claim never probes such a host.
+const NEVER_DUE_SQL: &str = "9223372036854775807";
 
 /// Distinct inbound anchor texts kept per link target, at write and read time.
 pub const MAX_ANCHORS_PER_TARGET: i64 = 64;
@@ -78,7 +82,7 @@ CREATE TABLE docs (                                -- current snapshot per URL; 
   http_status INTEGER NOT NULL,
   fetched_at  INTEGER NOT NULL,
   indexed     INTEGER NOT NULL DEFAULT 0,          -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|error|dead (legacy DBs: dup-near)
+  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|redirect|error|dead (legacy DBs: dup-near)
 );
 CREATE INDEX docs_sha     ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -94,7 +98,7 @@ CREATE TABLE shards (
   id          INTEGER PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,                -- filename; local: {node8}-{seq:06}.warc.gz
   state       INTEGER NOT NULL DEFAULT 0,          -- 0=open 1=sealed
-  source      TEXT NOT NULL DEFAULT 'crawl',       -- crawl|bootstrap|ingest|sync
+  source      TEXT NOT NULL DEFAULT 'crawl',       -- crawl = written by this node (crawl, bootstrap, ingest); sync = pulled from a peer
   origin_node TEXT NOT NULL,                       -- EndpointId hex; self for local shards
   bytes       INTEGER NOT NULL DEFAULT 0,          -- durable watermark while open; size when sealed
   records     INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +228,24 @@ fn migrate(conn: &Connection) -> Result<()> {
              COMMIT;
              PRAGMA temp_store = MEMORY;",
         )?;
+    }
+    if version < 7 {
+        // v7: hosts.next_due_at caches the earliest queued row's due time so
+        // the claim skips exhausted hosts on an index entry instead of probing
+        // the frontier for each of them (that scan grew with every host that
+        // ran out of work while keeping an old politeness gate).
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE hosts ADD COLUMN next_due_at INTEGER NOT NULL DEFAULT 0;
+             UPDATE hosts SET next_due_at = COALESCE(
+               (SELECT min(f.next_attempt_at) FROM frontier f
+                WHERE f.host_id = hosts.id AND f.state = 0), {NEVER_DUE_SQL});
+             DROP INDEX hosts_sched;
+             CREATE INDEX hosts_sched ON hosts (next_fetch_at, next_due_at)
+               WHERE state = 1 AND in_flight = 0;
+             PRAGMA user_version = 7;
+             COMMIT;"
+        ))?;
     }
     Ok(())
 }
@@ -395,6 +417,8 @@ pub struct IngestRecord {
     pub http_status: u16,
     pub fetched_at: i64,
     pub noindex: bool,
+    /// An instant meta refresh: stored, links harvested, never indexed.
+    pub redirect: bool,
     pub extract: Option<crate::extract::Extracted>,
     pub links: Vec<(String, String, String)>,
 }
@@ -551,6 +575,15 @@ impl Db {
     /// Indexer thread (sync context): record indexed/skipped outcomes.
     pub fn mark_docs_blocking(&self, marks: Vec<(i64, i64, Option<&'static str>)>) {
         let _ = self.tx.blocking_send(Cmd::MarkDocs { marks });
+    }
+
+    /// Indexer thread: barrier over everything it has sent (its marks), so a
+    /// sweep batch never re-selects rows whose marks are still in flight.
+    pub fn flush_blocking(&self) {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.blocking_send(Cmd::Flush { reply }).is_ok() {
+            let _ = rx.blocking_recv();
+        }
     }
 
     /// Indexer thread: persist cold-path extraction results on a docs row.
@@ -757,10 +790,45 @@ fn recover(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute("UPDATE hosts SET in_flight = 0 WHERE in_flight = 1", [])?;
+    // The due cache is derived state: rebuild it from the frontier at boot so
+    // no host is hidden by a stale value, whatever the crash left behind.
+    conn.execute(
+        &format!(
+            "UPDATE hosts SET next_due_at = COALESCE(
+               (SELECT min(f.next_attempt_at) FROM frontier f
+                WHERE f.host_id = hosts.id AND f.state = 0), {NEVER_DUE_SQL})"
+        ),
+        [],
+    )?;
     if n > 0 {
         tracing::info!("recovered {n} in-flight frontier rows");
     }
     Ok(())
+}
+
+/// `mycel reindex --online`: return every indexed or skipped document (dead
+/// pages excepted) to pending, in short transactions so it is safe beside a
+/// running daemon. The daemon's sweep then re-extracts each from WARC with
+/// today's gates, centrality, and anchor text; the existing index entries
+/// keep serving until each document is re-added (delete-before-add) or
+/// removed by a gate.
+pub fn requeue_indexed(conn: &Connection) -> Result<u64> {
+    let mut total = 0u64;
+    loop {
+        let n = conn.execute(
+            "UPDATE docs SET indexed = 0, skip_reason = NULL
+             WHERE id IN (SELECT id FROM docs
+                          WHERE indexed IN (1, 2)
+                            AND (skip_reason IS NULL OR skip_reason != 'dead')
+                          LIMIT 5000)",
+            [],
+        )?;
+        total += n as u64;
+        if n == 0 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn load_counters(conn: &Connection) -> Result<HashMap<&'static str, i64>> {
@@ -1162,7 +1230,7 @@ JOIN frontier f ON f.id = (
    WHERE f2.host_id = h.id AND f2.state = 0 AND f2.next_attempt_at <= ?1
    ORDER BY f2.next_attempt_at, f2.id LIMIT 1)
 LEFT JOIN docs d ON d.url = f.url
-WHERE h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at <= ?1
+WHERE h.state = 1 AND h.in_flight = 0 AND h.next_fetch_at <= ?1 AND h.next_due_at <= ?1
 ORDER BY h.next_fetch_at
 LIMIT ?2";
 
@@ -1265,6 +1333,7 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
         "UPDATE hosts SET robots_body = ?1, robots_status = ?2, robots_fetched_at = ?3,
                           next_fetch_at = ?4, in_flight = 0,
                           robots_etag = ?8, robots_last_modified = ?9,
+                          last_error = CASE WHEN ?6 THEN 'robots-unavailable' ELSE last_error END,
                           consecutive_failures = CASE WHEN ?6 THEN consecutive_failures + 1
                                                       WHEN ?10 THEN 0
                                                       ELSE consecutive_failures END,
@@ -1297,6 +1366,21 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
     for (url, host) in &m.sitemaps {
         enqueue(tx, cfg, now, None, url, host, 1, 0, 0)?;
     }
+    refresh_next_due(tx, m.host_id)?;
+    Ok(())
+}
+
+/// Recompute the host's earliest queued due time after its frontier rows
+/// moved. The claim filters on this cache, so an exhausted host costs an
+/// index comparison to skip instead of a frontier probe.
+fn refresh_next_due(tx: &Transaction, host_id: i64) -> Result<()> {
+    tx.prepare_cached(&format!(
+        "UPDATE hosts SET next_due_at = COALESCE(
+           (SELECT min(f.next_attempt_at) FROM frontier f
+            WHERE f.host_id = hosts.id AND f.state = 0), {NEVER_DUE_SQL})
+         WHERE id = ?1"
+    ))?
+    .execute([host_id])?;
     Ok(())
 }
 
@@ -1313,6 +1397,8 @@ struct StoreDoc<'a> {
     payload_len: u64,
     sha256: &'a [u8; 32],
     noindex: bool,
+    /// An instant meta refresh: a shell for another URL, never indexed.
+    redirect: bool,
     extract: &'a Option<crate::extract::Extracted>,
     links: &'a [(String, String, String)],
     link_depth: i64,
@@ -1332,7 +1418,9 @@ fn store_doc(
 ) -> Result<()> {
     // Index-eligibility gates that need no tantivy state; dedup gates
     // (sha/simhash) live in the indexer.
-    let (indexed, skip): (i64, Option<&str>) = if d.noindex {
+    let (indexed, skip): (i64, Option<&str>) = if d.redirect {
+        (2, Some("redirect"))
+    } else if d.noindex {
         (2, Some("noindex"))
     } else {
         match d.extract {
@@ -1497,6 +1585,7 @@ fn handle_ingest(
             payload_len: r.payload_len,
             sha256: &r.sha256,
             noindex: r.noindex,
+            redirect: r.redirect,
             extract: &r.extract,
             links: &r.links,
             link_depth: 1,
@@ -1545,6 +1634,7 @@ fn handle_complete(
                         payload_len: p.payload_len,
                         sha256: &p.sha256,
                         noindex: p.noindex,
+                        redirect: false,
                         extract: &p.extract,
                         links: &p.links,
                         link_depth: c.depth + 1,
@@ -1633,6 +1723,13 @@ fn handle_complete(
         }
     }
 
+    // Why the host is in trouble, for operators (`hosts.last_error`).
+    let fault_reason: Option<&str> = match &c.outcome {
+        Outcome::RetryAt { reason, .. } | Outcome::PermanentFail { reason } if c.host_fault => {
+            Some(reason.as_str())
+        }
+        _ => None,
+    };
     if matches!(c.outcome, Outcome::Denied | Outcome::Deferred { .. }) {
         // No HTTP request happened: the host's politeness turn is not consumed.
         tx.prepare_cached("UPDATE hosts SET in_flight = 0 WHERE id = ?1")?
@@ -1645,6 +1742,7 @@ fn handle_complete(
         tx.prepare_cached(
             "UPDATE hosts SET in_flight = 0, next_fetch_at = ?1,
                     crawl_delay_ms = COALESCE(?2, crawl_delay_ms),
+                    last_error = COALESCE(?7, last_error),
                     consecutive_failures = CASE WHEN ?3 THEN 0
                                                 WHEN ?5 THEN consecutive_failures + 1
                                                 ELSE consecutive_failures END,
@@ -1660,11 +1758,13 @@ fn handle_complete(
             c.host_id,
             c.host_fault,
             threshold,
+            fault_reason,
         ])?;
         if !success && c.host_fault {
             warn_if_blocked(tx, c.host_id, threshold)?;
         }
     }
+    refresh_next_due(tx, c.host_id)?;
     Ok(())
 }
 
@@ -1745,7 +1845,9 @@ pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> R
         if inserted > 0 {
             urls_n += 1;
             conn.execute(
-                "UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1",
+                "UPDATE hosts SET urls_accepted = urls_accepted + 1,
+                                  next_due_at = min(next_due_at, 0)
+                 WHERE id = ?1",
                 [host_id],
             )?;
         }
@@ -1810,12 +1912,16 @@ fn enqueue(
         )?
         .execute(params![host_id, url, kind, depth, now, due])?;
     if inserted > 0 {
+        // Budget consumed, and the host's due cache lowered to the new row.
         let bump_sql = if kind == 1 {
-            "UPDATE hosts SET sitemaps_accepted = sitemaps_accepted + 1 WHERE id = ?1"
+            "UPDATE hosts SET sitemaps_accepted = sitemaps_accepted + 1,
+                              next_due_at = min(next_due_at, ?2) WHERE id = ?1"
         } else {
-            "UPDATE hosts SET urls_accepted = urls_accepted + 1 WHERE id = ?1"
+            "UPDATE hosts SET urls_accepted = urls_accepted + 1,
+                              next_due_at = min(next_due_at, ?2) WHERE id = ?1"
         };
-        tx.prepare_cached(bump_sql)?.execute([host_id])?;
+        tx.prepare_cached(bump_sql)?
+            .execute(params![host_id, due])?;
     }
     Ok(())
 }
@@ -1871,6 +1977,15 @@ pub fn anchors_for(conn: &Connection, url: &str) -> Result<String> {
 /// Belt-and-suspenders against lost fetch tasks: rows claimed >15 min ago go
 /// back to queued, and any host stuck in_flight with no claimed row is freed.
 fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
+    // The stuck rows become queued again: their hosts' due cache must not
+    // hide them (it never should, but this is the belt to the braces).
+    tx.execute(
+        "UPDATE hosts SET next_due_at = min(next_due_at,
+             (SELECT min(f.next_attempt_at) FROM frontier f
+              WHERE f.host_id = hosts.id AND f.state = 1 AND f.claimed_at < ?1))
+         WHERE id IN (SELECT host_id FROM frontier WHERE state = 1 AND claimed_at < ?1)",
+        [now - 900],
+    )?;
     let n = tx.execute(
         "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
          WHERE state = 1 AND claimed_at < ?1",
@@ -2198,6 +2313,180 @@ mod tests {
             .unwrap();
         assert_eq!(in_flight, 0);
         assert!(gate > t);
+        let due: i64 = conn
+            .query_row(
+                "SELECT next_due_at FROM hosts WHERE id = ?1",
+                [host_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(due, 0, "the enqueued /about is due now");
+    }
+
+    #[tokio::test]
+    async fn next_due_at_gates_the_claim_and_follows_new_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+        let due = || -> i64 {
+            check
+                .query_row("SELECT next_due_at FROM hosts", [], |r| r.get(0))
+                .unwrap()
+        };
+        let r: i64 = 14 * 86_400;
+        let t = now();
+        assert_eq!(due(), 0, "boot recovery computed the earliest due row");
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(stored_completion(&job, t * 1000, "root")).await;
+        db.flush().await;
+        assert_eq!(due(), t + r, "nothing due until the recrawl");
+        assert!(db.claim(t + 2, 1).await.is_empty());
+        // New work lowers the cache at once (here via seed; links use the
+        // same path in enqueue).
+        db.seed(vec![(
+            "example.com".into(),
+            "http://example.com/new".into(),
+        )])
+        .await
+        .unwrap();
+        assert_eq!(due(), 0);
+        let job = db.claim(t + 3, 1).await.pop().unwrap();
+        assert_eq!(job.url, "http://example.com/new");
+        // A lost fetch task: the lease sweep returns the row, and the host
+        // is claimable again.
+        db.tick(t + 3 + 1000).await;
+        db.flush().await;
+        let job = db
+            .claim(t + 3 + 1000, 1)
+            .await
+            .pop()
+            .expect("swept row claimable again");
+        assert_eq!(job.url, "http://example.com/new");
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_faults_record_last_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+        let last_error = || -> Option<String> {
+            check
+                .query_row("SELECT last_error FROM hosts", [], |r| r.get(0))
+                .unwrap()
+        };
+        let t = now();
+        assert_eq!(last_error(), None);
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::RetryAt {
+                at: t + 60,
+                reason: "timeout: elapsed".into(),
+            },
+            next_delay_ms: 0,
+            sticky_delay_ms: None,
+            host_fault: true,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+        assert_eq!(last_error().as_deref(), Some("timeout: elapsed"));
+        // A robots outage is a host fault too.
+        let job = db.claim(t + 61, 1).await.pop().unwrap();
+        db.robots_done(RobotsMsg {
+            host_id: job.host_id,
+            frontier_id: job.frontier_id,
+            result: RobotsResult::Unavailable { status: Some(503) },
+            sitemaps: vec![],
+            delay_ms: 1000,
+            now_ms: (t + 61) * 1000,
+        })
+        .await;
+        db.flush().await;
+        assert_eq!(last_error().as_deref(), Some("robots-unavailable"));
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn requeue_indexed_resets_all_but_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('a.com', 1, 0);
+             INSERT INTO shards (name, origin_node, created_at) VALUES ('s', 'o', 0);
+             INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                               fetched_at, indexed, skip_reason) VALUES
+               ('http://a.com/1', 1, 1, 0, 1, x'00', 200, 0, 1, NULL),
+               ('http://a.com/2', 1, 1, 1, 1, x'01', 200, 0, 2, 'lang'),
+               ('http://a.com/3', 1, 1, 2, 1, x'02', 200, 0, 2, 'dead'),
+               ('http://a.com/4', 1, 1, 3, 1, x'03', 200, 0, 0, NULL);",
+        )
+        .unwrap();
+        assert_eq!(requeue_indexed(&conn).unwrap(), 2);
+        let states: Vec<(i64, Option<String>)> = conn
+            .prepare("SELECT indexed, skip_reason FROM docs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![(0, None), (0, None), (2, Some("dead".into())), (0, None)]
+        );
+        assert_eq!(requeue_indexed(&conn).unwrap(), 0, "idempotent");
+    }
+
+    #[test]
+    fn migration_v7_computes_the_due_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        {
+            let conn = v5_database(&path);
+            conn.execute_batch(
+                "INSERT INTO hosts (host, state, added_at) VALUES ('busy.com', 1, 0), ('idle.com', 1, 0);
+                 INSERT INTO frontier (host_id, url, next_attempt_at, discovered_at) VALUES
+                   (1, 'http://busy.com/late', 900, 0), (1, 'http://busy.com/soon', 500, 0);",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let due = |host: &str| -> i64 {
+            conn.query_row(
+                "SELECT next_due_at FROM hosts WHERE host = ?1",
+                [host],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(due("busy.com"), 500, "earliest queued row");
+        assert_eq!(due("idle.com"), i64::MAX, "nothing queued: never due");
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'hosts_sched'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("next_due_at"), "{index_sql}");
     }
 
     #[tokio::test]

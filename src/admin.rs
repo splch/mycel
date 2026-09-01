@@ -70,7 +70,9 @@ impl AdminState {
             data_dir,
             node_id,
             started_at: db::now(),
-            csrf: format!("{:032x}", fastrand::u128(..)),
+            // 128 bits from the same CSPRNG that mints node keys; fastrand
+            // is not cryptographic.
+            csrf: hex::encode(&iroh::SecretKey::generate().to_bytes()[..16]),
             allowed_hosts,
             job: Mutex::new(None),
             index_tx,
@@ -208,6 +210,39 @@ pub async fn seed(
 #[derive(Deserialize)]
 pub struct TokenForm {
     t: String,
+}
+
+/// = `mycel reindex --online`: every document back to pending (dead pages
+/// excepted), then a sweep. Search keeps serving the current entries while
+/// the indexer replaces them, batch by batch, with today's gates, ranks, and
+/// anchor text. Own connection, short transactions, like the rank job.
+pub async fn reindex_online(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Form(f): Form<TokenForm>,
+) -> Response {
+    if let Some(deny) = api.admin.deny(&headers, &f.t) {
+        return deny;
+    }
+    let admin = api.admin.clone();
+    spawn_job(
+        &api,
+        "reindex-online",
+        "online re-index started (the indexer works through it in batches; refresh for the count)",
+        async move {
+            let db_path = admin.data_dir.join("mycel.sqlite");
+            let n = tokio::task::spawn_blocking(move || -> Result<u64> {
+                let conn = db::open(&db_path)?;
+                db::requeue_indexed(&conn)
+            })
+            .await
+            .map_err(|e| format!("requeue task panicked: {e}"))??;
+            let _ = admin.index_tx.send(IndexMsg::Sweep);
+            Ok(format!(
+                "{n} documents queued; the indexer is re-indexing them in batches while search keeps serving"
+            ))
+        },
+    )
 }
 
 /// = `mycel reindex --missing` (the daemon's indexer sweeps on demand).
@@ -583,6 +618,9 @@ async fn render(
          <form method=post action=/admin/sweep>{tok}\
            <button>index pending docs</button> <small>= mycel reindex --missing \
            (the daemon also sweeps every 5 min)</small></form>\
+         <form method=post action=/admin/reindex>{tok}\
+           <button>re-index everything online</button> <small>= mycel reindex --online \
+           (applies new ranks, anchors, and gates; search stays up)</small></form>\
          <form method=post action=/admin/ingest>{tok}\
            <textarea name=paths rows=2 aria-label=paths placeholder=\"/path/to/file.warc.gz or a directory, one per line\"></textarea>\
            <button>ingest</button> <small>= mycel ingest</small></form>\

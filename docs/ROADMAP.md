@@ -267,6 +267,8 @@ with `robots_body = NULL` and no stale-cache use (stricter than the RFC's
 (RFC floor: 500 kibibytes); robots fetches follow ≤5 redirects including
 cross-host (RFC: at least five consecutive). `crawl-delay` is not in the
 RFC; mycel honors it capped at 30s as a documented extension (SPEC §16).
+Since the 2026-09-01 production audit a robots.txt 429 stalls the host like
+a 5xx instead of allow-all (also SPEC §16).
 
 **sitemaps.org: compliant.** 50k `<loc>` cap, 50 MiB decompressed cap,
 gzip members detected by magic bytes, namespace-agnostic streaming parse,
