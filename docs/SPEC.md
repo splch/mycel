@@ -188,7 +188,7 @@ CREATE TABLE docs (                           -- current snapshot per URL; histo
   lang TEXT, title TEXT,
   http_status INTEGER NOT NULL, fetched_at INTEGER NOT NULL,
   indexed INTEGER NOT NULL DEFAULT 0,         -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                            -- dup-exact|dup-near|lang|empty|noindex|error
+  skip_reason TEXT                            -- dup-exact|lang|empty|noindex|error|dead
 );
 CREATE INDEX docs_sha ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -224,7 +224,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 - Records: one `warcinfo` per file, then `response` records (full HTTP status line + headers + body). Bodies stored transfer-decoded; header block drops `Content-Encoding`, rewrites `Content-Length`; oversize bodies kept with `WARC-Truncated: length`.
 - `WARC-Record-ID: <urn:mycel:{hex32(sha256(url‖fetched_at_nanos‖counter))}>`; `WARC-Payload-Digest: sha256:<hex>`. Dates: hand-rolled strict ISO-8601 subset (Hinnant civil-date algorithms, ~50 LoC).
 - Rotation: one open shard, append-only; at `shard_mb` → fsync, whole-file blake3, mark sealed, open next. Sealed shards are immutable; they are the sync catalog entries.
-- **Watermark crash protocol**: append records, fsync the open shard once per batch, then the same db-writer batch that inserts `docs` rows advances `shards.bytes`. On boot, truncate open shard to `shards.bytes`. Torn tails are unobservable; post-watermark records simply get recrawled. Orphans impossible.
+- **Watermark crash protocol**: append records, fsync the open shard once per batch, then the same db-writer batch that inserts `docs` rows advances `shards.bytes`. On boot, truncate open shard to `shards.bytes`. Torn tails are unobservable; post-watermark records simply get recrawled. Orphans impossible. If the fsync, the watermark update, or the commit fails, the batch rolls back and the shard is truncated back to the durable position at once, so row-less members are never covered by a later watermark.
 - Random access: `docs(shard_id, offset, len)` → seek, gunzip member, parse; the same shape as CC ranged fetches, so ingest of CC-derived files reuses every reader line.
 
 ## 6. Crawler
@@ -250,7 +250,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **Politeness**: `effective_delay = max(default_delay_ms, min(robots crawl-delay, 30s), hosts.crawl_delay_ms, 10× last fetch duration)` (the last term is Mercator's adaptive rule, capped by `max_delay_ms`); after every completed request `next_fetch_at = now + effective_delay`, `in_flight=0`. **429**: `crawl_delay_ms = min(×2, max_delay_ms)` persisted, never lowered (StractBot policy); requeue at `max(Retry-After, new_delay)`. **503**: non-sticky host backoff `clamp(Retry-After|60s, ≤1h)`. 429/503 attempts capped at 5.
 
-**robots.txt (RFC 9309)**: 2xx → cache body (≤512 KiB) and any ETag/Last-Modified validators; 4xx → allow-all; **5xx/network error → complete disallow**, `robots_body=NULL`, host stalls, retried hourly. With validators on file the cache TTL extends to 24h (the RFC maximum) and re-fetches are conditional (`If-None-Match`/`If-Modified-Since`; 304 keeps the cached rules and refreshes the timestamp). texting_robots parses per fetch (µs; `delay: Option<f32>`, `sitemaps: Vec<String>`).
+**robots.txt (RFC 9309)**: 2xx → cache body (≤512 KiB) and any ETag/Last-Modified validators; 429 → stall exactly like 5xx but without a breaker fault (the host answered: back off); other 4xx → allow-all; **5xx/network error → complete disallow**, `robots_body=NULL`, host stalls, retried hourly. With validators on file the cache TTL extends to 24h (the RFC maximum) and re-fetches are conditional (`If-None-Match`/`If-Modified-Since`; 304 keeps the cached rules and refreshes the timestamp). texting_robots parses per fetch (µs; `delay: Option<f32>`, `sitemaps: Vec<String>`).
 
 **Outcomes**: 200 new sha → WARC + docs(indexed=0) + links + requeue at `now+recrawl_days` (attempts reset, streak reset); 200 unchanged sha → touch fetched_at only, **no WARC write**, streak+1 and requeue at `recrawl_days × 2^min(streak,4)` (adaptive recrawl, ≤16×); 3xx same-host → follow in-request; 3xx cross-host → permanent + edge recorded + target enqueued if active; 4xx → permanent (+ tantivy delete if previously indexed); 5xx/timeout → retry `60s·4^(n−1)`, permanent after 3.
 
@@ -258,7 +258,7 @@ No priority column: `next_attempt_at, id` IS the priority (FIFO within host; ret
 
 **URL normalization** (`url` crate): reject non-http(s) and >2048 chars; strip fragments; default ports drop; keep query order verbatim but strip `utm_*`, `gclid`, `fbclid`, `msclkid`.
 
-**Scope**: only `hosts.state=1` crawled; exact-host (subdomains distinct; no PSL). Link extraction (dom_query, `a[href]`, skip `rel~=nofollow`, ≤2000/page, resolve→normalize→dedupe): off-host targets upsert candidate host rows (state=0, never crawled until seeded) + `links` edges (self-loops excluded). Enqueue iff target host active AND `urls_accepted < max_urls_per_host` AND `depth+1 ≤ 32`. `<meta name=robots>`: noindex → store, don't index; nofollow → no link extraction.
+**Scope**: only `hosts.state=1` crawled; exact-host (subdomains distinct; no PSL). Link extraction (dom_query, `a[href]`, skip `rel~=nofollow`, ≤2000/page, resolve→normalize→dedupe): off-host targets upsert candidate host rows (state=0, never crawled until seeded) + `links` edges (self-loops excluded). Enqueue iff target host active AND `urls_accepted < max_urls_per_host` AND `depth+1 ≤ 32`. `<meta name=robots>` and `X-Robots-Tag` response headers (unscoped, or scoped to `mycel`/`*`): noindex → store, don't index; nofollow → no link extraction.
 
 **Sitemaps**: robots `Sitemap:` lines → frontier `kind=1`; identical politeness; streamed quick-xml parse (urlset→pages, sitemapindex→child sitemaps depth≤3; caps 50k locs / 50 MiB); `<lastmod>` seeds a page's first-fetch priority within the host (recently modified first); no WARC/docs rows. Recrawled every `recrawl_days` via the URL-unique frontier row.
 
@@ -283,7 +283,7 @@ simhash: u64 FAST  (serve-time near-dup collapse; older indexes fail open
            with a schema error and `reindex` moves them aside + rebuilds)
 ```
 
-Indexer thread: consumes in-memory channel from crawl (already-extracted text, no double work) + 5-min sweep + boot reconciliation of `indexed=0` (re-reads WARC). `delete_term(url)` before every add → idempotent, recrawl updates in place. Commit at 1000 docs / 60s; then batch-set `indexed=1`. Crash-safe in both orderings (tantivy rollback + replay; delete-before-add).
+Indexer thread: consumes in-memory channel from crawl (already-extracted text, no double work) + 5-min sweep + boot reconciliation of `indexed=0` (re-reads WARC). `delete_term(url)` before every add → idempotent, recrawl updates in place. Commit at 1000 docs / 60s; then batch-set `indexed=1`. Crash-safe in both orderings (tantivy rollback + replay; delete-before-add). The writer lock is taken before the WARC shard is opened (a second process refuses to start), and a killed writer is fatal: the indexer cancels the daemon, which exits non-zero for the supervisor to restart; nothing is marked, so the boot sweep replays the pending rows. `error` marks (unreadable records) are retried by `reindex`; `dead` marks (URL failed permanently on recrawl) are not.
 
 `reindex`: rebuild into `index.new/` reading docs `ORDER BY shard_id, offset` (sequential I/O), swap dirs; daemon stopped. `ingest` only registers (indexed=0), safe while running. `reindex --missing` = index pending only.
 
@@ -355,6 +355,7 @@ No parquet/duckdb/aws crates in the binary: subset selection is external, docume
 | Failure | Behavior |
 |---|---|
 | Index corrupt / tantivy upgrade break | boot fails with instruction: `rm -rf index/ && mycel reindex`. WARC+SQLite are truth. |
+| tantivy writer killed (EMFILE, I/O error) | daemon exits non-zero with nothing marked; supervisor restarts; boot sweep replays pending rows |
 | SQLite lost, WARC intact | `mycel ingest warc/**` (idempotent) + `reindex`; recovery = the two normal code paths |
 | SQLITE_BUSY | near-impossible internally (single writer); externals ride busy_timeout |
 | Disk full | scheduler stops claiming, indexer pauses, 60s probe, /healthz degraded; WAL+watermark ⇒ nothing corrupts; resumes without restart |
@@ -390,7 +391,7 @@ Total ≈ 6.3k production + ~1.7k tests.
 
 1. **axum** → raw hyper (<200 LoC swap). 2. **length-prefixed JSON** → postcard behind the same 2-fn codec + ALPN bump. 3. **hand-rolled WARC** → `warc` crate if hairy (verify its health first). 4. **HyperBall** → exact BFS (fine ≤~100k hosts; boost is secondary anyway). 5. **iroh builder default address-lookup set** → confirm at M5; one builder call if not default. 6. **dom_smoothie/whichlang versions** → pin at impl; validate dom_smoothie on our corpus early (fallback extraction already specced). 7. **encoding_rs, flate2, sha2, blake3, csv, hex, fastrand, rustls, tracing** → plumbing beyond research's list, all ecosystem defaults.
 
-Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority; dom_query replaces scraper (a single DOM parse serves links/meta/Readability/fallback — measured 1.6× on ingest; scraper dropped from the dependency tree).
+Extensions beyond RESEARCH.md (none contradict it): self-origin-only shard export; federation off by default; `source` stamped by requester not wire; CC-bootstrapped docs exportable; contact_url required to crawl; cross-host redirects permanent; crawl-delay cap 30s; exact-host scope (no PSL); tracking-param strip list; the `/admin` page (post-v1; §10); adaptive recrawl (`frontier.unchanged_streak`, interval ×2^min(streak,4) ≤16×, reset on change; schema v2); serve-time host diversity (≤2 hits/host/page, `diversity=0` opt-out, counted in `host_capped`); optional freshness multiplier (`rank.freshness_weight`, default 0); inbound anchor text as an indexed field (`anchor_text` table, schema v3, boost 1.5, applied at index time like centrality); latency-adaptive politeness (10× last fetch duration); conditional robots re-fetch with 24h TTL when validators exist (schema v4); sitemap `<lastmod>` first-fetch priority; dom_query replaces scraper (a single DOM parse serves links/meta/Readability/fallback — measured 1.6× on ingest; scraper dropped from the dependency tree); `X-Robots-Tag` honored like the meta tag; robots.txt 429 stalls like 5xx without a breaker fault; a `dead` skip label distinct from `error` (schema v5 relabels and returns indexer casualties to pending); the daemon raises its own fd soft limit; a killed tantivy writer is fatal rather than per-doc `error` marks; `reindex` holds the writer lock for the whole rebuild and every WARC-writing command takes it before opening the shard; a failed fsync/watermark/commit truncates the open shard back to the durable position.
 
 ## Verification (end-to-end, after M5)
 

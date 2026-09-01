@@ -37,12 +37,63 @@ pub struct Analysis {
     pub extract: Option<Extracted>,
 }
 
-/// The full pipeline over one DOM parse. None = unusable URL (callers map it
-/// to a bad-record error).
-pub fn analyze(final_url: &str, html: &str) -> Option<Analysis> {
+/// Robots directives that arrive as `X-Robots-Tag` headers, the header twin
+/// of `<meta name=robots>`. Only `noindex`, `nofollow`, and `none` matter to
+/// us. A leading `agent:` scope binds the whole value to that agent (honored
+/// for our token and `*`, ignored for anyone else); valued directives such as
+/// `unavailable_after: <date>` also carry a colon and are skipped by name.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RobotsHeader {
+    pub noindex: bool,
+    pub nofollow: bool,
+}
+
+const VALUED_DIRECTIVES: [&str; 4] = [
+    "unavailable_after",
+    "max-snippet",
+    "max-image-preview",
+    "max-video-preview",
+];
+
+impl RobotsHeader {
+    /// Fold every `X-Robots-Tag` value of a response into one verdict.
+    pub fn parse<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::default();
+        for value in values {
+            let mut directives = value.trim();
+            if let Some((left, right)) = directives.split_once(':')
+                && !left.contains(',')
+                && !VALUED_DIRECTIVES.contains(&left.trim().to_ascii_lowercase().as_str())
+            {
+                let agent = left.trim();
+                if !(agent.eq_ignore_ascii_case(crate::UA_TOKEN) || agent == "*") {
+                    continue;
+                }
+                directives = right;
+            }
+            for d in directives.split(',') {
+                match d.trim().to_ascii_lowercase().as_str() {
+                    "noindex" => out.noindex = true,
+                    "nofollow" => out.nofollow = true,
+                    "none" => {
+                        out.noindex = true;
+                        out.nofollow = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The full pipeline over one DOM parse. `hdr` carries the response's
+/// X-Robots-Tag directives, which combine with the page's own meta tag.
+/// None = unusable URL (callers map it to a bad-record error).
+pub fn analyze(final_url: &str, html: &str, hdr: RobotsHeader) -> Option<Analysis> {
     let base = Url::parse(final_url).ok()?;
     let doc = dom_query::Document::from(html);
-    let meta = links_and_meta_doc(&base, &doc);
+    let meta = links_and_meta_doc(&base, &doc, hdr);
     let extract = full_from_doc(final_url, html, doc);
     Some(Analysis { meta, extract })
 }
@@ -87,10 +138,11 @@ fn sniff_meta_charset(head: &[u8]) -> Option<&'static encoding_rs::Encoding> {
 
 /// Parse the page for links and robots meta, over an already-parsed document.
 /// `final_url` is the URL the content was served from (post-redirect), the
-/// base for relatives.
-fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document) -> PageMeta {
-    let mut noindex = false;
-    let mut nofollow = false;
+/// base for relatives. Header directives seed the verdict; the meta tag can
+/// only add restrictions, never lift them.
+fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHeader) -> PageMeta {
+    let mut noindex = hdr.noindex;
+    let mut nofollow = hdr.nofollow;
     for m in doc.select("meta[name][content]").iter() {
         let name = m.attr("name").unwrap_or_default();
         if name.eq_ignore_ascii_case("robots") {
@@ -134,7 +186,11 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document) -> PageMeta {
 /// Test-only convenience wrapper: parse, then extract links/meta.
 #[cfg(test)]
 pub fn links_and_meta(final_url: &Url, html: &str) -> PageMeta {
-    links_and_meta_doc(final_url, &dom_query::Document::from(html))
+    links_and_meta_doc(
+        final_url,
+        &dom_query::Document::from(html),
+        RobotsHeader::default(),
+    )
 }
 
 /// Readability's scoring gets expensive on very large documents; above this
@@ -326,6 +382,78 @@ mod tests {
         let m = links_and_meta(&base(), html);
         assert!(m.noindex);
         assert!(m.links.is_empty(), "nofollow suppresses link extraction");
+    }
+
+    #[test]
+    fn x_robots_tag_parsing() {
+        let p = |vals: &[&str]| RobotsHeader::parse(vals.iter().copied());
+        let none = RobotsHeader::default();
+        let noindex = RobotsHeader {
+            noindex: true,
+            nofollow: false,
+        };
+        let nofollow = RobotsHeader {
+            noindex: false,
+            nofollow: true,
+        };
+        let both = RobotsHeader {
+            noindex: true,
+            nofollow: true,
+        };
+        assert_eq!(p(&["noindex"]), noindex);
+        assert_eq!(p(&["NOINDEX, NoFollow"]), both);
+        assert_eq!(p(&["none"]), both);
+        assert_eq!(p(&["noarchive, nosnippet"]), none);
+        assert_eq!(
+            p(&["googlebot: noindex"]),
+            none,
+            "other agents' scopes are not ours"
+        );
+        assert_eq!(p(&["mycel: nofollow"]), nofollow);
+        assert_eq!(p(&["MYCEL: noindex, nofollow"]), both);
+        assert_eq!(p(&["*: noindex"]), noindex);
+        assert_eq!(
+            p(&["unavailable_after: 25 Jun 2030 15:00:00 PST"]),
+            none,
+            "a valued directive is not an agent scope"
+        );
+        assert_eq!(
+            p(&["noarchive", "noindex"]),
+            noindex,
+            "repeated headers accumulate"
+        );
+        assert_eq!(p(&["noindex, googlebot: nofollow"]), noindex);
+        assert_eq!(p(&[]), none);
+    }
+
+    #[test]
+    fn header_directives_gate_like_meta() {
+        let html = r#"<html><body><a href="/x">x</a></body></html>"#;
+        let a = analyze(
+            "http://example.com/",
+            html,
+            RobotsHeader {
+                noindex: true,
+                nofollow: false,
+            },
+        )
+        .unwrap();
+        assert!(a.meta.noindex);
+        assert_eq!(a.meta.links.len(), 1, "noindex still follows links");
+        let a = analyze(
+            "http://example.com/",
+            html,
+            RobotsHeader {
+                noindex: false,
+                nofollow: true,
+            },
+        )
+        .unwrap();
+        assert!(!a.meta.noindex);
+        assert!(
+            a.meta.links.is_empty(),
+            "header nofollow suppresses extraction"
+        );
     }
 
     #[test]

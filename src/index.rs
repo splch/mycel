@@ -14,6 +14,7 @@ use tantivy::schema::{
     FAST, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
 use tantivy::{Index, Term, doc};
+use tokio_util::sync::CancellationToken;
 
 /// Hamming radius for serve-time near-dup collapsing (Manku et al., k=3 at
 /// 8B-page scale). Closer docs are shown once; nothing leaves the index.
@@ -153,22 +154,60 @@ pub struct IndexerCfg {
     pub languages: Vec<String>,
 }
 
+/// Take the index writer, naming the one failure an operator can act on:
+/// the lock is held by another process (a running daemon, or a `reindex`).
+pub fn acquire_writer(index: &Index, heap_mb: usize) -> Result<tantivy::IndexWriter> {
+    index.writer(heap_mb.max(64) * 1024 * 1024).map_err(|e| {
+        if is_lock_busy(&e) {
+            "the index writer lock is held by another process (a running daemon or \
+                 `mycel reindex`); refusing to start"
+                .into()
+        } else {
+            e.into()
+        }
+    })
+}
+
+pub fn is_lock_busy(e: &tantivy::TantivyError) -> bool {
+    matches!(
+        e,
+        tantivy::TantivyError::LockFailure(tantivy::directory::error::LockError::LockBusy, _)
+    )
+}
+
+/// Open the index and take its writer. The daemon calls this before anything
+/// else touches shared state: a held lock (another daemon, a `reindex`) must
+/// refuse to start before the WARC shard is opened by a second writer.
+pub fn open_writer(cfg: &IndexerCfg) -> Result<tantivy::IndexWriter> {
+    let index = open_or_create(&cfg.index_dir)?;
+    acquire_writer(&index, cfg.heap_mb)
+}
+
 /// Spawn the indexer thread over a pre-made channel (the db-writer holds a
 /// sender clone for hot-path adds/deletes). Send `IndexMsg::Shutdown` and join
 /// the handle to flush cleanly; marks flow through `db`, so keep the writer
 /// alive until the join returns.
+///
+/// A writer killed mid-run is fatal: the thread cancels `cancel` and returns
+/// the error, and nothing gets mislabeled (pending rows replay at boot).
 pub fn spawn_indexer_with(
     cfg: IndexerCfg,
     dbh: db::Db,
     rx: mpsc::Receiver<IndexMsg>,
-) -> Result<std::thread::JoinHandle<()>> {
-    let index = open_or_create(&cfg.index_dir)?;
+    cancel: CancellationToken,
+    writer: tantivy::IndexWriter,
+) -> Result<std::thread::JoinHandle<Result<()>>> {
     let read_conn = db::open(&cfg.db_path)?;
+    let mut ix = Indexer::new(cfg, dbh, writer, read_conn)?;
     let handle = std::thread::Builder::new()
         .name("indexer".into())
-        .spawn(move || match Indexer::new(cfg, dbh, index, read_conn) {
-            Ok(mut ix) => ix.run(rx),
-            Err(e) => tracing::error!("indexer failed to start: {e}"),
+        .spawn(move || {
+            let out = ix.run(rx);
+            if let Err(e) = &out {
+                tracing::error!("indexer died: {e}; stopping so a restart can replay pending docs");
+                cancel.cancel();
+            }
+            out
         })?;
     Ok(handle)
 }
@@ -196,9 +235,13 @@ struct Indexer {
 }
 
 impl Indexer {
-    fn new(cfg: IndexerCfg, dbh: db::Db, index: Index, conn: rusqlite::Connection) -> Result<Self> {
-        let f = fields(&index.schema());
-        let writer: tantivy::IndexWriter = index.writer(cfg.heap_mb.max(64) * 1024 * 1024)?;
+    fn new(
+        cfg: IndexerCfg,
+        dbh: db::Db,
+        writer: tantivy::IndexWriter,
+        conn: rusqlite::Connection,
+    ) -> Result<Self> {
+        let f = fields(&writer.index().schema());
         Ok(Self {
             cfg,
             dbh,
@@ -215,19 +258,22 @@ impl Indexer {
         })
     }
 
-    fn run(&mut self, rx: mpsc::Receiver<IndexMsg>) {
+    /// Err = the tantivy writer is dead (a worker hit an io::Error such as
+    /// EMFILE, or panicked). Nothing is marked on that path: rows stay
+    /// pending and the next boot's sweep replays them.
+    fn run(&mut self, rx: mpsc::Receiver<IndexMsg>) -> Result<()> {
         tracing::info!("indexer up");
         // Boot reconciliation: index whatever a previous run left pending.
-        self.sweep();
+        self.sweep()?;
         loop {
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(IndexMsg::Add(d)) => self.gate_and_add(*d),
+                Ok(IndexMsg::Add(d)) => self.gate_and_add(*d)?,
                 Ok(IndexMsg::Delete(url)) => {
                     self.writer
                         .delete_term(Term::from_field_text(self.fields.url, &url));
                     self.dirty_ops += 1;
                 }
-                Ok(IndexMsg::Sweep) => self.sweep(),
+                Ok(IndexMsg::Sweep) => self.sweep()?,
                 Ok(IndexMsg::Shutdown) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -236,19 +282,22 @@ impl Indexer {
                 || (self.dirty_ops > 0
                     && self.last_commit.elapsed().as_secs() >= self.cfg.commit_secs)
             {
-                self.commit_and_mark();
+                self.commit_and_mark()?;
             }
             if self.last_sweep.elapsed() >= SWEEP_EVERY {
-                self.sweep();
+                self.sweep()?;
             }
         }
-        self.commit_and_mark();
+        self.commit_and_mark()?;
         tracing::info!("indexer stopped");
+        Ok(())
     }
 
     /// Exact-dedup gate, then delete-before-add (idempotent). Near-dups
     /// index alongside their twins; search collapses them at serve time.
-    fn gate_and_add(&mut self, d: IndexDoc) {
+    /// An add failure is never about the document: tantivy only refuses when
+    /// its writer has been killed, so it is fatal and the row stays pending.
+    fn gate_and_add(&mut self, d: IndexDoc) -> Result<()> {
         let exact_dup: bool = self
             .conn
             .query_row(
@@ -259,22 +308,17 @@ impl Indexer {
             .unwrap_or(false);
         if exact_dup {
             self.mark(d.doc_id, 2, Some("dup-exact"));
-            return;
+            return Ok(());
         }
         self.writer
             .delete_term(Term::from_field_text(self.fields.url, &d.url));
-        let res = self.writer.add_document(tantivy_doc(&self.fields, &d));
-        match res {
-            Ok(_) => {
-                self.in_flight.insert(d.doc_id);
-                self.pending_marks.push((d.doc_id, 1, None));
-                self.dirty_ops += 1;
-            }
-            Err(e) => {
-                tracing::error!("add_document failed: {e}");
-                self.mark(d.doc_id, 2, Some("error"));
-            }
-        }
+        self.writer
+            .add_document(tantivy_doc(&self.fields, &d))
+            .map_err(|e| format!("add_document failed for {}: {e}", d.url))?;
+        self.in_flight.insert(d.doc_id);
+        self.pending_marks.push((d.doc_id, 1, None));
+        self.dirty_ops += 1;
+        Ok(())
     }
 
     /// A skip decision needs no commit: mark immediately.
@@ -283,9 +327,9 @@ impl Indexer {
         self.dbh.mark_docs_blocking(vec![(doc_id, indexed, reason)]);
     }
 
-    fn commit_and_mark(&mut self) {
+    fn commit_and_mark(&mut self) -> Result<()> {
         if self.dirty_ops == 0 && self.pending_marks.is_empty() {
-            return;
+            return Ok(());
         }
         match self.writer.commit() {
             Ok(_) => {
@@ -305,13 +349,17 @@ impl Indexer {
             Err(e) => {
                 // tantivy rolls back to the last commit; rows stay indexed=0 and
                 // reconciliation replays them. Drop in-memory state accordingly.
+                // A rollback that fails too means the writer is dead: fatal.
                 tracing::error!("index commit failed: {e}");
                 self.pending_marks.clear();
                 self.in_flight.clear();
                 self.dirty_ops = 0;
-                let _ = self.writer.rollback();
+                self.writer
+                    .rollback()
+                    .map_err(|e| format!("index rollback failed after a failed commit: {e}"))?;
             }
         }
+        Ok(())
     }
 
     /// Reconciliation: cold-path (re-)extraction of docs left `indexed = 0`:
@@ -320,21 +368,26 @@ impl Indexer {
     /// mid-sweep already travel the hot path (their Add is queued), so
     /// chasing them here would double-process and, under a live ingest,
     /// never terminate.
-    fn sweep(&mut self) {
+    fn sweep(&mut self) -> Result<()> {
         self.last_sweep = Instant::now();
         let max_id: i64 = self
             .conn
             .query_row("SELECT COALESCE(MAX(id), 0) FROM docs", [], |r| r.get(0))
             .unwrap_or(0);
         self.sweeping = true;
+        let outcome = self.sweep_batches(max_id);
+        self.sweeping = false;
+        outcome
+    }
+
+    fn sweep_batches(&mut self, max_id: i64) -> Result<()> {
         let mut total = 0usize;
         loop {
             let batch = match self.load_pending_batch(max_id) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("sweep query failed: {e}");
-                    self.sweeping = false;
-                    return;
+                    return Ok(());
                 }
             };
             if batch.is_empty() {
@@ -342,14 +395,14 @@ impl Indexer {
             }
             for row in batch {
                 total += 1;
-                self.reindex_row(row);
+                self.reindex_row(row)?;
             }
-            self.commit_and_mark();
+            self.commit_and_mark()?;
         }
-        self.sweeping = false;
         if total > 0 {
             tracing::info!("reconciled {total} pending docs");
         }
+        Ok(())
     }
 
     #[allow(clippy::type_complexity)]
@@ -388,7 +441,12 @@ impl Indexer {
         Ok(out)
     }
 
-    fn reindex_row(&mut self, row: (i64, String, String, f64, i64, String, i64, i64)) {
+    /// Per-record verdicts ('error' for an unreadable record, the content
+    /// gates) are marked here; only a dead writer propagates as Err.
+    fn reindex_row(
+        &mut self,
+        row: (i64, String, String, f64, i64, String, i64, i64),
+    ) -> Result<()> {
         let (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) = row;
         if !matches!(&self.cur_shard, Some((n, _)) if *n == shard_name) {
             match std::fs::File::open(self.cfg.warc_dir.join(&shard_name)) {
@@ -396,7 +454,7 @@ impl Indexer {
                 Err(e) => {
                     tracing::warn!("cannot open shard for {url}: {e}");
                     self.mark(doc_id, 2, Some("error"));
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -406,29 +464,40 @@ impl Indexer {
             Err(e) => {
                 tracing::warn!("cannot read WARC member for {url}: {e}");
                 self.mark(doc_id, 2, Some("error"));
-                return;
+                return Ok(());
             }
         };
         let Some((_status, head, payload)) = rec.http_parts() else {
             self.mark(doc_id, 2, Some("error"));
-            return;
+            return Ok(());
         };
+        // Rows normally passed the noindex gate at insert time; rows returned
+        // to pending by a migration may predate the header form of it.
+        let hdr = extract::RobotsHeader::parse(
+            warc::http_header_values(head, "x-robots-tag")
+                .iter()
+                .map(String::as_str),
+        );
+        if hdr.noindex {
+            self.mark(doc_id, 2, Some("noindex"));
+            return Ok(());
+        }
         let content_type = warc::http_header_value(head, "content-type");
         let html = extract::decode_html(payload, content_type.as_deref());
         let Some(ex) = extract::full(&url, &html) else {
             self.mark(doc_id, 2, Some("empty"));
-            return;
+            return Ok(());
         };
         if !self.cfg.languages.iter().any(|l| l == ex.lang) {
             self.mark(doc_id, 2, Some("lang"));
-            return;
+            return Ok(());
         }
         let anchors = match db::anchors_for(&self.conn, &url) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!("anchor lookup failed for {url}: {e}");
                 self.mark(doc_id, 2, Some("error"));
-                return;
+                return Ok(());
             }
         };
         // Persist extraction results alongside the pending state.
@@ -448,14 +517,16 @@ impl Indexer {
             simhash: ex.simhash,
             sha256: sha,
             anchors,
-        });
+        })
     }
 }
 
 /// Full rebuild from WARC into a fresh index directory. Offline only: the
-/// caller holds no writer on the live index and owns the directory swap.
+/// caller holds the live index's writer lock and owns the directory swap.
 /// Re-derives every gate with fresh dedup state and writes docs.indexed
-/// directly on `conn`. Docs previously marked 'error' (dead pages) stay dead.
+/// directly on `conn`. Docs marked 'dead' (the URL failed permanently on a
+/// later fetch) stay out; 'error' marks (unreadable records, indexer
+/// casualties) are re-attempted.
 pub fn rebuild(
     cfg: &IndexerCfg,
     conn: &mut rusqlite::Connection,
@@ -477,7 +548,7 @@ pub fn rebuild(
         let mut stmt = conn.prepare(
             "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
              FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
-             WHERE NOT (d.indexed = 2 AND d.skip_reason = 'error')
+             WHERE NOT (d.indexed = 2 AND d.skip_reason = 'dead')
              ORDER BY d.shard_id, d.offset",
         )?;
         let mapped = stmt.query_map([], |r| {
@@ -511,7 +582,12 @@ pub fn rebuild(
             let (_status, head, payload) = rec.http_parts().ok_or("error")?;
             let content_type = warc::http_header_value(head, "content-type");
             let html = extract::decode_html(payload, content_type.as_deref());
-            let a = extract::analyze(&url, &html).ok_or("error")?;
+            let hdr = extract::RobotsHeader::parse(
+                warc::http_header_values(head, "x-robots-tag")
+                    .iter()
+                    .map(String::as_str),
+            );
+            let a = extract::analyze(&url, &html, hdr).ok_or("error")?;
             if a.meta.noindex {
                 return Err("noindex");
             }
@@ -579,6 +655,130 @@ mod tests {
         let f = fields(&s);
         assert_ne!(f.url, f.body);
         assert_ne!(f.simhash, f.centrality);
+    }
+
+    #[test]
+    fn writer_lock_busy_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = open_or_create(dir.path()).unwrap();
+        let _held = acquire_writer(&index, 64).unwrap();
+        let err = match acquire_writer(&index, 64) {
+            Ok(_) => panic!("second writer must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("held by another process"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A page with enough English text to pass the empty and language gates.
+    fn page(title: &str, topic: &str) -> Vec<u8> {
+        format!(
+            "<html><head><title>{title}</title></head><body><p>This page explains {topic} \
+             in enough plain English sentences that the extractor keeps it, the language \
+             detector calls it English, and the length gate is satisfied comfortably.</p>\
+             <p>{topic} again, with a second paragraph about {topic} for good measure.</p>\
+             </body></html>"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn rebuild_retries_error_marks_but_skips_dead() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let warc_dir = dir.path().join("warc");
+        std::fs::create_dir_all(&warc_dir).unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let mut conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('a.com', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let mut shard = warc::ShardFile::create(warc_dir.join("s-000001.warc.gz")).unwrap();
+        let mut put = |url: &str, html: &[u8]| -> (i64, i64, Vec<u8>) {
+            let sha = sha2::Sha256::digest(html);
+            let rec = warc::build_response_record(
+                url,
+                1_700_000_000,
+                url.as_bytes(),
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/html",
+                html,
+                &hex::encode(sha),
+                false,
+            );
+            let (o, l) = shard.append_member(&warc::gzip_member(&rec)).unwrap();
+            (o as i64, l as i64, sha.to_vec())
+        };
+        let rows = [
+            (
+                "http://a.com/pending",
+                page("Pending page", "harbor lanterns"),
+                0,
+                None,
+            ),
+            (
+                "http://a.com/retry",
+                page("Retry page", "granite summits"),
+                2,
+                Some("error"),
+            ),
+            (
+                "http://a.com/dead",
+                page("Dead page", "meadow willows"),
+                2,
+                Some("dead"),
+            ),
+        ];
+        let mut placed = Vec::new();
+        for (url, html, _, _) in &rows {
+            placed.push(put(url, html));
+        }
+        shard.flush().unwrap();
+        conn.execute(
+            "INSERT INTO shards (name, state, origin_node, bytes, records, created_at)
+             VALUES ('s-000001.warc.gz', 1, 'o', ?1, 3, 0)",
+            [shard.end as i64],
+        )
+        .unwrap();
+        for ((url, _, indexed, reason), (offset, len, sha)) in rows.iter().zip(&placed) {
+            conn.execute(
+                "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                                   fetched_at, indexed, skip_reason)
+                 VALUES (?1, 1, 1, ?2, ?3, ?4, 200, 1700000000, ?5, ?6)",
+                params![url, offset, len, sha, indexed, reason],
+            )
+            .unwrap();
+        }
+        let cfg = IndexerCfg {
+            index_dir: dir.path().join("index"),
+            db_path,
+            warc_dir,
+            commit_docs: 1000,
+            commit_secs: 60,
+            heap_mb: 64,
+            languages: vec!["en".into()],
+        };
+        let (n_indexed, n_skipped) =
+            rebuild(&cfg, &mut conn, &dir.path().join("index.new")).unwrap();
+        assert_eq!(
+            (n_indexed, n_skipped),
+            (2, 0),
+            "pending + retried error; dead untouched"
+        );
+        let label = |url: &str| -> (i64, Option<String>) {
+            conn.query_row(
+                "SELECT indexed, skip_reason FROM docs WHERE url = ?1",
+                [url],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(label("http://a.com/pending"), (1, None));
+        assert_eq!(label("http://a.com/retry"), (1, None));
+        assert_eq!(label("http://a.com/dead"), (2, Some("dead".into())));
     }
 
     #[test]

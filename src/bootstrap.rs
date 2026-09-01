@@ -133,7 +133,12 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
     }
     let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
     let html = extract::decode_html(payload, Some(&content_type));
-    let analysis = extract::analyze(&url, &html)?;
+    let hdr = extract::RobotsHeader::parse(
+        warc::http_header_values(head, "x-robots-tag")
+            .iter()
+            .map(String::as_str),
+    );
+    let analysis = extract::analyze(&url, &html, hdr)?;
     Some(IngestRecord {
         payload_len: payload.len() as u64,
         fetched_at: rec.date_secs().unwrap_or_else(db::now),
@@ -445,5 +450,40 @@ mod tests {
         // warcinfo records are not ingestable
         let info = warc::parse_record(&warc::build_warcinfo(0, "http://c/")).unwrap();
         assert!(prepare_ingest(&info, vec![]).is_none());
+    }
+
+    #[test]
+    fn ingest_honors_x_robots_tag() {
+        let payload = b"<html><head><title>Tagged page about mycelium</title></head>\
+                        <body><a href=\"/x\">x</a> some text here</body></html>";
+        let sha = hex::encode(sha2::Sha256::digest(payload));
+        let ingest = |head: &[u8]| {
+            let rec = warc::parse_record(&warc::build_response_record(
+                "http://example.com/tagged",
+                1_700_000_000,
+                b"seed",
+                head,
+                payload,
+                &sha,
+                false,
+            ))
+            .unwrap();
+            prepare_ingest(&rec, vec![]).expect("response record ingests")
+        };
+        let ir = ingest(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nx-robots-tag: noindex, nofollow",
+        );
+        assert!(ir.noindex);
+        assert!(ir.links.is_empty(), "header nofollow suppresses links");
+        let ir = ingest(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nX-Robots-Tag: googlebot: noindex",
+        );
+        assert!(!ir.noindex, "another agent's scope is not ours");
+        assert_eq!(ir.links.len(), 1);
+        let ir = ingest(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nX-Robots-Tag: noarchive\r\nX-Robots-Tag: mycel: noindex",
+        );
+        assert!(ir.noindex, "repeated headers and our own scope apply");
+        assert_eq!(ir.links.len(), 1);
     }
 }

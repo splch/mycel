@@ -20,6 +20,9 @@ use std::process::ExitCode;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Product token: the robots.txt group and the X-Robots-Tag agent scope we obey.
+pub const UA_TOKEN: &str = "mycel";
+
 const USAGE: &str = "\
 mycel: a fast, decentralized web crawler, indexer, and search engine
 
@@ -283,28 +286,30 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         });
     }
     let (cfg, data) = load_env()?;
-    // Refuse while a daemon holds the live index's writer lock. An
-    // old-schema index cannot even be opened; it is disposable, so move it
-    // aside instead of failing.
+    // Refuse while a daemon holds the live index's writer lock, and hold that
+    // lock ourselves for the whole rebuild: a daemon started meanwhile must
+    // fail to start rather than index into the directory the swap below
+    // deletes. An old-schema index cannot even be opened; it is disposable,
+    // so move it aside instead of failing.
     let live_dir = data.join("index");
-    match index::open_or_create(&live_dir) {
-        Ok(live) => {
-            let probe: std::result::Result<tantivy::IndexWriter, _> = live.writer(64 * 1024 * 1024);
-            if probe.is_err() {
-                return Err(
-                    "the index is in use; stop `mycel run`/`crawl` before reindexing".into(),
-                );
+    let held_lock: Option<tantivy::IndexWriter> = match index::open_or_create(&live_dir) {
+        Ok(live) => Some(live.writer(64 * 1024 * 1024).map_err(|e| {
+            if index::is_lock_busy(&e) {
+                Error::from("the index is in use; stop `mycel run`/`crawl` before reindexing")
+            } else {
+                e.into()
             }
-        }
+        })?),
         Err(e) if index::is_old_schema_err(&e) => {
             let stale = data.join("index.stale");
             if stale.exists() {
                 std::fs::remove_dir_all(&stale)?;
             }
             std::fs::rename(&live_dir, &stale)?;
+            None
         }
         Err(e) => return Err(e),
-    }
+    };
     let dest = data.join("index.new");
     if dest.exists() {
         std::fs::remove_dir_all(&dest)?;
@@ -328,6 +333,8 @@ fn cmd_reindex(rest: &[String]) -> Result<()> {
         std::fs::rename(&live_dir, &old)?;
     }
     std::fs::rename(&dest, data.join("index"))?;
+    // The lock file moved with the old directory; release it before deleting.
+    drop(held_lock);
     for dir in [old, data.join("index.stale")] {
         if dir.exists() {
             std::fs::remove_dir_all(dir)?;
@@ -375,9 +382,120 @@ enum DaemonWork {
     },
 }
 
+/// Raise this process's open-file soft limit toward its hard limit. A wide
+/// crawl holds thousands of idle keep-alive sockets on top of the index and
+/// WARC handles, while service managers hand out tiny defaults (launchd
+/// agents: 256); tantivy's writer dies on EMFILE and takes indexing with it.
+mod fdlimit {
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    ))]
+    mod sys {
+        /// `struct rlimit` on 64-bit Linux and macOS: two `rlim_t` = `u64`.
+        #[repr(C)]
+        pub struct Rlimit {
+            pub cur: u64,
+            pub max: u64,
+        }
+        #[cfg(target_os = "linux")]
+        pub const RLIMIT_NOFILE: i32 = 7;
+        #[cfg(target_os = "macos")]
+        pub const RLIMIT_NOFILE: i32 = 8;
+        unsafe extern "C" {
+            pub fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i32;
+            pub fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+        }
+    }
+
+    /// (soft, hard) open-file limits, on the platforms we know the ABI for.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    ))]
+    pub fn current() -> Option<(u64, u64)> {
+        let mut lim = sys::Rlimit { cur: 0, max: 0 };
+        // SAFETY: a plain POSIX call writing into a correctly laid out struct.
+        (unsafe { sys::getrlimit(sys::RLIMIT_NOFILE, &mut lim) } == 0).then_some((lim.cur, lim.max))
+    }
+
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    )))]
+    pub fn current() -> Option<(u64, u64)> {
+        None
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    ))]
+    fn set(cur: u64, max: u64) -> bool {
+        let lim = sys::Rlimit { cur, max };
+        // SAFETY: a plain POSIX call reading a correctly laid out struct.
+        unsafe { sys::setrlimit(sys::RLIMIT_NOFILE, &lim) == 0 }
+    }
+
+    #[cfg(not(all(
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    )))]
+    fn set(_cur: u64, _max: u64) -> bool {
+        false
+    }
+
+    /// Lift the soft limit as far as the hard limit and the platform allow;
+    /// log the outcome. Never fails the boot.
+    pub fn raise() {
+        let Some((before, hard)) = current() else {
+            return;
+        };
+        let mut cur = before;
+        // macOS rejects anything above OPEN_MAX (10240) for this resource, so
+        // fall back to that when the larger target is refused.
+        for target in [65_536u64, 10_240] {
+            let want = target.min(hard);
+            if want <= cur {
+                break;
+            }
+            if set(want, hard) {
+                cur = want;
+                break;
+            }
+        }
+        if cur != before {
+            tracing::info!("raised the open-file limit from {before} to {cur}");
+        }
+        if cur < 4096 {
+            tracing::warn!(
+                "open-file limit is {cur}: a wide crawl can exhaust it and kill the index \
+                 writer; raise the hard limit (ulimit -n, systemd LimitNOFILE, launchd \
+                 HardResourceLimits)"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn raise_never_lowers_and_stays_within_hard() {
+            let Some((before, hard)) = super::current() else {
+                return;
+            };
+            super::raise();
+            let (after, hard_after) = super::current().unwrap();
+            assert!(after >= before, "{after} < {before}");
+            assert!(after <= hard, "{after} > {hard}");
+            assert_eq!(hard_after, hard, "the hard limit is never touched");
+        }
+    }
+}
+
 /// Shared engine assembly: db-writer + indexer, optional crawler and API.
 fn daemon(opts: DaemonOpts) -> Result<()> {
     let (cfg, data) = load_env()?;
+    fdlimit::raise();
     if matches!(opts.work, DaemonWork::Crawl { .. }) && cfg.crawl.contact_url.is_empty() {
         return Err(
             "crawl.contact_url must be set in mycel.toml before crawling; it identifies \
@@ -414,6 +532,11 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
         languages: cfg.index.languages.clone(),
     };
 
+    // Take the index writer lock before anything opens the WARC shard: a
+    // second process beside a running daemon (or a `reindex`) must refuse
+    // here, not after truncating the live shard to its watermark.
+    let index_writer = index::open_writer(&indexer_cfg)?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -428,16 +551,25 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
             });
         }
 
-        // Wire order: indexer channel exists before the writer starts.
-        let (index_tx, indexer) = {
-            // The indexer needs a Db handle; create the writer first with the
-            // indexer's sender, using a pre-made channel pair.
-            let (tx, rx) = std::sync::mpsc::channel::<index::IndexMsg>();
-            let (db, writer) = db::spawn_writer(conn, warc_init, db_cfg, Some(tx.clone()))?;
-            let indexer = index::spawn_indexer_with(indexer_cfg, db.clone(), rx)?;
-            ((tx, db, writer), indexer)
+        // Wire order: indexer channel exists before the writer starts (the
+        // writer holds a sender for hot-path adds/deletes).
+        let (index_tx, rx) = std::sync::mpsc::channel::<index::IndexMsg>();
+        let (db, writer) = db::spawn_writer(conn, warc_init, db_cfg, Some(index_tx.clone()))?;
+        let indexer = match index::spawn_indexer_with(
+            indexer_cfg,
+            db.clone(),
+            rx,
+            cancel.clone(),
+            index_writer,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                // The writer is already up: take it down cleanly, then fail.
+                db.shutdown().await;
+                let _ = tokio::task::spawn_blocking(move || writer.join()).await;
+                return Err(e);
+            }
         };
-        let (index_tx, db, writer) = index_tx;
 
         // Federation serves + syncs only in crawl/run mode (one-shot commands
         // must not linger on the network).
@@ -567,7 +699,7 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
 
         // Shutdown order: indexer first (its marks need the writer alive).
         let _ = index_tx.send(index::IndexMsg::Shutdown);
-        let _ = tokio::task::spawn_blocking(move || indexer.join()).await;
+        let indexer_outcome = tokio::task::spawn_blocking(move || indexer.join()).await;
         db.flush().await;
         db.shutdown().await;
         let _ = tokio::task::spawn_blocking(move || writer.join()).await;
@@ -575,7 +707,19 @@ fn daemon(opts: DaemonOpts) -> Result<()> {
         if let Some(t) = api_task {
             let _ = t.await;
         }
-        Ok::<(), Error>(())
+        // An indexer that died mid-run already cancelled everything above;
+        // exit non-zero so a service manager restarts us and the boot sweep
+        // replays whatever stayed pending.
+        let outcome: Result<()> = match indexer_outcome {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(format!(
+                "indexer died: {e}; restart the daemon (pending documents are re-indexed at boot)"
+            )
+            .into()),
+            Ok(Err(_)) => Err("indexer thread panicked".into()),
+            Err(e) => Err(format!("indexer join failed: {e}").into()),
+        };
+        outcome
     })
 }
 

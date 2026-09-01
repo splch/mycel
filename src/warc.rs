@@ -9,6 +9,12 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// Test seam: make the next `ShardFile::flush` of exactly this path fail
+/// once, so the writer's fsync-failure rollback can be exercised end to end.
+/// Keyed by path so parallel tests (each in its own temp dir) never collide.
+#[cfg(test)]
+pub static FAIL_FLUSH_ONCE_FOR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 // ---------------------------------------------------------------- records --
 
 /// A parsed WARC record: headers + raw record block.
@@ -72,6 +78,22 @@ pub fn http_header_value(head: &[u8], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every value of a (possibly repeated) header in a raw HTTP head block.
+pub fn http_header_values(head: &[u8], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in head.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        if let Some((k, v)) = line.trim_end_matches('\r').split_once(':')
+            && k.trim().eq_ignore_ascii_case(name)
+        {
+            out.push(v.trim().to_string());
+        }
+    }
+    out
 }
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
@@ -359,6 +381,28 @@ impl ShardFile {
     /// requirement: this must succeed before the shards.bytes transaction
     /// commits, not before each individual append.
     pub fn flush(&mut self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut hook = FAIL_FLUSH_ONCE_FOR.lock().expect("test hook");
+            if hook.as_ref() == Some(&self.path) {
+                *hook = None;
+                return Err("injected fsync failure".into());
+            }
+        }
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Cut the file back to a known-durable position after a failed batch:
+    /// the members appended since then have no catalog rows and must never
+    /// be covered by a later watermark. In-memory state is updated as soon as
+    /// the truncation itself succeeds, so a failing sync here cannot leave
+    /// the cursor past the end of the file.
+    pub fn truncate_to(&mut self, end: u64, records: u64) -> Result<()> {
+        self.file.set_len(end)?;
+        self.end = end;
+        self.records = records;
+        self.file.seek(SeekFrom::Start(end))?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -572,6 +616,41 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn truncate_to_rolls_back_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t-000001.warc.gz");
+        let mut shard = ShardFile::create(path.clone()).unwrap();
+        let member = gzip_member(&sample_record());
+        let (_, l) = shard.append_member(&member).unwrap();
+        shard.flush().unwrap();
+        // Two more appends "fail to publish": roll back to the durable point.
+        shard.append_member(&member).unwrap();
+        shard.append_member(&member).unwrap();
+        assert_eq!(shard.records, 3);
+        shard.truncate_to(l, 1).unwrap();
+        assert_eq!((shard.end, shard.records), (l, 1));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), l);
+        // The next append continues exactly at the durable point.
+        let (o, _) = shard.append_member(&member).unwrap();
+        assert_eq!(o, l);
+        let items: Vec<_> = MemberIter::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn header_values_collects_repeats() {
+        let head = b"HTTP/1.1 200 OK\r\nX-Robots-Tag: noarchive\r\ncontent-type: text/html\r\nx-robots-tag: mycel: noindex\r\n";
+        assert_eq!(
+            http_header_values(head, "X-Robots-Tag"),
+            vec!["noarchive".to_string(), "mycel: noindex".to_string()]
+        );
+        assert!(http_header_values(head, "missing").is_empty());
     }
 
     #[test]

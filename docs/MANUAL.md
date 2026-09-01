@@ -373,6 +373,14 @@ The daemon: crawler + indexer + HTTP API + federation server + shard sync,
 until Ctrl-C. Unlike `crawl` it keeps waiting when the frontier is idle and
 picks up recrawls as they come due.
 
+Both `run` and `crawl` take the index writer lock before they touch anything
+else and refuse to start while another process holds it (`the index writer
+lock is held by another process`). If the indexer's tantivy writer dies
+while running (a worker thread hit an I/O error, typically running out of
+file descriptors), the daemon shuts down and exits non-zero so a service
+manager restarts it; nothing is mislabeled, and the pending documents are
+re-indexed by the boot sweep.
+
 ### `mycel search <query> [--json] [--federated] [--no-diversity]`
 
 One-shot query. All non-flag arguments are joined into the query string
@@ -416,24 +424,24 @@ immediately everywhere via `mycel reindex`. Safe to run beside the daemon
 
 - `mycel reindex` (full): rebuild the entire index from WARC into
   `index.new/`, then swap it into place. Re-runs every gate
-  (noindex, empty, language, exact and near dedup) with fresh state; documents
-  previously marked `error` (dead pages) stay out. **The daemon must be
-  stopped**; the command probes the index writer lock and refuses with
+  (noindex, empty, language, exact dedup) with fresh state; documents
+  marked `dead` (the URL failed permanently on a later fetch) stay out,
+  while `error` marks (unreadable records, indexer casualties) are
+  re-attempted. **The daemon must be stopped**; the command probes the
+  index writer lock and refuses with
   `the index is in use; stop 'mycel run'/'crawl' before reindexing`.
   Prints `reindexed from WARC: N indexed, M skipped`.
   The rebuild is single-threaded and re-reads every WARC record: budget
   roughly an hour per million documents (a ~2M-document corpus takes
-  ~2.5 hours), during which search is down. Keep the daemon stopped for
-  the whole run — if anything (a watchdog, a second operator) starts it
-  mid-rebuild, it will crawl and index into the *old* index directory
-  that the swap then deletes, and those documents end up marked `indexed`
-  but unsearchable. Recovery: after the rebuild, set the rows created
-  during the window back to pending (`UPDATE docs SET indexed = 0 WHERE
-  id > <max id at rebuild start> AND indexed = 1`) and let the daemon's
-  reconciliation sweep re-index them.
+  ~2.5 hours), during which search is down. The rebuild holds the index
+  writer lock for its whole duration, so a daemon started meanwhile (a
+  watchdog, a second operator) refuses to start with `the index writer
+  lock is held by another process` instead of indexing into the old
+  directory that the swap then deletes.
 - `mycel reindex --missing`: index only documents still marked pending
-  (crash leftovers, freshly ingested files). Also requires the daemon to be
-  stopped (see [One writer at a time](#one-writer-at-a-time)).
+  (crash leftovers, freshly ingested files). Refuses to start while a
+  daemon holds the index writer lock (see
+  [One writer at a time](#one-writer-at-a-time)).
 
 ### `mycel bootstrap --hosts F [--records F]`
 
@@ -673,7 +681,10 @@ and re-fetches are conditional — a `304 Not Modified` keeps the cached rules
 and just refreshes the timestamp. Outcomes:
 
 - 2xx: body cached (up to 512 KiB) and enforced.
-- 4xx: treated as allow-all (cached as such).
+- 429: the host asked us to back off, so it is treated like unavailable
+  (complete disallow, stalled for an hour, then retried), not as allow-all.
+  The stall does not count toward the host circuit breaker.
+- other 4xx: treated as allow-all (cached as such).
 - 5xx or network error: **complete disallow**; the host is stalled for an
   hour, then robots is retried.
 
@@ -702,7 +713,8 @@ request, and the host's turn is not consumed.
 | other status (e.g. 404, 410) | Permanent failure immediately. |
 
 When a previously indexed URL fails permanently, it is deleted from the
-search index (dead pages fall out on their recrawl).
+search index and its catalog row is marked `dead`, which also keeps it out
+of full rebuilds (dead pages fall out on their recrawl).
 
 **Host circuit breaker.** Failures that indict the host itself — transport
 errors, 5xx (including repeated 503), and robots-unavailable stalls — are
@@ -722,8 +734,11 @@ storage; WARC stores decoded bodies.
 **Link discovery.** Up to 2000 `<a href>` links per page, resolved against
 the final URL, normalized, deduplicated, with their anchor text (≤ 80
 characters) recorded for indexing into the link target. `rel=nofollow` links are skipped;
-a `<meta name=robots content=nofollow>` suppresses link extraction entirely;
-`noindex` stores the page in WARC but keeps it out of the index. Off-host
+a `<meta name=robots content=nofollow>` or an `X-Robots-Tag: nofollow`
+response header suppresses link extraction entirely; `noindex` in either form
+stores the page in WARC but keeps it out of the index. Header directives
+scoped to another crawler (`googlebot: noindex`) are ignored; unscoped ones
+and the `mycel:` and `*:` scopes apply. Off-host
 link targets create candidate host rows and webgraph edges but are never
 crawled until seeded. Same-host links are enqueued while the host is under
 `max_urls_per_host` and link depth ≤ 32.
@@ -974,11 +989,13 @@ handshake means the peer does not list *your* id.
 The WARC store has a single open shard with a single writer. **Never run two
 WARC-writing commands concurrently against the same data dir**; a second
 writer would truncate and append the same open shard file and corrupt it.
+Every WARC-writing command takes the index writer lock before it opens the
+shard, so a second one refuses to start instead.
 
 | command | touches | safe while `run`/`crawl` is active? |
 |---|---|---|
 | `run`, `crawl` | everything | one of these at a time |
-| `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | **no** as a second process; use the admin page instead |
+| `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | refused as a second process (writer-lock probe); use the admin page instead |
 | `reindex` (full) | index + db | refuses by itself (writer-lock probe) |
 | `seed`, `bootstrap --hosts`, `rank` | db (short write txn) | yes |
 | `search`, `status`, `id`, `peers check` | read-only | yes |
@@ -1005,6 +1022,7 @@ ExecStart=/usr/local/bin/mycel run
 KillSignal=SIGINT
 TimeoutStopSec=40
 Restart=on-failure
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1012,6 +1030,16 @@ WantedBy=multi-user.target
 
 A SIGKILL or power loss is also safe (see crash safety), just less tidy:
 whatever was past the durability watermark is simply recrawled.
+
+**File descriptors.** A wide crawl holds thousands of idle keep-alive
+sockets on top of the index and WARC handles. The daemon raises its own soft
+limit at startup, as far as the hard limit allows (capped at 65,536; macOS
+caps at 10,240), and warns when it ends up below 4,096. It cannot raise the
+hard limit: set `LimitNOFILE` in the unit, or `SoftResourceLimits` and
+`HardResourceLimits` → `NumberOfFiles` in a launchd plist (launchd agents
+default to 256). If the limit is exhausted anyway, the index writer dies and
+the daemon exits non-zero so the service manager restarts it; the pending
+documents are re-indexed at boot.
 
 ### Logging and monitoring
 
@@ -1058,7 +1086,11 @@ subcommands, not special tools:
 - The database schema is versioned; a newer binary migrates automatically at
   open. A binary older than the database refuses to start
   (`database schema is vN, newer than this binary understands`); upgrade the
-  binary.
+  binary. Do not point a newer binary at a data dir a running older daemon
+  is using: the migration happens on first open.
+- Schema v5 relabels catalog rows: `error` marks on URLs whose frontier row
+  failed permanently become `dead`; every other `error` mark goes back to
+  pending and is re-indexed by the first boot sweep after the upgrade.
 - If a mycel upgrade ships a tantivy version that cannot read the old index,
   rebuild it: `rm -rf <data>/index && mycel reindex`. The corpus is
   untouched.
@@ -1097,11 +1129,24 @@ if `pending` is high, wait for the ~60 s commit or run the daemon longer; if
 `indexed` did not grow, inspect skip reasons
 (`SELECT skip_reason, count(*) FROM docs WHERE indexed = 2 GROUP BY 1;`).
 Common ones: `lang` (page not in `index.languages`), `empty` (under 100
-chars of extracted text), `dup-near` (boilerplate pages that differ too
-little; the gate is doing its job), `noindex` (page opted out).
+chars of extracted text and no usable title), `dup-exact` (another URL is
+already indexed with the same bytes), `noindex` (the page or its response
+headers opted out), `dead` (the URL failed permanently on a later fetch),
+`error` (an unreadable record; `reindex` retries these). Near-duplicates
+are never skipped: they index and collapse at search time.
 
 **`the index is in use; stop 'mycel run'/'crawl' before reindexing`** —
 exactly what it says; only one process may hold the index writer.
+
+**`the index writer lock is held by another process`** — a daemon (`run` or
+`crawl`) is already up on this data dir, or a full `reindex` is in progress.
+One index writer at a time; the refusal happens before the WARC shard is
+touched.
+
+**`indexer died: …`** — the tantivy writer was killed, almost always by
+running out of file descriptors. The daemon exits non-zero on purpose; raise
+the limit (see [Running as a service](#running-as-a-service)), restart, and
+the boot sweep re-indexes the pending documents.
 
 **`federated search needs the daemon; start 'mycel run' first`** — CLI
 `--federated` goes through the HTTP API of the running daemon.

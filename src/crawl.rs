@@ -4,7 +4,7 @@
 
 use crate::config::CrawlCfg;
 use crate::db::{Completion, Db, Job, Outcome, RobotsMsg, RobotsResult, StoredPage};
-use crate::{Result, db, urlnorm, warc};
+use crate::{Result, UA_TOKEN, db, urlnorm, warc};
 use sha2::Digest;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,6 @@ const ROBOTS_CAP: usize = 512 * 1024;
 const SITEMAP_COMPRESSED_CAP: usize = 10 * 1024 * 1024;
 const SITEMAP_DECOMPRESSED_CAP: u64 = 50 * 1024 * 1024;
 const MAX_REDIRECT_HOPS: u32 = 5;
-const UA_TOKEN: &str = "mycel";
 /// Mercator's adaptive politeness: after a fetch that took T, the host's next
 /// turn comes at least FACTOR·T later, so a struggling server is hit less
 /// without any per-host configuration.
@@ -369,6 +368,10 @@ async fn fetch_robots(st: &Shared, job: &Job) -> (RobotsResult, Vec<(String, Str
                 // Conditional re-fetch came back unchanged: keep the cached
                 // rules (and validators), refresh only the timestamp.
                 304 => (RobotsResult::NotModified, vec![]),
+                // Rate limited. RFC 9309 would let us read this as "no rules,
+                // crawl freely"; we read it as "back off": stall like 5xx,
+                // without blaming the host.
+                429 => (RobotsResult::RateLimited { status }, vec![]),
                 400..=499 => (RobotsResult::AllowAll { status }, vec![]),
                 _ => (
                     RobotsResult::Unavailable {
@@ -732,7 +735,13 @@ fn build_stored(
     now: i64,
 ) -> Outcome {
     let html = crate::extract::decode_html(&body, Some(&content_type));
-    let Some(analysis) = crate::extract::analyze(&final_url, &html) else {
+    // X-Robots-Tag rides in the stored head, so rebuilds see it too.
+    let hdr = crate::extract::RobotsHeader::parse(
+        warc::http_header_values(&head, "x-robots-tag")
+            .iter()
+            .map(String::as_str),
+    );
+    let Some(analysis) = crate::extract::analyze(&final_url, &html, hdr) else {
         return Outcome::PermanentFail {
             reason: "bad-final-url".into(),
         };

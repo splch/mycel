@@ -6,9 +6,13 @@ use std::net::TcpListener;
 use std::process::Command;
 
 const PHRASE: &str = "unmistakable-fixture-phrase";
+/// Lives on a page served with `X-Robots-Tag: noindex`: stored, never indexed.
+const HDR_PHRASE: &str = "header-noindex-sentinel";
+/// Lives on a page reachable only through that noindex page's links.
+const DEEP_PHRASE: &str = "reached-through-header-noindex-page";
 
-/// Distinct filler per page; near-identical filler across pages would
-/// (correctly) trip the near-dup simhash gate and never index.
+/// Distinct filler per page: byte-identical filler across pages would be
+/// exact-duplicated (sha256) and never index.
 fn filler(seed: u64) -> String {
     const WORDS: [&str; 24] = [
         "crawler", "index", "search", "network", "mycelium", "harvest", "signal", "garden",
@@ -48,10 +52,12 @@ fn serve_fixture(listener: TcpListener) {
         let n = stream.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..n]);
         let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
-        let (status, ctype, body) = match path.as_str() {
+        // (status, content type, extra header lines, body)
+        let (status, ctype, extra, body) = match path.as_str() {
             "/robots.txt" => (
                 "200 OK",
                 "text/plain",
+                "",
                 format!(
                     "User-agent: *\nDisallow: /secret/\nSitemap: http://127.0.0.1:{port}/sitemap.xml\n"
                 ),
@@ -59,6 +65,7 @@ fn serve_fixture(listener: TcpListener) {
             "/sitemap.xml" => (
                 "200 OK",
                 "application/xml",
+                "",
                 format!(
                     "<urlset><url><loc>http://127.0.0.1:{port}/hidden.html</loc></url></urlset>"
                 ),
@@ -66,31 +73,53 @@ fn serve_fixture(listener: TcpListener) {
             "/" => (
                 "200 OK",
                 "text/html",
+                "",
                 page_with(
                     "Home",
                     1,
-                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a>",
+                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a> <a href=\"/tagged.html\">t</a>",
                 ),
             ),
             "/a.html" => (
                 "200 OK",
                 "text/html",
+                "",
                 page_with("Alpha", 2, &format!("<p>the {PHRASE} lives here</p>")),
             ),
             "/b.html" => (
                 "200 OK",
                 "text/html",
+                "",
                 page_with("Beta", 3, "<p>nothing special</p>"),
             ),
             "/hidden.html" => (
                 "200 OK",
                 "text/html",
+                "",
                 page_with("Hidden", 4, "<p>found only via sitemap</p>"),
             ),
-            _ => ("404 Not Found", "text/plain", "nope".to_string()),
+            // The header form of a robots directive: stored and its links
+            // followed, but never indexed.
+            "/tagged.html" => (
+                "200 OK",
+                "text/html",
+                "x-robots-tag: noindex\r\n",
+                page_with(
+                    "Tagged",
+                    5,
+                    &format!("<p>{HDR_PHRASE}</p><a href=\"/deep.html\">d</a>"),
+                ),
+            ),
+            "/deep.html" => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with("Deep", 6, &format!("<p>{DEEP_PHRASE}</p>")),
+            ),
+            _ => ("404 Not Found", "text/plain", "", "nope".to_string()),
         };
         let resp = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.write_all(resp.as_bytes());
@@ -180,4 +209,35 @@ fn crawl_index_search_roundtrip() {
     )
     .unwrap();
     assert_eq!(v["total"], 1);
+
+    // X-Robots-Tag: noindex keeps the tagged page out of the index while its
+    // links are still followed (only nofollow would stop that).
+    let search = |q: &str| -> serde_json::Value {
+        serde_json::from_slice(&mycel(dir, &["search", q, "--json"]).stdout).unwrap()
+    };
+    assert_eq!(search(HDR_PHRASE)["total"], 0, "header noindex honored");
+    let v = search(DEEP_PHRASE);
+    assert_eq!(v["total"], 1, "the noindex page's links were followed");
+    assert!(
+        v["hits"][0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/deep.html")
+    );
+
+    // A full rebuild from WARC (holding the writer lock throughout) reproduces
+    // the index, header gate included.
+    let out = mycel(dir, &["reindex"]);
+    assert!(
+        out.status.success(),
+        "reindex: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("reindexed from WARC:"));
+    assert_eq!(search(PHRASE)["total"], 1);
+    assert_eq!(
+        search(HDR_PHRASE)["total"],
+        0,
+        "the rebuild re-derives the header gate"
+    );
 }

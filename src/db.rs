@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const DDL_V1: &str = r#"
 CREATE TABLE hosts (
@@ -70,7 +70,7 @@ CREATE TABLE docs (                                -- current snapshot per URL; 
   http_status INTEGER NOT NULL,
   fetched_at  INTEGER NOT NULL,
   indexed     INTEGER NOT NULL DEFAULT 0,          -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|error (legacy DBs: dup-near)
+  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|error|dead (legacy DBs: dup-near)
 );
 CREATE INDEX docs_sha     ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -161,6 +161,21 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 4)?;
     }
+    if version < 5 {
+        // v5: the 'error' skip label meant two things. A URL that failed
+        // permanently on a later fetch is a dead page and stays out of full
+        // rebuilds: it becomes 'dead' (its frontier row is the failed one).
+        // Every other 'error' mark was an indexer or record failure and goes
+        // back to pending so reconciliation re-examines it.
+        conn.execute_batch(
+            "UPDATE docs SET skip_reason = 'dead'
+               WHERE indexed = 2 AND skip_reason = 'error'
+                 AND url IN (SELECT url FROM frontier WHERE state = 2);
+             UPDATE docs SET indexed = 0, skip_reason = NULL
+               WHERE indexed = 2 AND skip_reason = 'error';",
+        )?;
+        conn.pragma_update(None, "user_version", 5)?;
+    }
     Ok(())
 }
 
@@ -227,6 +242,10 @@ pub enum RobotsResult {
     AllowAll { status: u16 },
     /// 304: cached rules unchanged; refresh the timestamp, keep body+validators.
     NotModified,
+    /// 429: the host is telling us to slow down. Stalls exactly like
+    /// Unavailable (complete disallow, hourly retry), but the host answered,
+    /// so it neither counts toward the breaker nor resets it.
+    RateLimited { status: u16 },
     /// 5xx / network error: complete disallow; host stalls, retried hourly.
     Unavailable { status: Option<u16> },
 }
@@ -576,6 +595,61 @@ struct WarcState {
     shard_db_id: i64,
     shard: warc::ShardFile,
     dirty: bool,
+    /// Where the last committed watermark (shards.bytes/records) stands:
+    /// the position a failed batch rolls the file back to.
+    durable_end: u64,
+    durable_records: u64,
+}
+
+impl WarcState {
+    /// Adopt a shard whose catalog row already reflects its current length.
+    fn new(init: WarcInit, shard_db_id: i64, shard: warc::ShardFile) -> Self {
+        Self {
+            durable_end: shard.end,
+            durable_records: shard.records,
+            init,
+            shard_db_id,
+            shard,
+            dirty: false,
+        }
+    }
+
+    fn rotate_to(&mut self, shard_db_id: i64, shard: warc::ShardFile) {
+        self.durable_end = shard.end;
+        self.durable_records = shard.records;
+        self.shard_db_id = shard_db_id;
+        self.shard = shard;
+        self.dirty = false;
+    }
+
+    /// The batch that appended since the durable point has committed.
+    fn mark_durable(&mut self) {
+        self.durable_end = self.shard.end;
+        self.durable_records = self.shard.records;
+        self.dirty = false;
+    }
+
+    /// The batch failed (fsync, watermark update, or commit): its members
+    /// have no catalog rows, so cut the file back to the durable point before
+    /// anything else appends, or a later watermark would cover orphans.
+    fn rollback_to_durable(&mut self) {
+        match self
+            .shard
+            .truncate_to(self.durable_end, self.durable_records)
+        {
+            Ok(()) => self.dirty = false,
+            Err(e) => {
+                // fsync and truncate both failing means the disk is in
+                // trouble. Stay dirty so the next batch retries the flush.
+                // Rows can still never point past the watermark; the residual
+                // risk is unreferenced members inside the file.
+                tracing::error!(
+                    "cannot cut shard back to watermark {}: {e}",
+                    self.durable_end
+                );
+            }
+        }
+    }
 }
 
 struct Writer {
@@ -678,14 +752,7 @@ fn attach_shard(conn: &mut Connection, init: WarcInit) -> Result<WarcState> {
     if let Some((id, name, bytes, records)) = existing {
         let path = init.dir.join(&name);
         match warc::ShardFile::open_truncate(path, bytes as u64, records as u64) {
-            Ok(shard) => {
-                return Ok(WarcState {
-                    init,
-                    shard_db_id: id,
-                    shard,
-                    dirty: false,
-                });
-            }
+            Ok(shard) => return Ok(WarcState::new(init, id, shard)),
             Err(e) => {
                 tracing::warn!("cannot reopen shard {name}: {e}; sealing it and starting fresh");
                 conn.execute(
@@ -696,12 +763,7 @@ fn attach_shard(conn: &mut Connection, init: WarcInit) -> Result<WarcState> {
         }
     }
     let (shard_db_id, shard) = create_shard(conn, &init)?;
-    Ok(WarcState {
-        init,
-        shard_db_id,
-        shard,
-        dirty: false,
-    })
+    Ok(WarcState::new(init, shard_db_id, shard))
 }
 
 fn create_shard(conn: &Connection, init: &WarcInit) -> Result<(i64, warc::ShardFile)> {
@@ -938,39 +1000,59 @@ impl Writer {
             // Advance the durable watermark for everything appended this batch.
             // One fsync per batch, not per member: the invariant needs the
             // shard bytes durable before shards.bytes commits.
-            if self.warc.dirty {
-                if let Err(e) = self.warc.shard.flush() {
-                    // Never let docs rows commit past unsynced shard bytes:
-                    // boot truncation would cut the members they point at.
-                    // Roll the whole batch back; pending oneshot replies fail
+            let appended = self.warc.dirty;
+            if appended {
+                let mut published = self.warc.shard.flush();
+                if published.is_ok() {
+                    published = tx
+                        .execute(
+                            "UPDATE shards SET bytes = ?1, records = ?2 WHERE id = ?3",
+                            params![
+                                self.warc.shard.end as i64,
+                                self.warc.shard.records as i64,
+                                self.warc.shard_db_id
+                            ],
+                        )
+                        .map(|_| ())
+                        .map_err(Into::into);
+                }
+                if let Err(e) = published {
+                    // Never let docs rows commit past unsynced shard bytes or
+                    // under a stale watermark: boot truncation would cut the
+                    // members they point at. Roll the whole batch back and cut
+                    // the shard back to the durable point, so the members
+                    // appended this batch (now row-less) can never be covered
+                    // by a later watermark. Pending oneshot replies fail
                     // closed (empty/default) as their senders drop.
-                    tracing::error!("shard fsync failed; batch rolled back: {e}");
+                    tracing::error!("shard fsync/watermark failed; batch rolled back: {e}");
                     drop(tx);
+                    self.warc.rollback_to_durable();
                     if stop {
                         break;
                     }
                     continue;
                 }
-                if let Err(e) = tx.execute(
-                    "UPDATE shards SET bytes = ?1, records = ?2 WHERE id = ?3",
-                    params![
-                        self.warc.shard.end as i64,
-                        self.warc.shard.records as i64,
-                        self.warc.shard_db_id
-                    ],
-                ) {
-                    tracing::error!("watermark update failed: {e}");
-                }
-                self.warc.dirty = false;
             }
             if stop {
                 let _ = flush_counters(&tx, &self.counters);
             }
-            if let Err(e) = tx.commit() {
-                tracing::error!("batch commit failed: {e}");
-            }
-            for r in replies {
-                r();
+            match tx.commit() {
+                Ok(()) => {
+                    if appended {
+                        self.warc.mark_durable();
+                    }
+                    for r in replies {
+                        r();
+                    }
+                }
+                Err(e) => {
+                    // The rows are gone, so the bytes go too, and callers fail
+                    // closed just as above.
+                    tracing::error!("batch commit failed: {e}");
+                    if appended {
+                        self.warc.rollback_to_durable();
+                    }
+                }
             }
             // Seal + rotate outside the batch transaction (blake3 reads the
             // file). Never seal a shard holding only its warcinfo record;
@@ -1007,9 +1089,7 @@ impl Writer {
             self.warc.shard.records
         );
         let (id, shard) = create_shard(&self.conn, &self.warc.init)?;
-        self.warc.shard_db_id = id;
-        self.warc.shard = shard;
-        self.warc.dirty = false;
+        self.warc.rotate_to(id, shard);
         Ok(())
     }
 }
@@ -1102,25 +1182,33 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
             last_modified.clone(),
         ),
         RobotsResult::AllowAll { status } => (Some(""), Some(*status as i64), None, None),
+        RobotsResult::RateLimited { status } => (None, Some(*status as i64), None, None),
         RobotsResult::Unavailable { status } => (None, status.map(|s| s as i64), None, None),
         RobotsResult::NotModified => unreachable!("handled above"),
     };
-    // 5xx/unreachable robots = complete disallow: stall the host for an hour.
+    // 5xx/unreachable/rate-limited robots = complete disallow: stall the host
+    // for an hour.
     let gate = if body.is_none() {
         gate_at(m.now_ms, 3_600_000)
     } else {
         gate_at(m.now_ms, m.delay_ms)
     };
     // A served robots (even empty allow-all) proves the host is alive and
-    // resets the failure count; unavailability counts toward the breaker.
+    // resets the failure count; unavailability counts toward the breaker; a
+    // 429 does neither (the host answered, just not with rules).
     let fault = matches!(m.result, RobotsResult::Unavailable { .. });
+    let served = matches!(
+        m.result,
+        RobotsResult::Fetched { .. } | RobotsResult::AllowAll { .. }
+    );
     let threshold = block_threshold(cfg);
     tx.prepare_cached(
         "UPDATE hosts SET robots_body = ?1, robots_status = ?2, robots_fetched_at = ?3,
                           next_fetch_at = ?4, in_flight = 0,
                           robots_etag = ?8, robots_last_modified = ?9,
                           consecutive_failures = CASE WHEN ?6 THEN consecutive_failures + 1
-                                                      ELSE 0 END,
+                                                      WHEN ?10 THEN 0
+                                                      ELSE consecutive_failures END,
                           state = CASE WHEN ?6 AND state = 1
                                             AND consecutive_failures + 1 >= ?7
                                        THEN 2 ELSE state END
@@ -1135,7 +1223,8 @@ fn handle_robots(tx: &Transaction, cfg: &DbCfg, m: &RobotsMsg) -> Result<()> {
         fault,
         threshold,
         etag,
-        last_modified
+        last_modified,
+        served
     ])?;
     if fault {
         warn_if_blocked(tx, m.host_id, threshold)?;
@@ -1443,7 +1532,9 @@ fn handle_complete(
         }
         Outcome::PermanentFail { reason } => {
             fail_permanent(tx, c.frontier_id, reason)?;
-            // If this URL had been indexed, the page is gone: remove it.
+            // If this URL had been indexed, the page is gone: remove it. The
+            // 'dead' label (distinct from 'error', which rebuilds retry) keeps
+            // it out of full rebuilds.
             let was_indexed: Option<i64> = tx
                 .prepare_cached("SELECT indexed FROM docs WHERE url = ?1")?
                 .query_row([&c.url], |r| r.get(0))
@@ -1453,7 +1544,7 @@ fn handle_complete(
             {
                 let _ = itx.send(IndexMsg::Delete(c.url.clone()));
             }
-            tx.prepare_cached("UPDATE docs SET indexed = 2, skip_reason = 'error' WHERE url = ?1")?
+            tx.prepare_cached("UPDATE docs SET indexed = 2, skip_reason = 'dead' WHERE url = ?1")?
                 .execute([&c.url])?;
             success = false;
             bump(counters, "fetch_err", 1);
@@ -2491,6 +2582,255 @@ mod tests {
         db.flush().await;
         assert_eq!(state_of(), (t + 8 * r, 0));
 
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    /// A Stored completion for `job` carrying a small page with `marker` text.
+    fn stored_completion(job: &Job, now_ms: i64, marker: &str) -> Completion {
+        use sha2::Digest as _;
+        let payload = format!("<html><body>{marker}</body></html>").into_bytes();
+        let sha: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        let member = warc::gzip_member(&warc::build_response_record(
+            &job.url,
+            now_ms / 1000,
+            b"seed",
+            b"HTTP/1.1 200 OK",
+            &payload,
+            &hex::encode(sha),
+            false,
+        ));
+        Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::Stored(StoredPage {
+                final_url: job.url.clone(),
+                http_status: 200,
+                member,
+                payload_len: payload.len() as u64,
+                sha256: sha,
+                noindex: false,
+                extract: None,
+                links: vec![],
+            }),
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn fsync_failure_rolls_back_batch_and_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+        let open_shard = || -> (String, i64) {
+            check
+                .query_row("SELECT name, bytes FROM shards WHERE state = 0", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+        };
+        let (name, watermark) = open_shard();
+        let path = dir.path().join(&name);
+        // The next fsync of this shard fails: the batch must roll back and
+        // the file must be cut back to the watermark.
+        *warc::FAIL_FLUSH_ONCE_FOR.lock().unwrap() = Some(path.clone());
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(stored_completion(&job, t * 1000, "first try"))
+            .await;
+        db.flush().await;
+        let docs: i64 = check
+            .query_row("SELECT count(*) FROM docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0, "docs row rolled back with the batch");
+        let fstate: i64 = check
+            .query_row("SELECT state FROM frontier", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fstate, 1, "the claim stands; the row is untouched");
+        assert_eq!(open_shard().1, watermark, "watermark did not move");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            watermark as u64,
+            "shard cut back to the watermark: the row-less member is gone"
+        );
+
+        // fsync works again: the retry lands exactly at the watermark, and
+        // file, watermark, and row agree.
+        db.complete(stored_completion(&job, t * 1000, "second try"))
+            .await;
+        db.flush().await;
+        let (offset, len): (i64, i64) = check
+            .query_row("SELECT offset, len FROM docs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(offset, watermark);
+        let (_, bytes) = open_shard();
+        assert_eq!(bytes, watermark + len);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes as u64);
+        let rec = warc::read_member_at(&path, offset as u64, len as u64).unwrap();
+        assert_eq!(rec.target_uri(), Some("http://example.com/"));
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_marks_the_doc_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let check = open(&db_path).unwrap();
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.complete(stored_completion(&job, t * 1000, "alive"))
+            .await;
+        db.flush().await;
+        // The recrawl 404s: the page is dead and stays out of rebuilds.
+        db.complete(Completion {
+            frontier_id: job.frontier_id,
+            host_id: job.host_id,
+            depth: 0,
+            url: job.url.clone(),
+            outcome: Outcome::PermanentFail {
+                reason: "http-404".into(),
+            },
+            next_delay_ms: 1000,
+            sticky_delay_ms: None,
+            host_fault: false,
+            now_ms: (t + 5) * 1000,
+        })
+        .await;
+        db.flush().await;
+        let (indexed, reason): (i64, Option<String>) = check
+            .query_row("SELECT indexed, skip_reason FROM docs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((indexed, reason.as_deref()), (2, Some("dead")));
+        let fstate: i64 = check
+            .query_row("SELECT state FROM frontier", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fstate, 2);
+        db.shutdown().await;
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn migration_v5_splits_error_into_dead_and_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DDL_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute_batch(
+                "INSERT INTO hosts (host, state, added_at) VALUES ('a.com', 1, 0);
+                 INSERT INTO shards (name, origin_node, created_at) VALUES ('s', 'o', 0);
+                 INSERT INTO frontier (host_id, url, state, discovered_at) VALUES
+                   (1, 'http://a.com/dead', 2, 0), (1, 'http://a.com/poisoned', 0, 0);
+                 INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                                   fetched_at, indexed, skip_reason) VALUES
+                   ('http://a.com/dead', 1, 1, 0, 1, x'00', 200, 0, 2, 'error'),
+                   ('http://a.com/poisoned', 1, 1, 1, 1, x'01', 200, 0, 2, 'error'),
+                   ('http://a.com/orphan', 1, 1, 2, 1, x'02', 200, 0, 2, 'error'),
+                   ('http://a.com/french', 1, 1, 3, 1, x'03', 200, 0, 2, 'lang');",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let label = |url: &str| -> (i64, Option<String>) {
+            conn.query_row(
+                "SELECT indexed, skip_reason FROM docs WHERE url = ?1",
+                [url],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            label("http://a.com/dead"),
+            (2, Some("dead".into())),
+            "a permanently failed URL stays out of rebuilds"
+        );
+        assert_eq!(
+            label("http://a.com/poisoned"),
+            (0, None),
+            "an indexer casualty goes back to pending"
+        );
+        assert_eq!(
+            label("http://a.com/orphan"),
+            (0, None),
+            "no frontier row at all: re-examine"
+        );
+        assert_eq!(
+            label("http://a.com/french"),
+            (2, Some("lang".into())),
+            "other labels are untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_rate_limited_stalls_without_breaker_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/a");
+        // Two earlier host faults on record: a 429 must neither add to them
+        // (Unavailable would) nor wipe them (a served robots would).
+        conn.execute("UPDATE hosts SET consecutive_failures = 2", [])
+            .unwrap();
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let mut cfg = test_cfg();
+        cfg.block_after_failures = 3;
+        let (db, handle) = spawn_writer(conn, test_warc_init(dir.path()), cfg, None).unwrap();
+        let check = open(&db_path).unwrap();
+
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        db.robots_done(RobotsMsg {
+            host_id: job.host_id,
+            frontier_id: job.frontier_id,
+            result: RobotsResult::RateLimited { status: 429 },
+            sitemaps: vec![],
+            delay_ms: 1000,
+            now_ms: t * 1000,
+        })
+        .await;
+        db.flush().await;
+
+        // Stalled like an unavailable robots: complete disallow for an hour...
+        assert!(db.claim(t + 1, 1).await.is_empty());
+        let (body, status): (Option<String>, Option<i64>) = check
+            .query_row("SELECT robots_body, robots_status FROM hosts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(body, None);
+        assert_eq!(status, Some(429));
+        // ...but not a host fault: still active, failure count unchanged.
+        assert_eq!(host_row(&check, "example.com"), (1, 2));
+        // After the stall the URL is claimable again with robots stale.
+        let job = db.claim(t + 3601, 1).await.pop().unwrap();
+        assert!(job.robots_body.is_none());
+        assert_eq!(job.attempts, 1, "the robots turn refunded the claim");
         db.shutdown().await;
         handle.join().unwrap();
     }
