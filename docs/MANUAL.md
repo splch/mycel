@@ -425,7 +425,7 @@ New values affect search only as documents are re-indexed: on recrawl, or
 immediately everywhere via `mycel reindex`. Safe to run beside the daemon
 (one short write transaction at the end).
 
-### `mycel reindex [--missing]`
+### `mycel reindex [--missing|--online]`
 
 - `mycel reindex` (full): rebuild the entire index from WARC into
   `index.new/`, then swap it into place. Re-runs every gate

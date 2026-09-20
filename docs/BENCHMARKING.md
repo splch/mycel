@@ -333,5 +333,9 @@ should-clauses that still score; the approximation removes them from
 scoring entirely (Algolia removeWords semantics). When AND fails because
 mid-DF *content* terms are missing — the common case on verbose topics —
 the kept-subset conjunction matches an arbitrary small doc set, and the
-plain disjunction it preempted ranked relevant docs top. Without native
-MSM in tantivy 0.26, the two-pass AND → OR ladder stands.
+plain disjunction it preempted ranked relevant docs top. tantivy 0.26.1
+does expose native MSM (`BooleanQuery::with_minimum_required_clauses`,
+which keeps every term scoring), so true MSM is untested here rather than
+unavailable: it is the first candidate for the next ranking experiment,
+and until it is measured through this gate the two-pass AND → OR ladder
+stands.

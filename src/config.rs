@@ -52,11 +52,14 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# mycel configuration. Every value belo
 # enabled = false          # peerless default: no socket bound, nothing published
 # fanout = true
 # fanout_timeout_ms = 1500
+# preset = "n0"           # "n0": iroh relays + DNS lookup; "empty": no external infra, peers need addr
+# bind = ""               # optional UDP ip:port for the QUIC endpoint; "" = ephemeral
 
 # [[federation.peers]]
 # id = "<64-hex endpoint id>"   # from `mycel id` on the peer
 # name = "alice"                # result badge
 # sync = true                   # pull this peer's shards
+# addr = "192.168.1.11:4433"    # optional direct ip:port; required with preset = "empty"
 
 [sync]
 # enabled = true           # no-op unless federation.enabled

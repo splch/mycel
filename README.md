@@ -45,12 +45,13 @@ refuses to run until `crawl.contact_url` identifies you.
 | `seed <host\|url>… [--from-file F]` | activate hosts + enqueue roots |
 | `crawl [--limit N]` | crawl + index until the frontier drains |
 | `run` | daemon: crawler + indexer + HTTP API |
-| `search <q> [--json]` | one-shot query (`site:host` filters work) |
+| `search <q> [--json] [--federated] [--no-diversity]` | one-shot query (`site:host` filters work) |
 | `bootstrap --hosts F [--records F]` | seed centrality + fetch Common Crawl records |
 | `ingest <file\|dir>…` | register + index local `.warc` / `.warc.gz` |
 | `rank [--force]` | harmonic centrality over the host webgraph |
-| `reindex [--missing]` | rebuild the index from WARC (daemon stopped) |
+| `reindex [--missing\|--online]` | rebuild the index from WARC (daemon stopped), index pending docs, or re-index everything through the running daemon |
 | `status [--json]` | counters, queue depths, shards |
+| `peers check` | dial every configured peer and verify auth + protocol |
 
 ## Bootstrapping from Common Crawl
 

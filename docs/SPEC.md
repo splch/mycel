@@ -98,6 +98,8 @@ timeout_secs = 30
 max_body_bytes = 2097152
 recrawl_days = 14
 max_urls_per_host = 50000
+block_after_failures = 25  # circuit breaker: block the host (state 2) after this many
+                           # consecutive host-level failures; 0 disables; `seed` re-activates
 scope = "host"           # exact-host membership in hosts table (only v1 value)
 
 [index]
@@ -108,6 +110,7 @@ heap_mb = 256
 
 [rank]
 weight = 0.3             # w in score = bm25 * (1 + w*centrality)
+freshness_weight = 0.0   # fw in score * (1 + fw*e^(-age_days/90)); 0 = off, scoring byte-identical
 exact_bfs_max_hosts = 20000
 
 [warc]
@@ -127,11 +130,15 @@ fanout_timeout_ms = 1500 # per-peer deadline; a per-peer circuit breaker (5
                          # consecutive failures → 30s cooldown, ×2 to 1h cap,
                          # half-open probe after) skips dead peers instead of
                          # paying this timeout on every query
+preset = "n0"            # "n0": iroh relays + DNS address lookup; "empty": no external
+                         # infrastructure (LAN/tests/airgap), every peer then needs `addr`
+bind = ""                # optional UDP ip:port for the QUIC endpoint; "" = ephemeral
 
 [[federation.peers]]     # example
 # id = "<64-hex endpoint id>"   # from `mycel id` on the peer
 # name = "alice"                # result badge
 # sync = true                   # pull this peer's shards
+# addr = "192.168.1.11:4433"    # optional direct ip:port; required with preset = "empty"
 
 [sync]
 enabled = true           # no-op unless federation.enabled
@@ -366,7 +373,7 @@ No parquet/duckdb/aws crates in the binary: subset selection is external, docume
 | tantivy writer killed (EMFILE, I/O error) | daemon exits non-zero with nothing marked; supervisor restarts; boot sweep replays pending rows |
 | SQLite lost, WARC intact | `mycel ingest warc/**` (idempotent) + `reindex`; recovery = the two normal code paths |
 | SQLITE_BUSY | near-impossible internally (single writer); externals ride busy_timeout |
-| Disk full | scheduler stops claiming, indexer pauses, 60s probe, /healthz degraded; WAL+watermark ⇒ nothing corrupts; resumes without restart |
+| Disk full | writes fail with logged errors; nothing already durable is at risk (WAL + watermark), claimed rows return through the lease sweep, boot truncation cleans the open shard. Free space and restart the daemon; there is no in-process probe or self-resume |
 | Crash anywhere | watermark truncation + in_flight reset + reconciliation ⇒ worst case a few pages recrawled |
 | Backup | `sqlite3 .backup` + rsync `warc/`; the index is never backed up |
 
