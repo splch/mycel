@@ -306,14 +306,24 @@ those grounds: PDFs (a dependency and a second extraction pipeline), feeds
 quality features and the full `bench/` layout (speculative until Phase 8),
 per-URL takedown (`block` covers spam at host granularity).
 
-- **Phase 8 — the measurement gate, completed.** One stdlib Python script in
-  `tools/` that wraps a BEIR corpus into gzip-member WARC, writes a scratch
-  config with `rank.weight = 0`, runs `init`/`ingest`/`reindex`/`search
-  --json`, and computes nDCG@10 itself (no ir_measures, no daemon); plus a
-  debug-level tracing line per query. Acceptance: reproduces the
-  TREC-COVID and SciFact numbers in docs/BENCHMARKING.md §10 within noise.
+- **Phase 8 — the measurement gate, completed.** *Shipped 2026-09-21.*
+  `tools/beir_eval.py` wraps a BEIR corpus into gzip-member WARC, runs
+  `init`/`ingest`/`reindex`/`search --json --no-diversity` through the real
+  binary at `rank.weight = 0`, and computes nDCG@k and P@k on a page of
+  exactly k results plus R@100 on a second pass (no ir_measures, no
+  daemon); the API emits a debug-level query line on the `mycel::queries`
+  target. Result (docs/BENCHMARKING.md §11): SciFact nDCG@10 0.6047 /
+  P@10 0.0803 / R@100 0.8778 reproduces §10 within noise; TREC-COVID
+  0.4553 / 0.456 / 0.059 sits 0.020 above the recorded nDCG@10 with P@10
+  0.010 below, unexplained because the old harness is not in the repo;
+  these are the baseline from here on. Finding: at page size 100
+  TREC-COVID reads 0.4983, because the near-dup collapse leaves 10-result
+  pages short.
 - **Phase 9 — ranking levers, one experiment at a time, one schema bump.**
-  True minimum-should-match as the first rung
+  Backfilling collapsed slots first (collect more candidates than the page,
+  collapse, cut to the page; measured ceiling +0.043 nDCG@10 on
+  TREC-COVID, no change on SciFact); then true minimum-should-match as the
+  first rung
   (`BooleanQuery::with_minimum_required_clauses`, threshold part of the
   experiment, disjunctive retry kept); a sloppy phrase clause for term
   proximity; a tokenized domain field for navigational queries; English

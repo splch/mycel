@@ -36,8 +36,9 @@ one live-crawl soak as the closest honest approximation of end-to-end.
    in-tree harnesses in its commit message: `tests/golden/queries.toml`
    (exact-order snapshot) and `tests/golden/qrels.toml` (NDCG@10 floors
    over graded judgments; `cargo test ndcg_qrels`). A change that moves
-   no number says so explicitly. Full BEIR re-runs (§10) are required
-   only when the in-tree harnesses move.
+   no number says so explicitly. Full BEIR re-runs (§10, through
+   `tools/beir_eval.py`, §11) are required only when the in-tree harnesses
+   move; SciFact takes seconds, so run it anyway.
 
 ## 1. Harness layout
 
@@ -59,6 +60,11 @@ pattern from the integration tests, or a release binary on `PATH` for
 non-Cargo runs). No new dependencies in the main crate; `ir_measures` is a
 Python tool used only by `bench/score/`, outside the crate's dependency set
 (per the closed-dependency convention in SPEC §2).
+
+The runnable half of this layout today is `tools/beir_eval.py` (§11): one
+stdlib script that is stages 2 through 5 for one BEIR corpus, with the
+scoring done in-script (no `ir_measures`). The `bench/` tree above remains
+the plan for the nightly and milestone tiers.
 
 ## 2. Stage 1 — crawler (fixture fleet)
 
@@ -339,3 +345,59 @@ which keeps every term scoring), so true MSM is untested here rather than
 unavailable: it is the first candidate for the next ranking experiment,
 and until it is measured through this gate the two-pass AND → OR ladder
 stands.
+
+## 11. Running the gate (`tools/beir_eval.py`)
+
+One stdlib Python script is the runnable form of stages 2–5 for a BEIR
+corpus. It wraps `corpus.jsonl` into gzip-member WARC response records (one
+synthetic host, `<title>` plus `<p>` text), writes a scratch config
+(`rank.weight = 0`, `api.page_size = 100`), runs `init`, `ingest`, `reindex`,
+then `search --json --no-diversity` per judged query, and computes nDCG@10,
+P@10 and R@100 itself with the trec_eval formulas. No daemon, no
+`ir_measures`, no dependency beyond Python 3.
+
+```console
+$ curl -LO https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip
+$ unzip scifact.zip
+$ cargo build --release
+$ python3 tools/beir_eval.py --corpus scifact
+$ python3 tools/beir_eval.py --corpus trec-covid --out results.json
+```
+
+Conditions (§6): centrality weight 0, so the number is pure text relevance;
+near-duplicate collapse on, because that is the served system and the CLI
+has no toggle; host diversity off, because every synthetic document shares
+one host and the cap would hide all but two hits. `--limit N` builds a smoke
+corpus, `--reuse` re-queries a built work directory, `--self-test` checks
+the metric math. Skipped documents (the `lang` and `empty` gates) are part
+of the system under test and simply never appear.
+
+nDCG@k and P@k are scored on a page of exactly k results (`api.page_size =
+k`): the page a user of a k-per-page instance actually sees, which the
+near-duplicate collapse can leave short, and what the §6 protocol implies.
+R@100 comes from a second query pass at page size 100; `--depth` changes k.
+
+Baseline, v0.4.0 release binary, 2026-09-21:
+
+| corpus | indexed | nDCG@10 | P@10 | R@100 | zero-hit | relaxed | §10 recorded |
+|---|---|---|---|---|---|---|---|
+| SciFact, 300 queries | 5,180 / 5,183 | 0.6047 | 0.0803 | 0.8778 | 0 | 284 | 0.608 / 0.080 / 0.878 |
+| TREC-COVID, 50 topics | 164,868 / 171,332 | 0.4553 | 0.456 | 0.059 | 0 | 35 | 0.4353 / 0.466 |
+
+SciFact reproduces within noise. TREC-COVID does not quite: nDCG@10 is
+0.020 above the recorded number while P@10 is 0.010 below it, on a 50-topic
+set whose two recorded runs already differed by 0.004. The old harness is
+not in the repository, so the residual is unexplained; candidate causes are
+graded versus binary gains, the HTML wrapping of title and abstract, and a
+155-document difference in what indexed. This table is the baseline from
+here on; the §10 numbers stay as history.
+
+One finding fell out of getting the protocol right. Scored at page size 100
+(the first ten *visible* hits drawn from a hundred candidates), TREC-COVID
+reads nDCG@10 0.4983 and P@10 0.534 against 0.4553 / 0.456 at page size 10,
+while SciFact is unchanged. TREC-COVID is dense with near-duplicate preprint
+versions, and the serve-time collapse hides them from the page without
+backfilling from the next candidates, so a 10-result page often ships
+short. Backfilling collapsed slots (collect more candidates than the page,
+collapse, then cut to the page) is therefore a measurable ranking lever
+with a known ceiling on this corpus, and is queued in docs/ROADMAP.md.

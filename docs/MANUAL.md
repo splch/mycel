@@ -1118,6 +1118,13 @@ documents are re-indexed at boot.
 - Logs: stderr, `RUST_LOG` filter (default `info`). At info you get startup
   summaries, a crawl progress line every 60 s, shard seals, sync activity,
   and warnings. `RUST_LOG=debug` adds per-fetch and per-stream detail.
+- Query log: each API search emits one debug-level line on the
+  `mycel::queries` target with the query text, page, total, hit count, and
+  whether the all-terms pass had to relax. Off at the default `info`;
+  `RUST_LOG=info,mycel::queries=debug` turns on just that line. Local,
+  opt-in, stderr: redirect it to build a real query set for ranking work
+  (`tools/beir_eval.py` is the corpus-side half of that gate, see
+  docs/BENCHMARKING.md §11).
 - Liveness: `GET /healthz` (503 = storage pipeline unresponsive).
 - Metrics: `GET /stats` (gauges) plus `mycel status --json` (adds lifetime
   counters). Scrape either.
@@ -1304,7 +1311,7 @@ are decisions, not gaps):
 | variable | effect |
 |---|---|
 | `MYCEL_CONFIG` | Path to the config file (default `./mycel.toml`). |
-| `RUST_LOG` | Log filter (tracing `EnvFilter` syntax), default `info`. |
+| `RUST_LOG` | Log filter (tracing `EnvFilter` syntax), default `info`. `RUST_LOG=info,mycel::queries=debug` adds the per-query log line. |
 | `XDG_DATA_HOME` | Default data dir parent (`$XDG_DATA_HOME/mycel`) when `data_dir` is unset. |
 | `HOME` | Fallback data dir parent (`~/.local/share/mycel`) and `~/` expansion in `data_dir`. |
 

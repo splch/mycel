@@ -93,7 +93,32 @@ fn want_diversity(p: &SearchParams) -> bool {
     p.diversity.map(|v| v != 0).unwrap_or(true)
 }
 
+/// One API search, then a debug-level record of it on the `mycel::queries`
+/// target: the operator's own query log. Off at the default `info` level;
+/// `RUST_LOG=info,mycel::queries=debug` turns on just this line, so nothing
+/// is kept unless asked for (the privacy stance), and a real query set for
+/// ranking work is one redirect away.
 async fn run_search(
+    api: &Arc<Api>,
+    q: String,
+    page: usize,
+    federated: Option<u8>,
+    collapse: bool,
+    diversity: bool,
+) -> std::result::Result<search::Outcome, String> {
+    let shown = q.clone();
+    let out = run_search_inner(api, q, page, federated, collapse, diversity).await?;
+    tracing::debug!(
+        target: "mycel::queries",
+        "{shown:?} page={page} total={} hits={} relaxed={}",
+        out.total,
+        out.hits.len(),
+        out.relaxed
+    );
+    Ok(out)
+}
+
+async fn run_search_inner(
     api: &Arc<Api>,
     q: String,
     page: usize,
