@@ -175,6 +175,26 @@ fn admin_page_drives_the_node() {
     ]);
     assert_eq!(code, 303);
 
+    // Block the fixture's host through the form: its pages leave search
+    // within the commit interval (the form nudges the sweep).
+    let (code, _) = http(&[
+        "-X",
+        "POST",
+        "--data-urlencode",
+        &format!("t={token}"),
+        "--data-urlencode",
+        "hosts=www.marginalia.nu",
+        &format!("{api}/admin/block"),
+    ]);
+    assert_eq!(code, 303, "block redirects");
+    poll("blocked host's pages leave search", 30, || {
+        get_json(&format!("{api}/api/search?q=marginalia")).is_some_and(|v| {
+            v["hits"]
+                .as_array()
+                .is_some_and(|hits| hits.iter().all(|h| h["host"] != "www.marginalia.nu"))
+        })
+    });
+
     // Config editor: invalid TOML is rejected and the file is untouched...
     let cfg_url = format!("{api}/admin/config");
     let (code, body) = http(&[

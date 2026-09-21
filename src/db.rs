@@ -82,7 +82,7 @@ CREATE TABLE docs (                                -- current snapshot per URL; 
   http_status INTEGER NOT NULL,
   fetched_at  INTEGER NOT NULL,
   indexed     INTEGER NOT NULL DEFAULT 0,          -- 0=pending 1=indexed 2=skipped
-  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|redirect|error|dead (legacy DBs: dup-near)
+  skip_reason TEXT                                 -- dup-exact|lang|empty|noindex|redirect|error|dead|blocked (legacy DBs: dup-near)
 );
 CREATE INDEX docs_sha     ON docs (sha256);
 CREATE INDEX docs_pending ON docs (id) WHERE indexed = 0;
@@ -417,7 +417,8 @@ pub struct IngestRecord {
     pub http_status: u16,
     pub fetched_at: i64,
     pub noindex: bool,
-    /// An instant meta refresh: stored, links harvested, never indexed.
+    /// The page names another URL as the real one (instant meta refresh or
+    /// same-host canonical): stored, links harvested, never indexed.
     pub redirect: bool,
     pub extract: Option<crate::extract::Extracted>,
     pub links: Vec<(String, String, String)>,
@@ -807,7 +808,7 @@ fn recover(conn: &Connection) -> Result<()> {
 }
 
 /// `mycel reindex --online`: return every indexed or skipped document (dead
-/// pages excepted) to pending, in short transactions so it is safe beside a
+/// pages and blocked hosts excepted) to pending, in short transactions so it is safe beside a
 /// running daemon. The daemon's sweep then re-extracts each from WARC with
 /// today's gates, centrality, and anchor text; the existing index entries
 /// keep serving until each document is re-added (delete-before-add) or
@@ -819,7 +820,7 @@ pub fn requeue_indexed(conn: &Connection) -> Result<u64> {
             "UPDATE docs SET indexed = 0, skip_reason = NULL
              WHERE id IN (SELECT id FROM docs
                           WHERE indexed IN (1, 2)
-                            AND (skip_reason IS NULL OR skip_reason != 'dead')
+                            AND (skip_reason IS NULL OR skip_reason NOT IN ('dead', 'blocked'))
                           LIMIT 5000)",
             [],
         )?;
@@ -1397,7 +1398,8 @@ struct StoreDoc<'a> {
     payload_len: u64,
     sha256: &'a [u8; 32],
     noindex: bool,
-    /// An instant meta refresh: a shell for another URL, never indexed.
+    /// The page names another URL as the real one (instant meta refresh or
+    /// same-host canonical): a shell, never indexed.
     redirect: bool,
     extract: &'a Option<crate::extract::Extracted>,
     links: &'a [(String, String, String)],
@@ -1417,8 +1419,14 @@ fn store_doc(
     d: &StoreDoc,
 ) -> Result<()> {
     // Index-eligibility gates that need no tantivy state; dedup gates
-    // (sha/simhash) live in the indexer.
-    let (indexed, skip): (i64, Option<&str>) = if d.redirect {
+    // (sha/simhash) live in the indexer. A blocked host comes first: its
+    // pages are stored (WARC is the corpus) but never reach the index.
+    let host_state: i64 = tx
+        .prepare_cached("SELECT state FROM hosts WHERE id = ?1")?
+        .query_row([d.host_id], |r| r.get(0))?;
+    let (indexed, skip): (i64, Option<&str>) = if host_state == 2 {
+        (2, Some("blocked"))
+    } else if d.redirect {
         (2, Some("redirect"))
     } else if d.noindex {
         (2, Some("noindex"))
@@ -1826,8 +1834,8 @@ fn fail_permanent(tx: &Transaction, frontier_id: i64, reason: &str) -> Result<()
 pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> Result<(u64, u64)> {
     let (mut hosts_n, mut urls_n) = (0u64, 0u64);
     for (host, url) in entries {
-        // Seeding is also the re-activation path for breaker-blocked hosts:
-        // state back to 1, failure count cleared.
+        // Seeding is also the re-activation path for blocked hosts (breaker
+        // or `mycel block`): state back to 1, failure count cleared.
         conn.execute(
             "INSERT INTO hosts (host, state, added_at) VALUES (?1, 1, ?2)
              ON CONFLICT(host) DO UPDATE SET state = 1, consecutive_failures = 0",
@@ -1836,6 +1844,13 @@ pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> R
         hosts_n += 1;
         let host_id: i64 =
             conn.query_row("SELECT id FROM hosts WHERE host = ?1", [host], |r| r.get(0))?;
+        // Unblocking: documents retired as `blocked` go back to pending, and
+        // the sweep restores them to the index.
+        conn.execute(
+            "UPDATE docs SET indexed = 0, skip_reason = NULL
+             WHERE host_id = ?1 AND indexed = 2 AND skip_reason = 'blocked'",
+            [host_id],
+        )?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO frontier (host_id, url, kind, state, next_attempt_at, attempts,
                                              depth, discovered_at)
@@ -1855,11 +1870,50 @@ pub fn seed_into(conn: &Connection, now: i64, entries: &[(String, String)]) -> R
     Ok((hosts_n, urls_n))
 }
 
+/// The `mycel block` write: mark each host blocked (state 2: unclaimable,
+/// never indexed) and return its indexed documents to pending, so the
+/// indexer's sweep retires them under the `blocked` label. Unknown hosts are
+/// created blocked, so a spam domain can be shut out before it is ever
+/// linked. `seed` is the inverse. Shared by the CLI and the admin page.
+pub fn block_into(conn: &Connection, now: i64, hosts: &[String]) -> Result<(u64, u64)> {
+    let (mut hosts_n, mut docs_n) = (0u64, 0u64);
+    for host in hosts {
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES (?1, 2, ?2)
+             ON CONFLICT(host) DO UPDATE SET state = 2",
+            params![host, now],
+        )?;
+        hosts_n += 1;
+        let host_id: i64 =
+            conn.query_row("SELECT id FROM hosts WHERE host = ?1", [host], |r| r.get(0))?;
+        docs_n += conn.execute(
+            "UPDATE docs SET indexed = 0, skip_reason = NULL WHERE host_id = ?1 AND indexed = 1",
+            [host_id],
+        )? as u64;
+    }
+    Ok((hosts_n, docs_n))
+}
+
+/// The `mycel seed --top N` read: candidate hosts (state 0) by inbound
+/// webgraph edge weight, the cheapest signal for which discovered hosts are
+/// worth promoting.
+pub fn top_candidates(conn: &Connection, n: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT h.host FROM hosts h JOIN links l ON l.to_host = h.id
+         WHERE h.state = 0 GROUP BY h.id ORDER BY sum(l.cnt) DESC, h.host LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([n as i64], |r| r.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
 /// Record a candidate host + webgraph edge, and enqueue the URL if its host is
 /// active and under caps. The single admission point for every discovered URL.
 /// Pages and sitemaps draw on separate budgets (`urls_accepted` vs
-/// `sitemaps_accepted`), and obvious non-HTML assets are never admitted as
-/// pages: the content-type gate would reject them after a politeness turn.
+/// `sitemaps_accepted`); obvious non-HTML assets and trap-shaped URLs
+/// (`urlnorm::is_trap`) are never admitted as pages: the content-type gate
+/// would reject the former after a politeness turn, and the latter would
+/// spend the host's whole budget on one faceted listing.
 /// `due` seeds next_attempt_at on a fresh row (0 = immediately due; negative
 /// values sort earlier — the sitemap lastmod hint).
 #[allow(clippy::too_many_arguments)]
@@ -1896,7 +1950,7 @@ fn enqueue(
     let under_cap = if kind == 1 {
         sitemaps < MAX_SITEMAPS_PER_HOST
     } else {
-        if crate::urlnorm::is_binary_asset(url) {
+        if crate::urlnorm::is_binary_asset(url) || crate::urlnorm::is_trap(url) {
             return Ok(());
         }
         accepted < cfg.max_urls_per_host
@@ -2437,7 +2491,8 @@ mod tests {
                ('http://a.com/1', 1, 1, 0, 1, x'00', 200, 0, 1, NULL),
                ('http://a.com/2', 1, 1, 1, 1, x'01', 200, 0, 2, 'lang'),
                ('http://a.com/3', 1, 1, 2, 1, x'02', 200, 0, 2, 'dead'),
-               ('http://a.com/4', 1, 1, 3, 1, x'03', 200, 0, 0, NULL);",
+               ('http://a.com/4', 1, 1, 3, 1, x'03', 200, 0, 0, NULL),
+               ('http://a.com/5', 1, 1, 4, 1, x'04', 200, 0, 2, 'blocked');",
         )
         .unwrap();
         assert_eq!(requeue_indexed(&conn).unwrap(), 2);
@@ -2450,7 +2505,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             states,
-            vec![(0, None), (0, None), (2, Some("dead".into())), (0, None)]
+            vec![
+                (0, None),
+                (0, None),
+                (2, Some("dead".into())),
+                (0, None),
+                (2, Some("blocked".into()))
+            ]
         );
         assert_eq!(requeue_indexed(&conn).unwrap(), 0, "idempotent");
     }
@@ -3636,6 +3697,176 @@ mod tests {
         assert_eq!(touched, t + r);
         db.shutdown().await;
         handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trap_urls_are_never_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        seed(&conn, "example.com", "http://example.com/");
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), None).unwrap();
+        let t = now();
+        let job = db.claim(t, 1).await.pop().unwrap();
+        let mut c = stored_completion(&job, t * 1000, "hub");
+        if let Outcome::Stored(p) = &mut c.outcome {
+            p.links = [
+                "http://example.com/cat?a=1&b=2&c=3&d=4&e=5",
+                "http://example.com/x/y/x/y/x/page",
+                "http://example.com/fine",
+            ]
+            .iter()
+            .map(|u| (u.to_string(), "example.com".to_string(), "t".to_string()))
+            .collect();
+        }
+        db.complete(c).await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+        let conn = open(&db_path).unwrap();
+        let queued: Vec<String> = conn
+            .prepare("SELECT url FROM frontier WHERE url != 'http://example.com/' ORDER BY url")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(queued, vec!["http://example.com/fine".to_string()]);
+        let accepted: i64 = conn
+            .query_row("SELECT urls_accepted FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted, 1, "traps consume no budget");
+    }
+
+    #[test]
+    fn block_retires_indexed_docs_and_seed_restores_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('a.com', 1, 0);
+             INSERT INTO shards (name, origin_node, created_at) VALUES ('s', 'o', 0);
+             INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                               fetched_at, indexed, skip_reason) VALUES
+               ('http://a.com/1', 1, 1, 0, 1, x'00', 200, 0, 1, NULL),
+               ('http://a.com/2', 1, 1, 1, 1, x'01', 200, 0, 1, NULL),
+               ('http://a.com/3', 1, 1, 2, 1, x'02', 200, 0, 2, 'lang');",
+        )
+        .unwrap();
+        let labels = || -> Vec<(i64, Option<String>)> {
+            conn.prepare("SELECT indexed, skip_reason FROM docs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let (hosts_n, docs_n) =
+            block_into(&conn, 0, &["a.com".into(), "spam.example".into()]).unwrap();
+        assert_eq!((hosts_n, docs_n), (2, 2));
+        assert_eq!(host_row(&conn, "a.com").0, 2);
+        assert_eq!(
+            host_row(&conn, "spam.example").0,
+            2,
+            "unknown hosts are created blocked"
+        );
+        assert_eq!(
+            labels(),
+            vec![(0, None), (0, None), (2, Some("lang".into()))],
+            "indexed docs return to pending for the sweep to retire; other skips stay"
+        );
+        // The sweep retires them; unblocking through seed brings them back.
+        conn.execute(
+            "UPDATE docs SET indexed = 2, skip_reason = 'blocked' WHERE indexed = 0",
+            [],
+        )
+        .unwrap();
+        seed_into(&conn, 0, &[("a.com".into(), "https://a.com/".into())]).unwrap();
+        assert_eq!(host_row(&conn, "a.com"), (1, 0));
+        assert_eq!(
+            labels(),
+            vec![(0, None), (0, None), (2, Some("lang".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_host_pages_are_stored_but_never_forwarded_to_the_indexer() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.sqlite");
+        let conn = open(&db_path).unwrap();
+        block_into(&conn, 0, &["blocked.example".into()]).unwrap();
+        drop(conn);
+        let conn = open(&db_path).unwrap();
+        let (itx, irx) = std::sync::mpsc::channel::<IndexMsg>();
+        let (db, handle) =
+            spawn_writer(conn, test_warc_init(dir.path()), test_cfg(), Some(itx)).unwrap();
+        let payload = b"<html><head><title>Spam</title></head><body>buy now words</body></html>";
+        let sha: [u8; 32] = sha2::Sha256::digest(payload).into();
+        let member = warc::gzip_member(&warc::build_response_record(
+            "http://blocked.example/",
+            1_700_000_000,
+            b"seed",
+            b"HTTP/1.1 200 OK",
+            payload,
+            &hex::encode(sha),
+            false,
+        ));
+        db.ingest(IngestRecord {
+            url: "http://blocked.example/".into(),
+            host: "blocked.example".into(),
+            location: IngestLocation::Append { member },
+            payload_len: payload.len() as u64,
+            sha256: sha,
+            http_status: 200,
+            fetched_at: 1_700_000_000,
+            noindex: false,
+            redirect: false,
+            extract: Some(crate::extract::Extracted {
+                title: "Spam".into(),
+                text: "buy now words".into(),
+                lang: "en",
+                simhash: 7,
+            }),
+            links: vec![],
+        })
+        .await;
+        db.flush().await;
+        db.shutdown().await;
+        handle.join().unwrap();
+        let conn = open(&db_path).unwrap();
+        let (indexed, reason): (i64, Option<String>) = conn
+            .query_row("SELECT indexed, skip_reason FROM docs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (indexed, reason.as_deref()),
+            (2, Some("blocked")),
+            "stored, never indexed"
+        );
+        assert!(irx.try_recv().is_err(), "nothing was sent to the indexer");
+    }
+
+    #[test]
+    fn top_candidates_rank_by_inbound_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (host, state, added_at) VALUES
+               ('seed.com', 1, 0), ('popular.org', 0, 0), ('niche.org', 0, 0),
+               ('active.org', 1, 0), ('orphan.org', 0, 0);
+             INSERT INTO links (from_host, to_host, cnt) VALUES
+               (1, 2, 5), (4, 2, 3), (1, 3, 1), (1, 4, 9);",
+        )
+        .unwrap();
+        assert_eq!(
+            top_candidates(&conn, 10).unwrap(),
+            vec!["popular.org", "niche.org"]
+        );
+        assert_eq!(top_candidates(&conn, 1).unwrap(), vec!["popular.org"]);
     }
 
     #[tokio::test]

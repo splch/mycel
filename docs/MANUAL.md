@@ -340,7 +340,7 @@ node id and data dir. Idempotent: existing files are never overwritten.
 Print this node's endpoint id (64 hex chars). This is the string peers paste
 into their `[[federation.peers]]` blocks. Errors if `init` has not run.
 
-### `mycel seed <host|url>... [--from-file F]`
+### `mycel seed <host|url>... [--from-file F] [--top N]`
 
 Promote hosts to *active* (crawlable) and enqueue starting URLs, in one
 transaction:
@@ -352,10 +352,32 @@ transaction:
 - `--from-file F` reads one entry per line; blank lines and `#` comments are
   ignored. File entries and positional entries can be mixed.
 
+- `--top N` also promotes the N *candidate* hosts with the most inbound
+  webgraph edges (hosts discovered through links but never crawled), and
+  enqueues their roots. This is how a curated corpus grows along the links
+  it has already seen; run it after a crawl, review `mycel status`, repeat.
+
 Already-known hosts are switched to active; already-known URLs are left
 untouched. Prints `activated N hosts, enqueued M urls`. Seeding is a short
 SQLite write and is safe while the daemon runs; the crawler picks the new
-rows up on its next scheduling pass.
+rows up on its next scheduling pass. Seeding a blocked host (see `block`)
+re-activates it and returns its retired documents to the index.
+
+### `mycel block <host|url>...`
+
+Block hosts: each becomes state 2 (never claimed by the crawler, never
+indexed) and its indexed documents are returned to pending, so the
+indexer's next sweep removes them from the search index under the skip
+reason `blocked`. A bare name or a full URL names the host; unknown hosts
+are created blocked, so a spam domain can be shut out before it is ever
+linked. Their WARC records stay (the archive is the corpus), and their
+webgraph edges stay.
+
+The sweep runs within five minutes inside a running daemon (the admin form
+nudges it immediately), or run `mycel reindex --missing` with the daemon
+stopped to retire them at once; a full `reindex` keeps blocked hosts out.
+`mycel seed <host>` is the inverse. Safe beside the daemon (a short write
+transaction), like `seed`.
 
 ### `mycel crawl [--limit N]`
 
@@ -591,7 +613,8 @@ cooldown is the probe. A dead peer therefore costs at most one
 ### `GET /admin` (the admin page)
 
 Server-rendered forms that expose the CLI against the running daemon:
-node identity and status (the `mycel id` / `mycel status` gauges), `seed`,
+node identity and status (the `mycel id` / `mycel status` gauges), `seed`
+(including the top-N candidate promotion), `block`,
 `rank [--force]`, `ingest`, `bootstrap`, an "index pending docs" button
 (= `reindex --missing`), a "re-index everything online" button
 (= `reindex --online`), `peers check`, and a `mycel.toml` editor. Long
@@ -711,7 +734,17 @@ and just refreshes the timestamp. Outcomes:
 A robots-disallowed URL is marked permanently failed without any HTTP
 request, and the host's turn is not consumed.
 
-**Redirects** are followed manually, at most 5 hops:
+**Redirects** are followed manually, at most 5 hops. A `<link rel=canonical>`
+naming a different URL on the same host is a redirect by other means and
+takes the same path (hop budget included): the alias page itself is never
+stored or indexed, only the canonical URL is. Cross-host canonicals are
+ignored (the page stays a page), and a self-canonical is a no-op. Shells
+that reach the store through `ingest` or a peer are kept but skipped as
+`redirect`, with the canonical target harvested as a link. The known cost is
+a misconfigured site whose every page canonicals to its homepage: those
+pages collapse into one.
+
+Plain HTTP redirects:
 
 - Same-host: followed within the same request, each hop re-checked against
   robots (a hop into disallowed space fails the URL permanently).
@@ -769,12 +802,17 @@ crawled until seeded. Same-host links are enqueued while the host is under
 non-HTML extension (images, media, fonts, archives, PDFs and office
 documents, scripts, stylesheets, feeds, data files) still count as webgraph
 edges but are never enqueued; requests carry an `Accept` header that
-prefers HTML.
+prefers HTML. Trap-shaped URLs are never enqueued either: more than 12 path
+segments, a path segment repeated more than twice, or more than 4 query
+parameters mark the URL as faceted navigation, a calendar, or a
+self-referential path that would spend the host's whole budget on one
+listing. These limits are fixed, not configurable.
 
 **URL normalization.** http(s) only; ≤ 2048 chars; fragments, credentials
 dropped; default ports dropped; host lowercased and punycoded; dot-segments
 collapsed; query strings kept byte-for-byte except the tracking parameters
-`utm_*`, `gclid`, `fbclid`, `msclkid`, which are stripped.
+`utm_*`, `gclid`, `fbclid`, `msclkid`, and the session ids `phpsessid`,
+`jsessionid`, `sessionid` (any case), which are stripped.
 
 **Sitemaps.** Sitemap jobs share the host's politeness budget. Gzip sitemaps
 are supported (10 MiB compressed download cap, 50 MiB decompressed cap);
@@ -1029,7 +1067,7 @@ shard, so a second one refuses to start instead.
 | `run`, `crawl` | everything | one of these at a time |
 | `bootstrap --records`, `ingest`, `reindex --missing` | WARC + db + index | refused as a second process (writer-lock probe); use the admin page instead |
 | `reindex` (full) | index + db | refuses by itself (writer-lock probe) |
-| `seed`, `bootstrap --hosts`, `rank`, `reindex --online` | db (short write txns) | yes |
+| `seed`, `block`, `bootstrap --hosts`, `rank`, `reindex --online` | db (short write txns) | yes |
 | `search`, `status`, `id`, `peers check` | read-only | yes |
 | external `sqlite3` reads | db read | yes (WAL) |
 
@@ -1178,8 +1216,10 @@ chars of extracted text and no usable title), `dup-exact` (another URL is
 already indexed with the same bytes), `noindex` (the page or its response
 headers opted out), `dead` (the URL failed permanently on a later fetch),
 `error` (an unreadable record; `reindex` retries these), `redirect` (an
-instant meta-refresh shell for another URL). Near-duplicates are never
-skipped: they index and collapse at search time.
+instant meta-refresh shell, or a page whose canonical is another URL on the
+same host), `blocked` (the host was blocked with `mycel block`; `seed`
+restores). Near-duplicates are never skipped: they index and collapse at
+search time.
 
 **`the index is in use; stop 'mycel run'/'crawl' before reindexing`** —
 exactly what it says; only one process may hold the index writer.
@@ -1232,6 +1272,7 @@ Fixed caps (not configurable) in v1:
 | sitemap: compressed / decompressed / locations | 10 MiB / 50 MiB / 50 000 |
 | sitemap jobs per host | 20 |
 | inbound anchor texts kept per URL | 64 |
+| trap limits: path segments / repeats of one segment / query parameters | 12 / 2 / 4 |
 | retry attempts: 429 and 503 / other errors | 5 / 3 |
 | federation frame | 4 MiB |
 | federation query / results per peer | 1 KiB / 50 hits |
@@ -1255,7 +1296,8 @@ are decisions, not gaps):
 - No auth/TLS on the HTTP API (bind it locally or proxy it; the admin page's
   CSRF token and Host check only stop cross-site browser attacks), no
   per-request page size, no live config reload (the admin editor writes the
-  file; restart to apply), no host blocklist tooling, no deletion workflow.
+  file; restart to apply), no per-URL deletion workflow (`block` works at
+  host granularity).
 
 ## Appendix A: environment variables
 

@@ -59,6 +59,7 @@ pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Resu
         .route("/stats", get(stats))
         .route("/admin", get(crate::admin::page))
         .route("/admin/seed", post(crate::admin::seed))
+        .route("/admin/block", post(crate::admin::block))
         .route("/admin/sweep", post(crate::admin::sweep))
         .route("/admin/reindex", post(crate::admin::reindex_online))
         .route("/admin/rank", post(crate::admin::rank_job))

@@ -176,9 +176,12 @@ pub async fn page(
 pub struct SeedForm {
     t: String,
     entries: String,
+    /// `--top N`: also promote the N candidate hosts with most inbound links.
+    #[serde(default)]
+    top: Option<String>,
 }
 
-/// = `mycel seed` (and `--from-file`: paste the file).
+/// = `mycel seed [--top N]` (and `--from-file`: paste the file).
 pub async fn seed(
     State(api): State<Arc<Api>>,
     headers: HeaderMap,
@@ -198,12 +201,86 @@ pub async fn seed(
             Err(e) => return redirect_err(&e),
         }
     }
+    if let Some(n) = f.top.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let Ok(n) = n.parse::<usize>() else {
+            return redirect_err("top must be a whole number");
+        };
+        let db_path = api.admin.data_dir.join("mycel.sqlite");
+        let hosts = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            db::top_candidates(&db::open(&db_path)?, n)
+        })
+        .await;
+        match hosts {
+            Ok(Ok(hosts)) => {
+                for h in hosts {
+                    match urlnorm::parse_seed_entry(&h) {
+                        Ok(p) => pairs.push(p),
+                        Err(e) => return redirect_err(&e),
+                    }
+                }
+            }
+            Ok(Err(e)) => return redirect_err(&format!("candidate lookup failed: {e}")),
+            Err(e) => return redirect_err(&format!("candidate lookup panicked: {e}")),
+        }
+    }
     if pairs.is_empty() {
-        return redirect_err("nothing to seed; one host or URL per line");
+        return redirect_err("nothing to seed; one host or URL per line, or a top-N count");
     }
     match api.db.seed(pairs).await {
         Ok((h, u)) => redirect_msg(&format!("activated {h} hosts, enqueued {u} urls")),
         Err(e) => redirect_err(&format!("seed failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BlockForm {
+    t: String,
+    hosts: String,
+}
+
+/// = `mycel block`: hosts become unclaimable and their pages retire from the
+/// index. A short write transaction on its own connection, like the rank
+/// job; the sweep is nudged so the retirement lands within a commit interval.
+pub async fn block(
+    State(api): State<Arc<Api>>,
+    headers: HeaderMap,
+    Form(f): Form<BlockForm>,
+) -> Response {
+    if let Some(deny) = api.admin.deny(&headers, &f.t) {
+        return deny;
+    }
+    let mut hosts = Vec::new();
+    for line in f.hosts.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match urlnorm::parse_seed_entry(line) {
+            Ok((host, _)) => hosts.push(host),
+            Err(e) => return redirect_err(&e),
+        }
+    }
+    if hosts.is_empty() {
+        return redirect_err("nothing to block; one host or URL per line");
+    }
+    let db_path = api.admin.data_dir.join("mycel.sqlite");
+    let out = tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
+        let mut conn = db::open(&db_path)?;
+        let tx = conn.transaction()?;
+        let out = db::block_into(&tx, db::now(), &hosts)?;
+        tx.commit()?;
+        Ok(out)
+    })
+    .await;
+    match out {
+        Ok(Ok((h, d))) => {
+            let _ = api.admin.index_tx.send(IndexMsg::Sweep);
+            redirect_msg(&format!(
+                "blocked {h} hosts; {d} indexed documents are being retired by the sweep"
+            ))
+        }
+        Ok(Err(e)) => redirect_err(&format!("block failed: {e}")),
+        Err(e) => redirect_err(&format!("block task panicked: {e}")),
     }
 }
 
@@ -631,7 +708,12 @@ async fn render(
          <h2>seed</h2>\
          <form method=post action=/admin/seed>{tok}\
            <textarea name=entries rows=4 aria-label=entries placeholder=\"blog.example.org or https://docs.example.org/guide/, one per line; # comments ignored\"></textarea>\
-           <button>seed</button> <small>= mycel seed</small></form>\
+           <label>also promote the top <input type=number name=top min=1 aria-label=\"top candidates\" placeholder=\"N\"> candidate hosts by inbound links</label> \
+           <button>seed</button> <small>= mycel seed [--top N]</small></form>\
+         <h2>block</h2>\
+         <form method=post action=/admin/block>{tok}\
+           <textarea name=hosts rows=2 aria-label=hosts placeholder=\"spam.example or https://spam.example/, one per line\"></textarea>\
+           <button>block</button> <small>= mycel block: never crawled, pages leave the index at the next sweep; seed re-activates</small></form>\
          <h2>peers</h2>{peers}\
          <h2>mycel.toml</h2>\
          <form method=post action=/admin/config>{tok}\

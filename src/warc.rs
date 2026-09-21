@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub static FAIL_FLUSH_ONCE_FOR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
+/// Test seam: make the next `ShardFile::append_member` of exactly this path
+/// land half the member and then fail, the shape of a short write at the
+/// moment a disk fills.
+#[cfg(test)]
+pub static FAIL_WRITE_ONCE_FOR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 // ---------------------------------------------------------------- records --
 
 /// A parsed WARC record: headers + raw record block.
@@ -371,10 +377,44 @@ impl ShardFile {
     /// (shards.bytes) — the db-writer flushes once per dirty batch.
     pub fn append_member(&mut self, member: &[u8]) -> Result<(u64, u64)> {
         let offset = self.end;
-        self.file.write_all(member)?;
+        if let Err(e) = self.write_member(member) {
+            self.cut_back();
+            return Err(e);
+        }
         self.end += member.len() as u64;
         self.records += 1;
         Ok((offset, member.len() as u64))
+    }
+
+    fn write_member(&mut self, member: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut hook = FAIL_WRITE_ONCE_FOR.lock().expect("test hook");
+            if hook.as_ref() == Some(&self.path) {
+                *hook = None;
+                drop(hook);
+                self.file.write_all(&member[..member.len() / 2])?;
+                return Err("injected short write".into());
+            }
+        }
+        self.file.write_all(member)?;
+        Ok(())
+    }
+
+    /// A failed append may have left part of the member in the file with the
+    /// cursor after it, while `end` never moved. Cut the file back and reseat
+    /// the cursor, so the next append lands exactly at `end` and no later
+    /// watermark can cover bytes that no catalog row describes.
+    fn cut_back(&mut self) {
+        let truncated = self.file.set_len(self.end);
+        let seated = self.file.seek(SeekFrom::Start(self.end)).map(drop);
+        if let Err(e) = truncated.and(seated) {
+            tracing::error!(
+                "cannot cut {} back to {} after a failed append: {e}",
+                self.path.display(),
+                self.end
+            );
+        }
     }
 
     /// Fsync everything appended so far. The watermark protocol's ordering
@@ -636,6 +676,35 @@ mod tests {
         // The next append continues exactly at the durable point.
         let (o, _) = shard.append_member(&member).unwrap();
         assert_eq!(o, l);
+        let items: Vec<_> = MemberIter::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn failed_append_cuts_back_to_the_logical_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t-000001.warc.gz");
+        let mut shard = ShardFile::create(path.clone()).unwrap();
+        let member = gzip_member(&sample_record());
+        let (_, l) = shard.append_member(&member).unwrap();
+        // The next write lands half the member, then fails.
+        *FAIL_WRITE_ONCE_FOR.lock().unwrap() = Some(path.clone());
+        assert!(shard.append_member(&member).is_err());
+        assert_eq!((shard.end, shard.records), (l, 1), "logical end unchanged");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            l,
+            "the partial member is cut off"
+        );
+        // The retry lands exactly at the logical end and is readable there.
+        let (o, l2) = shard.append_member(&member).unwrap();
+        assert_eq!(o, l);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), l + l2);
+        let rec = read_member_at(&path, o, l2).unwrap();
+        assert_eq!(rec.target_uri(), Some("http://example.com/"));
         let items: Vec<_> = MemberIter::open(&path)
             .unwrap()
             .map(|r| r.unwrap())

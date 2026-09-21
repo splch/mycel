@@ -21,10 +21,11 @@ pub struct PageMeta {
     /// Empty when the page declares nofollow.
     pub links: Vec<(String, String, String)>,
     pub noindex: bool,
-    /// An instant meta refresh (`content="0; url=..."`) pointing elsewhere:
-    /// (normalized target, host key). The page is a shell for its target and
-    /// is treated like a 3xx by the crawler, and never indexed by anyone.
-    pub refresh: Option<(String, String)>,
+    /// The page names another URL as the real one: an instant meta refresh
+    /// (`content="0; url=..."`) to anywhere, or a `<link rel=canonical>` to
+    /// the same host. (normalized target, host key). The crawler treats it
+    /// like a 3xx, and no path ever indexes the page itself.
+    pub redirect: Option<(String, String)>,
 }
 
 pub struct Extracted {
@@ -157,7 +158,7 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHea
     }
     // An instant meta refresh is a redirect in disguise; a delayed one is
     // content (live scoreboards, dashboards) and stays a page.
-    let mut refresh = None;
+    let mut redirect = None;
     for m in doc.select("meta[http-equiv][content]").iter() {
         if !m
             .attr("http-equiv")
@@ -172,7 +173,32 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHea
             && let Some(host) = crate::urlnorm::host_of(&norm)
             && norm != final_url.as_str()
         {
-            refresh = Some((norm, host));
+            redirect = Some((norm, host));
+            break;
+        }
+    }
+    // A same-host canonical says the same thing in another vocabulary: the
+    // real page is over there. Cross-host canonicals are left alone (honoring
+    // them would drop syndicated copies whose original is out of scope); a
+    // self-canonical, the common case, is a no-op.
+    if redirect.is_none() {
+        let own_host = crate::urlnorm::host_of(final_url.as_str());
+        for l in doc.select("link[rel][href]").iter() {
+            let rel = l.attr("rel").unwrap_or_default();
+            if !rel
+                .split_ascii_whitespace()
+                .any(|r| r.eq_ignore_ascii_case("canonical"))
+            {
+                continue;
+            }
+            let href = l.attr("href").unwrap_or_default();
+            if let Some(norm) = crate::urlnorm::normalize_rel(final_url, &href)
+                && let Some(host) = crate::urlnorm::host_of(&norm)
+                && Some(&host) == own_host.as_ref()
+                && norm != final_url.as_str()
+            {
+                redirect = Some((norm, host));
+            }
             break;
         }
     }
@@ -208,7 +234,7 @@ fn links_and_meta_doc(final_url: &Url, doc: &dom_query::Document, hdr: RobotsHea
     PageMeta {
         links,
         noindex,
-        refresh,
+        redirect,
     }
 }
 
@@ -526,7 +552,7 @@ mod tests {
                       <body>Redirecting...</body></html>"#;
         let a = analyze("http://example.com/moved", html, RobotsHeader::default()).unwrap();
         assert_eq!(
-            a.meta.refresh,
+            a.meta.redirect,
             Some((
                 "http://example.com/landing".to_string(),
                 "example.com".to_string()
@@ -535,10 +561,60 @@ mod tests {
         let html = r#"<html><head><meta http-equiv="refresh" content="30"></head>
                       <body>Live scores</body></html>"#;
         let a = analyze("http://example.com/live", html, RobotsHeader::default()).unwrap();
-        assert!(a.meta.refresh.is_none());
+        assert!(a.meta.redirect.is_none());
         let html = r#"<html><head><meta http-equiv="refresh" content="0; url=http://example.com/moved"></head></html>"#;
         let a = analyze("http://example.com/moved", html, RobotsHeader::default()).unwrap();
-        assert!(a.meta.refresh.is_none(), "a self-refresh is not a redirect");
+        assert!(
+            a.meta.redirect.is_none(),
+            "a self-refresh is not a redirect"
+        );
+    }
+
+    #[test]
+    fn canonical_is_a_redirect_pointer() {
+        let a = |html: &str| {
+            analyze(
+                "http://example.com/dir/alias?x=1",
+                html,
+                RobotsHeader::default(),
+            )
+            .unwrap()
+            .meta
+            .redirect
+        };
+        let canon = Some((
+            "http://example.com/canon".to_string(),
+            "example.com".to_string(),
+        ));
+        assert_eq!(
+            a(r#"<html><head><link rel="canonical" href="/canon"></head><body>copy</body></html>"#),
+            canon
+        );
+        assert_eq!(
+            a(r#"<link REL="alternate Canonical" href="../canon">"#),
+            canon,
+            "rel is a token list, matched case-insensitively"
+        );
+        assert_eq!(
+            a(r#"<link rel="canonical" href="http://example.com/dir/alias?x=1">"#),
+            None,
+            "a self-canonical is a no-op"
+        );
+        assert_eq!(
+            a(r#"<link rel="canonical" href="https://other.org/original">"#),
+            None,
+            "cross-host canonicals are ignored: the page stays a page"
+        );
+        assert_eq!(
+            a(
+                r#"<meta http-equiv="refresh" content="0; url=/go"><link rel="canonical" href="/canon">"#
+            ),
+            Some((
+                "http://example.com/go".to_string(),
+                "example.com".to_string()
+            )),
+            "an instant refresh wins: it is what the browser would follow"
+        );
     }
 
     #[test]

@@ -42,7 +42,8 @@ refuses to run until `crawl.contact_url` identifies you.
 |---|---|
 | `init` | create config, data dir, database, `identity.key` |
 | `id` | print this node's endpoint id (paste into peers' configs) |
-| `seed <host\|url>… [--from-file F]` | activate hosts + enqueue roots |
+| `seed <host\|url>… [--from-file F] [--top N]` | activate hosts + enqueue roots; `--top N` promotes the N most-linked candidate hosts |
+| `block <host\|url>…` | block hosts: never crawled, their pages leave the index (`seed` re-activates) |
 | `crawl [--limit N]` | crawl + index until the frontier drains |
 | `run` | daemon: crawler + indexer + HTTP API |
 | `search <q> [--json] [--federated] [--no-diversity]` | one-shot query (`site:host` filters work) |

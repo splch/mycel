@@ -247,6 +247,89 @@ conditional robots request and gets a 304.
 
 ---
 
+## Phase 7 — Crawl hygiene and control
+
+**Status: shipped 2026-09-21.** The first of the phases toward a short,
+simple, complete, and correct engine (Phases 8–11 below are planned). Each
+bites the moment a real site is seeded, and none depends on measurement.
+
+**Best-practice basis.** Mercator/IRLbot trap heuristics; RFC 6596
+(`rel=canonical`); every production engine's host blocklist.
+
+**Work.**
+
+1. *Watermark fix.* A WARC append that failed after a partial write left
+   the file cursor past the logical end, so a daemon that kept running
+   recorded wrong offsets for every later member. `ShardFile::append_member`
+   now cuts the file back to `end` and reseats the cursor on any write
+   error (`cut_back`); a test seam injects the short write.
+2. *Trap admission rules.* `urlnorm::is_trap` rejects, at `enqueue`, URLs
+   with more than 12 path segments, a segment repeated more than twice, or
+   more than 4 query parameters; normalization strips `phpsessid`,
+   `jsessionid`, `sessionid`. Fixed limits with a test table, not config.
+3. *Canonical as a redirect.* A same-host `<link rel=canonical>` naming a
+   different URL sets the same `PageMeta.redirect` pointer an instant meta
+   refresh sets, so it inherits the hop budget, the robots re-check, the
+   cross-host handling, and the ingest-side `redirect` skip. Cross-host
+   canonicals are ignored; a self-canonical is a no-op.
+4. *Block and unblock.* `mycel block <host|url>…` (and the admin form) sets
+   state 2 and returns the host's indexed documents to pending; `store_doc`,
+   the sweep, and the full rebuild retire pages by host state under the new
+   `blocked` label without reading WARC; `seed` restores them.
+5. *Bulk promotion.* `seed --top N` (and the admin seed form) promotes the N
+   candidate hosts with the most inbound webgraph edges.
+
+**Tests.** Unit: `failed_append_cuts_back_to_the_logical_end`,
+`trap_filter`, `canonical_is_a_redirect_pointer`, `trap_urls_are_never_admitted`,
+`block_retires_indexed_docs_and_seed_restores_them`,
+`blocked_host_pages_are_stored_but_never_forwarded_to_the_indexer`,
+`top_candidates_rank_by_inbound_edges`, plus the rebuild and sweep tests
+gaining a blocked host. Integration: the fixture site gained trap links, a
+canonical alias, and an off-host candidate; the crawl indexes one copy and
+never enters the traps; `block` → `reindex --missing` retires the host's
+pages, a full `reindex` keeps them out, `seed` + `reindex --missing` restores
+them, `seed --top 1` promotes the candidate; the admin block form retires
+pages within the commit interval.
+
+**Ranking gate.** No scoring, schema, or rank change: goldens and qrels
+untouched.
+
+---
+
+## Planned: Phases 8–11
+
+Sorting principle: every item must fix something wrong, close a gap a real
+deployment hits, or make a change measurable; anything speculative, any new
+dependency, and any new concept an existing one can carry is out. Cut on
+those grounds: PDFs (a dependency and a second extraction pipeline), feeds
+(a job kind for a freshness gain Phase 10 delivers more simply), page-level
+quality features and the full `bench/` layout (speculative until Phase 8),
+per-URL takedown (`block` covers spam at host granularity).
+
+- **Phase 8 — the measurement gate, completed.** One stdlib Python script in
+  `tools/` that wraps a BEIR corpus into gzip-member WARC, writes a scratch
+  config with `rank.weight = 0`, runs `init`/`ingest`/`reindex`/`search
+  --json`, and computes nDCG@10 itself (no ir_measures, no daemon); plus a
+  debug-level tracing line per query. Acceptance: reproduces the
+  TREC-COVID and SciFact numbers in docs/BENCHMARKING.md §10 within noise.
+- **Phase 9 — ranking levers, one experiment at a time, one schema bump.**
+  True minimum-should-match as the first rung
+  (`BooleanQuery::with_minimum_required_clauses`, threshold part of the
+  experiment, disjunctive retry kept); a sloppy phrase clause for term
+  proximity; a tokenized domain field for navigational queries; English
+  stop words before stemming. Each measured on the Phase 8 harness plus the
+  in-tree qrels before it ships; the two schema changes ship together;
+  goldens regenerated once and reviewed.
+- **Phase 10 — conditional recrawl.** Schema v8 stores ETag/Last-Modified
+  per document; the first hop sends them (not hops after a redirect, as
+  robots fetches do); a 304 is handled before the 3xx branch and maps onto
+  `Outcome::Unchanged`. Acceptance: a fixture 304 writes no WARC member and
+  stretches the interval.
+- **Phase 11 — serving polish, optional.** An OpenSearch description and
+  its link tag.
+
+---
+
 ## Explicitly out of scope (re-affirmed anti-features)
 
 - JS rendering, vector/semantic search, fuzzy-by-default (RESEARCH.md §9).

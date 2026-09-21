@@ -2,9 +2,15 @@ use url::Url;
 
 const MAX_URL_LEN: usize = 2048;
 
-/// Tracking parameters stripped during normalization (plus any `utm_*`).
+/// Query parameters stripped during normalization: click trackers (plus any
+/// `utm_*`) and the unambiguous session ids, which mint a fresh URL per
+/// visitor for the same page.
 fn is_tracking_param(key: &str) -> bool {
-    key.starts_with("utm_") || matches!(key, "gclid" | "fbclid" | "msclkid")
+    key.starts_with("utm_")
+        || matches!(key, "gclid" | "fbclid" | "msclkid")
+        || ["phpsessid", "jsessionid", "sessionid"]
+            .iter()
+            .any(|s| key.eq_ignore_ascii_case(s))
 }
 
 /// Normalize an absolute URL for crawling and dedup.
@@ -94,6 +100,36 @@ pub fn is_binary_asset(url: &str) -> bool {
     BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
 }
 
+/// Crawler-trap limits, applied at admission like the asset filter. Faceted
+/// navigation, calendars, and self-referential paths mint unbounded URLs on
+/// one host; these caps bound the damage before a politeness turn is spent
+/// on any of them. Constants, not config: they describe what a page URL
+/// never legitimately looks like, and the tests pin them.
+const MAX_PATH_SEGMENTS: usize = 12;
+const MAX_SEGMENT_OCCURRENCES: usize = 2;
+const MAX_QUERY_PARAMS: usize = 4;
+
+/// Does the URL have the shape of a crawler trap: too many path segments, one
+/// segment repeated more than twice, or too many query parameters?
+pub fn is_trap(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    let segments: Vec<&str> = u
+        .path_segments()
+        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+        .unwrap_or_default();
+    if segments.len() > MAX_PATH_SEGMENTS {
+        return true;
+    }
+    for seg in &segments {
+        if segments.iter().filter(|s| *s == seg).count() > MAX_SEGMENT_OCCURRENCES {
+            return true;
+        }
+    }
+    u.query_pairs().count() > MAX_QUERY_PARAMS
+}
+
 /// One `mycel seed` entry, from the CLI or the admin page: a bare host name
 /// (enqueues its https root) or a full URL. Returns (host key, normalized URL).
 pub fn parse_seed_entry(entry: &str) -> std::result::Result<(String, String), String> {
@@ -160,6 +196,12 @@ mod tests {
                 Some("http://e.com/?q=rust"),
             ),
             ("http://e.com/?gclid=abc", Some("http://e.com/")),
+            // session ids stripped too, whatever their case
+            (
+                "http://e.com/?PHPSESSID=abc123&q=1",
+                Some("http://e.com/?q=1"),
+            ),
+            ("http://e.com/?jsessionid=1", Some("http://e.com/")),
             (
                 "http://e.com/?fbclid=1&msclkid=2&utm_campaign=3",
                 Some("http://e.com/"),
@@ -247,6 +289,27 @@ mod tests {
             "http://e.com/.hidden",
         ] {
             assert!(!is_binary_asset(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn trap_filter() {
+        for u in [
+            "http://e.com/a/b/c/d/e/f/g/h/i/j/k/l/m", // 13 segments
+            "http://e.com/x/y/x/y/x/page",            // x three times
+            "http://e.com/cat?a=1&b=2&c=3&d=4&e=5",   // 5 params
+        ] {
+            assert!(is_trap(u), "{u}");
+        }
+        for u in [
+            "http://e.com/",
+            "http://e.com/a/b/c/d/e/f/g/h/i/j/k/l", // 12 segments
+            "http://e.com/x/y/x/page",              // x twice
+            "http://e.com/cat?a=1&b=2&c=3&d=4",     // 4 params
+            "http://e.com/2026/09/21/post/",        // trailing slash is not a segment
+            "http://e.com/download?file=x.zip",
+        ] {
+            assert!(!is_trap(u), "{u}");
         }
     }
 

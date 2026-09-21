@@ -14,6 +14,14 @@ const DEEP_PHRASE: &str = "reached-through-header-noindex-page";
 const SHELL_PHRASE: &str = "meta-refresh-shell-text";
 /// Lives on the page that shell refreshes to.
 const LANDING_PHRASE: &str = "landing-after-meta-refresh";
+/// Lives behind crawler-trap URLs (faceted query, repeated segments, absurd
+/// depth): never admitted, so never fetched.
+const TRAP_PHRASE: &str = "crawler-trap-sentinel";
+/// Body text of a page whose canonical names /canon.html: followed like a
+/// redirect, the alias itself never stored.
+const ALIAS_PHRASE: &str = "canonical-alias-text";
+/// Lives on the canonical page.
+const CANON_PHRASE: &str = "canonical-target-text";
 
 /// Distinct filler per page: byte-identical filler across pages would be
 /// exact-duplicated (sha256) and never index.
@@ -81,7 +89,10 @@ fn serve_fixture(listener: TcpListener) {
                 page_with(
                     "Home",
                     1,
-                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a> <a href=\"/tagged.html\">t</a> <a href=\"/moved.html\">m</a>",
+                    "<a href=\"/a.html\">a</a> <a href=\"/b.html\">b</a> <a href=\"/secret/x.html\">s</a> <a href=\"/tagged.html\">t</a> <a href=\"/moved.html\">m</a> \
+                     <a href=\"/alias.html\">c</a> <a href=\"/cat?a=1&amp;b=2&amp;c=3&amp;d=4&amp;e=5\">f</a> \
+                     <a href=\"/x/y/x/y/x/page\">r</a> <a href=\"/d/1/2/3/4/5/6/7/8/9/10/11/12\">d</a> \
+                     <a href=\"http://other.invalid/\">o</a>",
                 ),
             ),
             "/a.html" => (
@@ -139,6 +150,32 @@ fn serve_fixture(listener: TcpListener) {
                 "text/html",
                 "",
                 page_with("Landing", 8, &format!("<p>{LANDING_PHRASE}</p>")),
+            ),
+            // A canonical pointing elsewhere on the host is followed like a
+            // redirect; the alias itself is never stored.
+            "/alias.html" => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with(
+                    "Alias",
+                    9,
+                    &format!("<link rel=\"canonical\" href=\"/canon.html\"><p>{ALIAS_PHRASE}</p>"),
+                ),
+            ),
+            "/canon.html" => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with("Canonical", 10, &format!("<p>{CANON_PHRASE}</p>")),
+            ),
+            // Trap-shaped URLs serve real pages, so an admitted trap would show
+            // up in search.
+            p if p.starts_with("/cat?") || p.starts_with("/x/y/") || p.starts_with("/d/1/") => (
+                "200 OK",
+                "text/html",
+                "",
+                page_with("Trap", 11, &format!("<p>{TRAP_PHRASE}</p>")),
             ),
             _ => ("404 Not Found", "text/plain", "", "nope".to_string()),
         };
@@ -261,6 +298,21 @@ fn crawl_index_search_roundtrip() {
     );
     assert_eq!(search(SHELL_PHRASE)["total"], 0, "the shell is not a page");
 
+    // Trap-shaped URLs were never admitted, so their pages were never fetched.
+    assert_eq!(search(TRAP_PHRASE)["total"], 0, "traps never entered");
+
+    // The canonical alias was followed like a redirect: the canonical page is
+    // indexed under its own URL, the alias never stored.
+    let v = search(CANON_PHRASE);
+    assert_eq!(v["total"], 1, "canonical page indexed once");
+    assert!(
+        v["hits"][0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/canon.html")
+    );
+    assert_eq!(search(ALIAS_PHRASE)["total"], 0, "the alias is not a page");
+
     // A full rebuild from WARC (holding the writer lock throughout) reproduces
     // the index, header gate included.
     let out = mycel(dir, &["reindex"]);
@@ -276,4 +328,43 @@ fn crawl_index_search_roundtrip() {
         0,
         "the rebuild re-derives the header gate"
     );
+
+    // Block the fixture host: its pages leave the index at the next sweep
+    // (here the one-shot `reindex --missing`), a full rebuild keeps them out,
+    // and re-seeding brings them back.
+    let out = mycel(dir, &["block", "127.0.0.1"]);
+    assert!(
+        out.status.success(),
+        "block: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("blocked 1 hosts;"));
+    assert!(mycel(dir, &["reindex", "--missing"]).status.success());
+    assert_eq!(search(PHRASE)["total"], 0, "blocked host's pages retired");
+    assert!(mycel(dir, &["reindex"]).status.success());
+    assert_eq!(
+        search(PHRASE)["total"],
+        0,
+        "a full rebuild keeps blocked hosts out"
+    );
+    let root = format!("http://127.0.0.1:{port}/");
+    assert!(mycel(dir, &["seed", &root]).status.success());
+    assert!(mycel(dir, &["reindex", "--missing"]).status.success());
+    assert_eq!(search(PHRASE)["total"], 1, "unblocking restores the pages");
+
+    // Bulk promotion: the off-host link made other.invalid a candidate with
+    // one inbound edge.
+    let out = mycel(dir, &["seed", "--top", "1"]);
+    assert!(
+        out.status.success(),
+        "seed --top: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "activated 1 hosts, enqueued 1 urls"
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&mycel(dir, &["status", "--json"]).stdout).unwrap();
+    assert_eq!(v["hosts"]["active"], 2);
 }

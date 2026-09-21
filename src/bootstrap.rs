@@ -139,12 +139,12 @@ pub fn prepare_ingest(rec: &warc::Record, member: Vec<u8>) -> Option<IngestRecor
             .map(String::as_str),
     );
     let analysis = extract::analyze(&url, &html, hdr)?;
-    // A meta-refresh shell cannot be followed here, but its target is a
-    // link like any other: harvested (no anchor), and the shell stays out
-    // of the index.
+    // A refresh or canonical shell cannot be followed here, but its target
+    // is a link like any other: harvested (no anchor), and the shell stays
+    // out of the index.
     let mut links = analysis.meta.links;
-    let redirect = analysis.meta.refresh.is_some();
-    if let Some((target, host)) = analysis.meta.refresh {
+    let redirect = analysis.meta.redirect.is_some();
+    if let Some((target, host)) = analysis.meta.redirect {
         links.push((target, host, String::new()));
     }
     Some(IngestRecord {

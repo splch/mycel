@@ -739,9 +739,9 @@ async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outco
         });
         match built {
             Built::Outcome(outcome) => return (outcome, None),
-            // An instant meta refresh: a redirect by other means, with the
-            // same hop budget and the same rules as a Location header.
-            Built::Refresh(target) => match redirect_step(job, robot, &mut hops, target) {
+            // An instant meta refresh or a same-host canonical: a redirect by
+            // other means, with the same hop budget and rules as a Location.
+            Built::Redirect(target) => match redirect_step(job, robot, &mut hops, target) {
                 Redirected::Follow(next) => {
                     cur = next;
                     continue;
@@ -752,9 +752,10 @@ async fn do_fetch_inner(st: &Shared, job: &Job, robot: Option<&Robot>) -> (Outco
     }
 }
 
-/// The shared tail of every redirect, whether a 3xx Location or an instant
-/// meta refresh: count the hop, keep same-host targets in-request when robots
-/// allows them, hand cross-host targets back as a CrossRedirect.
+/// The shared tail of every redirect, whether a 3xx Location, an instant
+/// meta refresh, or a same-host canonical: count the hop, keep same-host
+/// targets in-request when robots allows them, hand cross-host targets back
+/// as a CrossRedirect.
 fn redirect_step(job: &Job, robot: Option<&Robot>, hops: &mut u32, target: String) -> Redirected {
     *hops += 1;
     if *hops > MAX_REDIRECT_HOPS {
@@ -789,8 +790,9 @@ enum Redirected {
 /// What the blocking page builder produced.
 enum Built {
     Outcome(Outcome),
-    /// The page is an instant meta refresh to this (normalized) URL.
-    Refresh(String),
+    /// The page names this (normalized) URL as the real one: an instant
+    /// meta refresh or a same-host canonical.
+    Redirect(String),
 }
 
 /// Reconstruct the HTTP header block for the WARC record: status line + headers
@@ -850,8 +852,8 @@ fn build_stored(
             reason: "bad-final-url".into(),
         });
     };
-    if let Some((target, _)) = analysis.meta.refresh {
-        return Built::Refresh(target);
+    if let Some((target, _)) = analysis.meta.redirect {
+        return Built::Redirect(target);
     }
 
     head.extend_from_slice(format!("\r\ncontent-length: {}", body.len()).as_bytes());

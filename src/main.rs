@@ -43,8 +43,11 @@ Commands:
                              rebuild the index from WARC (daemon stopped), index pending
                              docs, or re-index everything through the running daemon
   status [--json]            counters, queue depths, shards, disk
-  seed <host|url>... [--from-file F]
-                             promote hosts to active + enqueue roots
+  seed <host|url>... [--from-file F] [--top N]
+                             promote hosts to active + enqueue roots; --top N also
+                             promotes the N candidate hosts with the most inbound links
+  block <host|url>...        block hosts: never crawled, their pages leave the index
+                             (`seed` re-activates)
   peers check                dial every configured peer and verify auth + protocol
 
 Config: ./mycel.toml (or $MYCEL_CONFIG). An empty file is valid; defaults apply.
@@ -76,6 +79,7 @@ fn main() -> ExitCode {
         Some("search") => cmd_search(rest),
         Some("reindex") => cmd_reindex(rest),
         Some("seed") => cmd_seed(rest),
+        Some("block") => cmd_block(rest),
         Some("status") => cmd_status(rest),
         Some("rank") => cmd_rank(rest),
         Some("bootstrap") => cmd_bootstrap(rest),
@@ -158,9 +162,18 @@ fn cmd_id() -> Result<()> {
 /// `mycel seed`: activate hosts and enqueue their roots (or explicit URLs).
 fn cmd_seed(rest: &[String]) -> Result<()> {
     let mut entries: Vec<String> = Vec::new();
+    let mut top: Option<usize> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--top" => {
+                top = Some(
+                    it.next()
+                        .ok_or("--top needs a number")?
+                        .parse::<usize>()
+                        .map_err(|_| "--top needs a number")?,
+                );
+            }
             "--from-file" => {
                 let f = it.next().ok_or("--from-file needs a path")?;
                 for line in std::fs::read_to_string(f)?.lines() {
@@ -174,20 +187,51 @@ fn cmd_seed(rest: &[String]) -> Result<()> {
             s => entries.push(s.to_string()),
         }
     }
-    if entries.is_empty() {
-        return Err("nothing to seed; pass hosts/URLs or --from-file".into());
+    if entries.is_empty() && top.is_none() {
+        return Err("nothing to seed; pass hosts/URLs, --from-file, or --top N".into());
     }
 
     let (_cfg, data) = load_env()?;
+    let mut conn = db::open(&data.join("mycel.sqlite"))?;
+    let tx = conn.transaction()?;
+    if let Some(n) = top {
+        entries.extend(db::top_candidates(&tx, n)?);
+    }
     let pairs = entries
         .iter()
         .map(|e| urlnorm::parse_seed_entry(e))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut conn = db::open(&data.join("mycel.sqlite"))?;
-    let tx = conn.transaction()?;
     let (hosts_n, urls_n) = db::seed_into(&tx, db::now(), &pairs)?;
     tx.commit()?;
     println!("activated {hosts_n} hosts, enqueued {urls_n} urls");
+    Ok(())
+}
+
+/// `mycel block <host|url>…`: hosts become unclaimable (state 2) and their
+/// indexed pages return to pending, so the daemon's next sweep retires them
+/// under the `blocked` label. `mycel seed` is the inverse.
+fn cmd_block(rest: &[String]) -> Result<()> {
+    let hosts = rest
+        .iter()
+        .map(|e| {
+            if e.starts_with("--") {
+                return Err(format!("unknown flag {e}"));
+            }
+            urlnorm::parse_seed_entry(e).map(|(host, _)| host)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if hosts.is_empty() {
+        return Err("usage: mycel block <host|url>…".into());
+    }
+    let (_cfg, data) = load_env()?;
+    let mut conn = db::open(&data.join("mycel.sqlite"))?;
+    let tx = conn.transaction()?;
+    let (hosts_n, docs_n) = db::block_into(&tx, db::now(), &hosts)?;
+    tx.commit()?;
+    println!(
+        "blocked {hosts_n} hosts; {docs_n} indexed documents retire at the daemon's next sweep \
+         (within 5 minutes, or run `mycel reindex --missing`); `mycel seed` re-activates"
+    );
     Ok(())
 }
 

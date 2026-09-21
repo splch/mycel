@@ -233,8 +233,8 @@ struct Indexer {
 }
 
 /// A pending docs row as the sweep reads it: id, url, host, centrality,
-/// fetched_at, shard name, member offset, member length.
-type PendingRow = (i64, String, String, f64, i64, String, i64, i64);
+/// fetched_at, shard name, member offset, member length, host state.
+type PendingRow = (i64, String, String, f64, i64, String, i64, i64, i64);
 
 /// Whether a drained channel asked the indexer to stop.
 enum Drained {
@@ -446,7 +446,8 @@ impl Indexer {
 
     fn load_pending_batch(&self, max_id: i64) -> Result<Vec<PendingRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
+            "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len,
+                    h.state
              FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
              WHERE d.indexed = 0 AND d.id <= ?2 ORDER BY d.shard_id, d.offset LIMIT ?1",
         )?;
@@ -460,6 +461,7 @@ impl Indexer {
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?;
         rows.collect::<std::result::Result<_, _>>()
@@ -471,7 +473,13 @@ impl Indexer {
     /// gates are the same ones a fresh fetch runs, so an online re-index can
     /// retire a page that was indexed under older rules.
     fn reindex_row(&mut self, row: PendingRow) -> Result<()> {
-        let (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) = row;
+        let (doc_id, url, host, centrality, fetched_at, shard_name, offset, len, host_state) = row;
+        if host_state == 2 {
+            // `mycel block`: the host's pages leave the index without a WARC
+            // read; `seed` returns them to pending.
+            self.skip(doc_id, &url, "blocked");
+            return Ok(());
+        }
         if !matches!(&self.cur_shard, Some((n, _)) if *n == shard_name) {
             match std::fs::File::open(self.cfg.warc_dir.join(&shard_name)) {
                 Ok(f) => self.cur_shard = Some((shard_name.clone(), f)),
@@ -510,7 +518,7 @@ impl Indexer {
             self.skip(doc_id, &url, "noindex");
             return Ok(());
         }
-        if a.meta.refresh.is_some() {
+        if a.meta.redirect.is_some() {
             self.skip(doc_id, &url, "redirect");
             return Ok(());
         }
@@ -556,7 +564,7 @@ impl Indexer {
 /// Re-derives every gate with fresh dedup state and writes docs.indexed
 /// directly on `conn`. Docs marked 'dead' (the URL failed permanently on a
 /// later fetch) stay out; 'error' marks (unreadable records, indexer
-/// casualties) are re-attempted.
+/// casualties) are re-attempted; pages on blocked hosts are marked 'blocked'.
 pub fn rebuild(
     cfg: &IndexerCfg,
     conn: &mut rusqlite::Connection,
@@ -573,10 +581,10 @@ pub fn rebuild(
     // instead of one open() per doc.
     let mut cur_shard: Option<(String, std::fs::File)> = None;
 
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, String, String, f64, i64, String, i64, i64)> = {
+    let rows: Vec<PendingRow> = {
         let mut stmt = conn.prepare(
-            "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len
+            "SELECT d.id, d.url, h.host, h.centrality, d.fetched_at, s.name, d.offset, d.len,
+                    h.state
              FROM docs d JOIN hosts h ON h.id = d.host_id JOIN shards s ON s.id = d.shard_id
              WHERE NOT (d.indexed = 2 AND d.skip_reason = 'dead')
              ORDER BY d.shard_id, d.offset",
@@ -591,12 +599,13 @@ pub fn rebuild(
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?;
         mapped.collect::<std::result::Result<_, _>>()?
     };
 
-    for (doc_id, url, host, centrality, fetched_at, shard_name, offset, len) in rows {
+    for (doc_id, url, host, centrality, fetched_at, shard_name, offset, len, host_state) in rows {
         let mut mark = |m: (i64, i64, Option<&'static str>)| marks.push(m);
         let opened: std::result::Result<(), &'static str> = (|| {
             if !matches!(&cur_shard, Some((n, _)) if *n == shard_name) {
@@ -606,6 +615,9 @@ pub fn rebuild(
             Ok(())
         })();
         let verdict: std::result::Result<(), &'static str> = opened.and_then(|()| {
+            if host_state == 2 {
+                return Err("blocked");
+            }
             let shard_file = &mut cur_shard.as_mut().expect("shard handle").1;
             let rec = warc::read_member_from(shard_file, offset as u64, len as u64)
                 .map_err(|_| "error")?;
@@ -621,7 +633,7 @@ pub fn rebuild(
             if a.meta.noindex {
                 return Err("noindex");
             }
-            if a.meta.refresh.is_some() {
+            if a.meta.redirect.is_some() {
                 return Err("redirect");
             }
             let ex = a.extract.ok_or("empty")?;
@@ -789,6 +801,19 @@ mod tests {
             )
             .unwrap();
         }
+        // A page on a blocked host: retired by state alone, whatever its bytes.
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('blocked.example', 2, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                               fetched_at, indexed)
+             VALUES ('http://blocked.example/spam', 2, 1, ?1, ?2, ?3, 200, 1700000000, 1)",
+            params![placed[0].0, placed[0].1, placed[0].2],
+        )
+        .unwrap();
         let cfg = IndexerCfg {
             index_dir: dir.path().join("index"),
             db_path,
@@ -802,8 +827,8 @@ mod tests {
             rebuild(&cfg, &mut conn, &dir.path().join("index.new")).unwrap();
         assert_eq!(
             (n_indexed, n_skipped),
-            (2, 1),
-            "pending + retried error indexed; the refresh shell skipped; dead untouched"
+            (2, 2),
+            "pending + retried error indexed; refresh shell and blocked host skipped; dead untouched"
         );
         let label = |url: &str| -> (i64, Option<String>) {
             conn.query_row(
@@ -817,6 +842,10 @@ mod tests {
         assert_eq!(label("http://a.com/retry"), (1, None));
         assert_eq!(label("http://a.com/dead"), (2, Some("dead".into())));
         assert_eq!(label("http://a.com/shell"), (2, Some("redirect".into())));
+        assert_eq!(
+            label("http://blocked.example/spam"),
+            (2, Some("blocked".into()))
+        );
     }
 
     /// One-shot commands must not lose pending rows past the first sweep
@@ -874,6 +903,20 @@ mod tests {
             )
             .unwrap();
         }
+        // One pending page on a blocked host rides along: retired by the
+        // sweep without a WARC read, never added.
+        conn.execute(
+            "INSERT INTO hosts (host, state, added_at) VALUES ('blocked.example', 2, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO docs (url, host_id, shard_id, offset, len, sha256, http_status,
+                               fetched_at, indexed)
+             VALUES ('http://blocked.example/x', 2, 1, ?1, ?2, ?3, 200, 1700000000, 0)",
+            params![placed[0].1, placed[0].2, placed[0].3],
+        )
+        .unwrap();
         drop(shard);
         drop(conn);
 
@@ -933,6 +976,14 @@ mod tests {
             indexed as usize, n,
             "every pending row indexed, not just the first batch"
         );
+        let blocked: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT indexed, skip_reason FROM docs WHERE url = 'http://blocked.example/x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(blocked, (2, Some("blocked".into())));
         let index = open_or_create(&index_dir).unwrap();
         assert_eq!(index.reader().unwrap().searcher().num_docs() as usize, n);
     }
