@@ -672,12 +672,16 @@ Gauges for monitoring:
 
 `index_docs` counts live documents in the tantivy reader; `docs.*` counts
 catalog rows. A field reads `-1` if its query failed. Every response
-carries `snapshot_age_secs`: the gauges are full-table scans, so they are
-served from a snapshot refreshed at most every 60 s, stale-while-revalidate
-style. If a refresh cannot run (or a previous one wedges), the last
-snapshot is served with its age — up to 10 minutes old, after which the
-endpoint answers 503 `stats degraded` rather than silently passing off old
-data as fresh.
+carries `snapshot_age_secs`: the gauges are whole-table passes, so no
+request computes them. A background task refreshes the snapshot, waiting
+20× as long as the last computation took between refreshes (at least 2 s,
+at most 30 minutes): a small node stays near-live, and a corpus whose gauges
+take minutes spends about 5% of its time on them. The response is
+immediate. Right after start, before the first snapshot exists, the
+endpoint answers 503 `stats warming up`; a snapshot older than twice the
+current refresh interval plus 10 minutes answers 503 `stats degraded`
+rather than silently passing off old data as fresh. The admin page shows
+the same snapshot.
 
 ## 9. Crawler behavior
 
@@ -1181,6 +1185,13 @@ subcommands, not special tools:
 - Schema v7 adds a per-host cache of the earliest queued due time and
   rebuilds the scheduling index on it; instant, and recomputed at every
   start.
+- Schema v8 adds two partial indexes over leased rows (`frontier_leased`,
+  `hosts_in_flight`), so boot recovery and the 5-minute lease sweep stop
+  scanning the whole frontier. Building them reads the frontier once (a log
+  line announces it above a million rows; tens of seconds on a corpus-sized
+  table) and rebuilds no table. Databases carrying the 0.4.0 hand-made
+  `local_frontier_leased` / `local_hosts_in_flight` indexes have them
+  replaced by the new names.
 - If a mycel upgrade ships a tantivy version that cannot read the old index,
   rebuild it: `rm -rf <data>/index && mycel reindex`. The corpus is
   untouched.

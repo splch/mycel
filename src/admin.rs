@@ -587,48 +587,59 @@ async fn render(
         (up % 3600) / 60,
     );
 
-    // Same gauges as `mycel status` and /stats.
-    let status = {
-        let conn = api.stats_conn.lock().await;
-        let s = db::status_counts(&conn);
-        let meta = |key: &str| -> Option<String> {
-            conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-                .ok()
-        };
-        let counters = s
-            .counters
-            .iter()
-            .map(|(k, v)| format!("{} {v}", k.trim_start_matches("ctr_")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "<dl><dt>hosts<dd>active {}, candidate {}\
-             <dt>frontier<dd>queued {}, in-flight {}, failed {}\
-             <dt>docs<dd>{} total, {} pending, {} indexed, {} skipped\
-             <dt>webgraph<dd>{} host edges\
-             <dt>warc<dd>{} shards, {} bytes\
-             <dt>index<dd>{} searchable docs\
-             <dt>counters<dd>{}\
-             <dt>last rank<dd>{}</dl>\
-             <p><small>counters flush every 60 s; <a href=/admin>refresh</a></small>",
-            s.hosts_active,
-            s.hosts_candidate,
-            s.queued,
-            s.in_flight,
-            s.failed,
-            s.docs_total,
-            s.docs_pending,
-            s.docs_indexed,
-            s.docs_skipped,
-            s.edges,
-            s.shards,
-            s.warc_bytes,
+    // Same gauges as `mycel status` and /stats, from the API's background
+    // snapshot: computing them here would hold the page for minutes on a
+    // corpus-sized database.
+    let last_rank = api
+        .db
+        .meta_get("last_rank_at".into())
+        .await
+        .and_then(|v| v.parse().ok().map(warc::iso8601))
+        .unwrap_or_else(|| "never".to_string());
+    let status = match api.stats_cache.get() {
+        None => format!(
+            "<p><small>gauges are being computed; <a href=/admin>refresh</a> shortly</small>\
+             <dl><dt>index<dd>{} searchable docs<dt>last rank<dd>{}</dl>",
             api.searcher.num_docs(),
-            html_escape(&counters),
-            meta("last_rank_at")
-                .and_then(|v| v.parse().ok().map(warc::iso8601))
-                .unwrap_or_else(|| "never".to_string()),
-        )
+            html_escape(&last_rank),
+        ),
+        Some(snap) => {
+            let s = &snap.counts;
+            let counters = s
+                .counters
+                .iter()
+                .map(|(k, v)| format!("{} {v}", k.trim_start_matches("ctr_")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "<dl><dt>hosts<dd>active {}, candidate {}\
+                 <dt>frontier<dd>queued {}, in-flight {}, failed {}\
+                 <dt>docs<dd>{} total, {} pending, {} indexed, {} skipped\
+                 <dt>webgraph<dd>{} host edges\
+                 <dt>warc<dd>{} shards, {} bytes\
+                 <dt>index<dd>{} searchable docs\
+                 <dt>counters<dd>{}\
+                 <dt>last rank<dd>{}</dl>\
+                 <p><small>gauges as of {} s ago; counters flush every 60 s; \
+                 <a href=/admin>refresh</a></small>",
+                s.hosts_active,
+                s.hosts_candidate,
+                s.queued,
+                s.in_flight,
+                s.failed,
+                s.docs_total,
+                s.docs_pending,
+                s.docs_indexed,
+                s.docs_skipped,
+                s.edges,
+                s.shards,
+                s.warc_bytes,
+                api.searcher.num_docs(),
+                html_escape(&counters),
+                html_escape(&last_rank),
+                snap.at.elapsed().as_secs(),
+            )
+        }
     };
 
     let job = {

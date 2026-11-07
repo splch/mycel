@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// Newest schema version this binary understands.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// `hosts.next_due_at` for a host with no queued frontier row: sorts after
 /// every real timestamp, so the claim never probes such a host.
@@ -246,6 +246,32 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 7;
              COMMIT;"
         ))?;
+    }
+    if version < 8 {
+        // v8: partial indexes over the few leased rows, for the lease sweep
+        // and boot recovery. Without them both scan the whole frontier for
+        // `state = 1` (minutes on a corpus-sized table, inside the writer's
+        // transaction). Building them reads the frontier once and rebuilds
+        // no table. The `local_*` names are a hand-made hot-fix for exactly
+        // these indexes on 0.4.0 databases; they are replaced, not kept.
+        let rows: i64 = conn.query_row("SELECT COALESCE(max(id), 0) FROM frontier", [], |r| {
+            r.get(0)
+        })?;
+        if rows > 1_000_000 {
+            tracing::info!(
+                "indexing leased frontier rows (~{rows} rows): one-time migration, this can take a minute"
+            );
+        }
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP INDEX IF EXISTS local_frontier_leased;
+             DROP INDEX IF EXISTS local_hosts_in_flight;
+             CREATE INDEX IF NOT EXISTS frontier_leased ON frontier (claimed_at, host_id)
+               WHERE state = 1;
+             CREATE INDEX IF NOT EXISTS hosts_in_flight ON hosts (id) WHERE in_flight = 1;
+             PRAGMA user_version = 8;
+             COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -782,15 +808,28 @@ pub fn spawn_writer(
     Ok((Db { tx }, handle))
 }
 
+// Boot recovery and the lease sweep touch only leased rows; the v8 partial
+// indexes (frontier_leased, hosts_in_flight) keep them off full-table scans.
+// Named so the query-plan test checks the statements that actually run.
+const RECOVER_REQUEUE: &str =
+    "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
+     WHERE state = 1";
+const RECOVER_FREE_HOSTS: &str = "UPDATE hosts SET in_flight = 0 WHERE in_flight = 1";
+const SWEEP_LOWER_DUE: &str = "UPDATE hosts SET next_due_at = min(next_due_at,
+     (SELECT min(f.next_attempt_at) FROM frontier f
+      WHERE f.host_id = hosts.id AND f.state = 1 AND f.claimed_at < ?1))
+     WHERE id IN (SELECT host_id FROM frontier WHERE state = 1 AND claimed_at < ?1)";
+const SWEEP_REQUEUE: &str =
+    "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
+     WHERE state = 1 AND claimed_at < ?1";
+const SWEEP_FREE_HOSTS: &str = "UPDATE hosts SET in_flight = 0
+     WHERE in_flight = 1 AND id NOT IN (SELECT host_id FROM frontier WHERE state = 1)";
+
 /// Boot recovery: anything claimed at crash time goes back to queued, and the
 /// open shard is truncated to the durable watermark.
 fn recover(conn: &Connection) -> Result<()> {
-    let n = conn.execute(
-        "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
-         WHERE state = 1",
-        [],
-    )?;
-    conn.execute("UPDATE hosts SET in_flight = 0 WHERE in_flight = 1", [])?;
+    let n = conn.execute(RECOVER_REQUEUE, [])?;
+    conn.execute(RECOVER_FREE_HOSTS, [])?;
     // The due cache is derived state: rebuild it from the frontier at boot so
     // no host is hidden by a stale value, whatever the crash left behind.
     conn.execute(
@@ -1104,10 +1143,18 @@ impl Writer {
                     }
                     Cmd::Tick { now } => {
                         if now - self.last_sweep >= 300 {
-                            self.last_sweep = now;
+                            // Timed from the sweep's END: a slow sweep must
+                            // not leave the next one already due, or the
+                            // writer runs them back to back.
+                            let started = std::time::Instant::now();
                             if let Err(e) = lease_sweep(&tx, now) {
                                 tracing::error!("lease sweep failed: {e}");
                             }
+                            let took = started.elapsed();
+                            if took > std::time::Duration::from_secs(5) {
+                                tracing::warn!("lease sweep took {:.1}s", took.as_secs_f64());
+                            }
+                            self.last_sweep = now + took.as_secs() as i64;
                         }
                         if now - self.last_flush >= 60 {
                             self.last_flush = now;
@@ -2033,23 +2080,9 @@ pub fn anchors_for(conn: &Connection, url: &str) -> Result<String> {
 fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
     // The stuck rows become queued again: their hosts' due cache must not
     // hide them (it never should, but this is the belt to the braces).
-    tx.execute(
-        "UPDATE hosts SET next_due_at = min(next_due_at,
-             (SELECT min(f.next_attempt_at) FROM frontier f
-              WHERE f.host_id = hosts.id AND f.state = 1 AND f.claimed_at < ?1))
-         WHERE id IN (SELECT host_id FROM frontier WHERE state = 1 AND claimed_at < ?1)",
-        [now - 900],
-    )?;
-    let n = tx.execute(
-        "UPDATE frontier SET state = 0, claimed_at = NULL, attempts = MAX(attempts - 1, 0)
-         WHERE state = 1 AND claimed_at < ?1",
-        [now - 900],
-    )?;
-    tx.execute(
-        "UPDATE hosts SET in_flight = 0
-         WHERE in_flight = 1 AND id NOT IN (SELECT host_id FROM frontier WHERE state = 1)",
-        [],
-    )?;
+    tx.execute(SWEEP_LOWER_DUE, [now - 900])?;
+    let n = tx.execute(SWEEP_REQUEUE, [now - 900])?;
+    tx.execute(SWEEP_FREE_HOSTS, [])?;
     if n > 0 {
         tracing::warn!("lease sweep requeued {n} stuck rows");
     }
@@ -2059,6 +2092,12 @@ fn lease_sweep(tx: &Transaction, now: i64) -> Result<()> {
 /// The gauges behind `mycel status`, /stats, and the admin page: one home
 /// for the SQL so the three consumers cannot drift apart. A failed count
 /// reads -1 (the /stats rule) rather than failing the whole snapshot.
+///
+/// Each table is read in ONE grouped pass (per-state sums), not one count
+/// per gauge: on a corpus-sized database every unindexed count is a full
+/// scan, and a dozen of them took minutes. The daemon still computes this
+/// off the request path (api.rs's refresher); it is cheaper, not free.
+#[derive(Clone, Debug)]
 pub struct StatusCounts {
     pub hosts_active: i64,
     pub hosts_candidate: i64,
@@ -2077,6 +2116,15 @@ pub struct StatusCounts {
 
 pub fn status_counts(conn: &Connection) -> StatusCounts {
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    // One pass, N sums; any failure reads -1 for every gauge of that table.
+    let sums = |sql: &str, n: usize| -> Vec<i64> {
+        conn.query_row(sql, [], |r| {
+            (0..n)
+                .map(|i| r.get::<_, Option<i64>>(i).map(|v| v.unwrap_or(0)))
+                .collect::<rusqlite::Result<Vec<i64>>>()
+        })
+        .unwrap_or_else(|_| vec![-1; n])
+    };
     let mut counters = std::collections::BTreeMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM meta WHERE key LIKE 'ctr_%'")
         && let Ok(rows) =
@@ -2086,19 +2134,29 @@ pub fn status_counts(conn: &Connection) -> StatusCounts {
             counters.insert(k, v);
         }
     }
+    let hosts = sums("SELECT sum(state = 1), sum(state = 0) FROM hosts", 2);
+    let frontier = sums(
+        "SELECT sum(state = 0), sum(state = 1), sum(state = 2) FROM frontier",
+        3,
+    );
+    let docs = sums(
+        "SELECT count(*), sum(indexed = 0), sum(indexed = 1), sum(indexed = 2) FROM docs",
+        4,
+    );
+    let shards = sums("SELECT count(*), sum(bytes) FROM shards", 2);
     StatusCounts {
-        hosts_active: count("SELECT count(*) FROM hosts WHERE state = 1"),
-        hosts_candidate: count("SELECT count(*) FROM hosts WHERE state = 0"),
-        queued: count("SELECT count(*) FROM frontier WHERE state = 0"),
-        in_flight: count("SELECT count(*) FROM frontier WHERE state = 1"),
-        failed: count("SELECT count(*) FROM frontier WHERE state = 2"),
-        docs_total: count("SELECT count(*) FROM docs"),
-        docs_pending: count("SELECT count(*) FROM docs WHERE indexed = 0"),
-        docs_indexed: count("SELECT count(*) FROM docs WHERE indexed = 1"),
-        docs_skipped: count("SELECT count(*) FROM docs WHERE indexed = 2"),
+        hosts_active: hosts[0],
+        hosts_candidate: hosts[1],
+        queued: frontier[0],
+        in_flight: frontier[1],
+        failed: frontier[2],
+        docs_total: docs[0],
+        docs_pending: docs[1],
+        docs_indexed: docs[2],
+        docs_skipped: docs[3],
         edges: count("SELECT count(*) FROM links"),
-        shards: count("SELECT count(*) FROM shards"),
-        warc_bytes: count("SELECT COALESCE(sum(bytes), 0) FROM shards"),
+        shards: shards[0],
+        warc_bytes: shards[1],
         counters,
     }
 }
@@ -3916,5 +3974,144 @@ mod tests {
         assert_eq!(job.attempts, 1, "the robots turn refunded the claim");
         db.shutdown().await;
         handle.join().unwrap();
+    }
+
+    /// Every row of `EXPLAIN QUERY PLAN` for one statement.
+    fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        let params: Vec<i64> = vec![0; n];
+        stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            r.get::<_, String>(3)
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    #[test]
+    fn sweep_and_recovery_never_scan_the_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        // Enough rows, and fresh statistics, that the planner prefers the
+        // partial indexes for their own sake rather than by default.
+        conn.execute_batch(
+            "INSERT INTO hosts (host, state, in_flight, added_at)
+               WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 2000)
+               SELECT 'h' || value || '.com', 1, value % 100 = 0, 0 FROM n;
+             INSERT INTO frontier (host_id, url, state, discovered_at, claimed_at)
+               WITH RECURSIVE n(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 20000)
+               SELECT value % 2000 + 1, 'http://x/' || value,
+                      CASE WHEN value % 1000 = 0 THEN 1 ELSE value % 3 % 2 * 2 END,
+                      0, CASE WHEN value % 1000 = 0 THEN value END
+               FROM n;
+             ANALYZE;",
+        )
+        .unwrap();
+        for sql in [
+            RECOVER_REQUEUE,
+            RECOVER_FREE_HOSTS,
+            SWEEP_LOWER_DUE,
+            SWEEP_REQUEUE,
+            SWEEP_FREE_HOSTS,
+        ] {
+            let plan = query_plan(&conn, sql);
+            // A SCAN of the frontier is acceptable only over the partial
+            // index, which holds nothing but leased rows.
+            for step in &plan {
+                let frontier =
+                    step.contains("frontier") || step.contains(" f ") || step.ends_with(" f");
+                assert!(
+                    !(step.starts_with("SCAN") && frontier && !step.contains("frontier_leased")),
+                    "full frontier scan in {sql}: {plan:?}"
+                );
+            }
+            let joined = plan.join(" | ");
+            assert!(
+                joined.contains("frontier_leased") || joined.contains("hosts_in_flight"),
+                "no leased-row index in {sql}: {plan:?}"
+            );
+        }
+        // The hosts-side statements must not walk every host either.
+        for sql in [RECOVER_FREE_HOSTS, SWEEP_FREE_HOSTS] {
+            let joined = query_plan(&conn, sql).join(" | ");
+            assert!(joined.contains("hosts_in_flight"), "{sql}: {joined}");
+        }
+    }
+
+    #[test]
+    fn migration_v8_replaces_the_hand_made_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        {
+            // A v7 database carrying the 0.4.0 hot-fix indexes.
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX frontier_leased;
+                 DROP INDEX hosts_in_flight;
+                 CREATE INDEX local_frontier_leased ON frontier (claimed_at, host_id)
+                   WHERE state = 1;
+                 CREATE INDEX local_hosts_in_flight ON hosts (id) WHERE in_flight = 1;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let mut names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('frontier_leased', 'hosts_in_flight',
+                              'local_frontier_leased', 'local_hosts_in_flight')",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["frontier_leased", "hosts_in_flight"]);
+        // And a v7 database without them (any 0.4.0 node) migrates too.
+        drop(conn);
+        let fresh = dir.path().join("u.sqlite");
+        {
+            let conn = open(&fresh).unwrap();
+            conn.execute_batch(
+                "DROP INDEX frontier_leased; DROP INDEX hosts_in_flight;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        let conn = open(&fresh).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('frontier_leased', 'hosts_in_flight')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn status_counts_survive_an_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let s = status_counts(&conn);
+        assert_eq!(
+            (
+                s.hosts_active,
+                s.queued,
+                s.docs_total,
+                s.docs_pending,
+                s.shards,
+                s.warc_bytes
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
     }
 }

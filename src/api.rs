@@ -16,32 +16,87 @@ pub struct Api {
     pub db: db::Db,
     pub stats_conn: tokio::sync::Mutex<rusqlite::Connection>,
     pub stats_cache: StatsCache,
+    /// The refresher's current interval, for the staleness bound.
+    pub stats_interval: std::sync::Mutex<Duration>,
     pub page_size: usize,
     pub fed: Option<FedState>,
     pub admin: Arc<crate::admin::AdminState>,
 }
 
-type Snapshot = (Instant, Arc<serde_json::Value>);
+/// A computed gauge set and when it finished.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub at: Instant,
+    pub counts: Arc<db::StatusCounts>,
+}
 
-/// Serve-stale cache for /stats: the gauges are unindexed full-table scans,
-/// so recompute at most once per STATS_TTL and serve the snapshot (with its
-/// age) otherwise. Past STATS_MAX_STALE it is an error, not a gauge.
+/// Background-refreshed cache for /stats and the admin page. The gauges are
+/// whole-table passes (minutes on a corpus-sized database), so no request
+/// ever computes them: `refresh_stats` recomputes on its own connection and
+/// requests read the latest snapshot, with its age. The refresh interval
+/// scales with the cost, so a small node stays fresh and a big one spends at
+/// most ~5% of its time on gauges.
 #[derive(Default)]
 pub struct StatsCache(std::sync::Mutex<Option<Snapshot>>);
 
 impl StatsCache {
     /// The freshest snapshot, if any (only ever goes None → Some).
-    fn get(&self) -> Option<Snapshot> {
+    pub fn get(&self) -> Option<Snapshot> {
         self.0.lock().expect("stats cache poisoned").clone()
     }
 
-    fn put(&self, v: Arc<serde_json::Value>) {
-        *self.0.lock().expect("stats cache poisoned") = Some((Instant::now(), v));
+    fn put(&self, counts: db::StatusCounts) {
+        *self.0.lock().expect("stats cache poisoned") = Some(Snapshot {
+            at: Instant::now(),
+            counts: Arc::new(counts),
+        });
     }
 }
 
-const STATS_TTL: Duration = Duration::from_secs(60);
-const STATS_MAX_STALE: Duration = Duration::from_secs(600);
+/// Wait between refreshes: STATS_COST_FACTOR × the last computation, clamped.
+const STATS_COST_FACTOR: u32 = 20;
+const STATS_MIN_INTERVAL: Duration = Duration::from_secs(2);
+const STATS_MAX_INTERVAL: Duration = Duration::from_secs(1800);
+
+fn refresh_interval(took: Duration) -> Duration {
+    (took * STATS_COST_FACTOR).clamp(STATS_MIN_INTERVAL, STATS_MAX_INTERVAL)
+}
+
+/// Past this age a snapshot is an error, not a gauge: two missed refreshes
+/// plus ten minutes of slack.
+fn max_stale(interval: Duration) -> Duration {
+    interval * 2 + Duration::from_secs(600)
+}
+
+/// The refresher loop: compute, publish, sleep in proportion to the cost.
+async fn refresh_stats(api: Arc<Api>, cancel: CancellationToken) {
+    loop {
+        let started = Instant::now();
+        let computed = tokio::task::spawn_blocking({
+            let api = api.clone();
+            move || db::status_counts(&api.stats_conn.blocking_lock())
+        })
+        .await;
+        let took = started.elapsed();
+        match computed {
+            Ok(counts) => api.stats_cache.put(counts),
+            Err(e) => tracing::error!("stats computation panicked: {e}"),
+        }
+        let interval = refresh_interval(took);
+        *api.stats_interval.lock().expect("stats interval poisoned") = interval;
+        if took > Duration::from_secs(10) {
+            tracing::info!(
+                "stats gauges took {:.1}s; next refresh in {}s",
+                took.as_secs_f64(),
+                interval.as_secs()
+            );
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
 
 /// Federation context for the API: fan-out + peer checks.
 pub struct FedState {
@@ -67,7 +122,8 @@ pub async fn serve(bind: &str, api: Arc<Api>, cancel: CancellationToken) -> Resu
         .route("/admin/bootstrap", post(crate::admin::bootstrap_job))
         .route("/admin/peers", post(crate::admin::peers_probe))
         .route("/admin/config", post(crate::admin::save_config))
-        .with_state(api);
+        .with_state(api.clone());
+    tokio::spawn(refresh_stats(api, cancel.clone()));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("api listening on http://{bind}");
     axum::serve(listener, app)
@@ -340,67 +396,26 @@ async fn healthz(State(api): State<Arc<Api>>) -> impl IntoResponse {
     }
 }
 
-async fn stats(State(api): State<Arc<Api>>) -> impl IntoResponse {
-    if let Some((at, v)) = api.stats_cache.get()
-        && at.elapsed() < STATS_TTL
-    {
-        return with_age(v, at.elapsed()).into_response();
-    }
-    // try_lock, never block: if another refresh holds the connection,
-    // serve what we have.
-    let computed = tokio::task::spawn_blocking({
-        let api = api.clone();
-        move || {
-            api.stats_conn
-                .try_lock()
-                .map(|conn| stats_json(&conn, api.searcher.num_docs()))
-                .ok()
+async fn stats(State(api): State<Arc<Api>>) -> axum::response::Response {
+    let interval = *api.stats_interval.lock().expect("stats interval poisoned");
+    match api.stats_cache.get() {
+        Some(snap) if snap.at.elapsed() <= max_stale(interval) => {
+            let mut v = stats_json(&snap.counts, api.searcher.num_docs());
+            v["snapshot_age_secs"] = snap.at.elapsed().as_secs().into();
+            axum::Json(v).into_response()
         }
-    })
-    .await;
-    match computed {
-        Ok(Some(v)) => {
-            let v = Arc::new(v);
-            api.stats_cache.put(v.clone());
-            with_age(v, Duration::ZERO).into_response()
-        }
-        // Re-read the cache: a concurrent request may have refreshed while
-        // we abstained.
-        Ok(None) => serve_stale_or_error(
-            api.stats_cache.get(),
-            "another refresh holds the stats connection",
-        ),
-        Err(e) => {
-            tracing::error!("stats computation panicked: {e}");
-            serve_stale_or_error(api.stats_cache.get(), "stats computation panicked")
-        }
-    }
-}
-
-fn with_age(v: Arc<serde_json::Value>, age: Duration) -> axum::Json<serde_json::Value> {
-    let mut obj = (*v).clone();
-    obj["snapshot_age_secs"] = age.as_secs().into();
-    axum::Json(obj)
-}
-
-fn serve_stale_or_error(cached: Option<Snapshot>, why: &'static str) -> axum::response::Response {
-    match cached {
-        Some((at, v)) if at.elapsed() <= STATS_MAX_STALE => {
-            with_age(v, at.elapsed()).into_response()
-        }
-        Some((at, _)) => {
+        Some(snap) => {
             tracing::error!(
-                "stats snapshot is {}s old ({why}); refusing to serve it",
-                at.elapsed().as_secs()
+                "stats snapshot is {}s old; refusing to serve it",
+                snap.at.elapsed().as_secs()
             );
             (StatusCode::SERVICE_UNAVAILABLE, "stats degraded").into_response()
         }
-        None => (StatusCode::SERVICE_UNAVAILABLE, why).into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "stats warming up").into_response(),
     }
 }
 
-fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value {
-    let s = db::status_counts(conn);
+fn stats_json(s: &db::StatusCounts, index_docs: u64) -> serde_json::Value {
     serde_json::json!({
         "hosts": { "active": s.hosts_active, "candidate": s.hosts_candidate },
         "frontier": {
@@ -422,6 +437,31 @@ fn stats_json(conn: &rusqlite::Connection, index_docs: u64) -> serde_json::Value
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn stats_refresh_scales_with_cost() {
+        // A small node refreshes every couple of seconds; the 2m45s gauges
+        // seen on a 73 GB database refresh at the 30-minute ceiling and stay
+        // servable for an hour past it.
+        assert_eq!(
+            super::refresh_interval(Duration::from_millis(3)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::refresh_interval(Duration::from_secs(30)),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            super::refresh_interval(Duration::from_secs(165)),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            super::max_stale(Duration::from_secs(1800)),
+            Duration::from_secs(4200)
+        );
+    }
+
     #[test]
     fn stats_json_reports_table_counts() {
         let dir = tempfile::tempdir().unwrap();
@@ -442,7 +482,7 @@ mod tests {
              INSERT INTO links (from_host, to_host) VALUES (1, 2);",
         )
         .unwrap();
-        let v = super::stats_json(&conn, 42);
+        let v = super::stats_json(&crate::db::status_counts(&conn), 42);
         assert_eq!(v["hosts"]["active"], 1);
         assert_eq!(v["hosts"]["candidate"], 1);
         assert_eq!(v["frontier"]["queued"], 1);
